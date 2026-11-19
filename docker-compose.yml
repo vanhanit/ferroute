@@ -1,0 +1,63 @@
+# Usage:
+#   docker compose run --rm dev cargo test --workspace
+#   docker compose --profile sonar up -d sonarqube        (http://localhost:9000, admin/admin)
+#   docker compose --profile sonar run --rm sonar-scanner (needs SONAR_TOKEN)
+name: ferroute
+
+services:
+  dev:
+    build:
+      context: .
+      target: dev
+    image: ferroute-dev:local
+    working_dir: /work
+    environment:
+      HOME: /tmp
+      CARGO_TARGET_DIR: /cargo-target
+      WGPU_BACKEND: vulkan
+    # Run as the host user to avoid root-owned files: `UID_GID=$(id -u):$(id -g) docker compose run --rm dev ...`
+    user: "${UID_GID:-0:0}"
+    volumes:
+      - .:/work
+      - cargo-registry:/usr/local/cargo/registry
+      - cargo-target:/cargo-target
+    command: ["bash"]
+
+  sonarqube:
+    profiles: ["sonar"]
+    # SonarQube Community Build 26.11.0.134175 (pinned; source: Docker Hub library/sonarqube)
+    image: sonarqube:26.11.0.134175-community@sha256:65541accbdb92e27fe770fc6ba99988a3dd5a0c71ffafd67f88abfad366996fa
+    ports:
+      - "9000:9000"
+    environment:
+      SONAR_ES_BOOTSTRAP_CHECKS_DISABLE: "true"
+    volumes:
+      - sonarqube-data:/opt/sonarqube/data
+      - sonarqube-extensions:/opt/sonarqube/extensions
+      - sonarqube-logs:/opt/sonarqube/logs
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://localhost:9000/api/system/status | grep -q '\"status\":\"UP\"'"]
+      interval: 15s
+      timeout: 10s
+      retries: 40
+      start_period: 60s
+
+  sonar-scanner:
+    profiles: ["sonar"]
+    # sonar-scanner-cli 12.4.0.4321 (pinned; source: Docker Hub sonarsource/sonar-scanner-cli)
+    image: sonarsource/sonar-scanner-cli:12.4.0.4321_8.4.0@sha256:6e6eca4d552695a98fb7dab84f0c1bd0885ebbfe272654d1552e24bd7f452d51
+    depends_on:
+      sonarqube:
+        condition: service_healthy
+    environment:
+      SONAR_HOST_URL: http://sonarqube:9000
+      SONAR_TOKEN: ${SONAR_TOKEN:-}
+    volumes:
+      - .:/usr/src
+
+volumes:
+  cargo-registry:
+  cargo-target:
+  sonarqube-data:
+  sonarqube-extensions:
+  sonarqube-logs:
