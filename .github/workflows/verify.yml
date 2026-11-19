@@ -20,6 +20,7 @@ env:
 jobs:
   fmt:
     runs-on: ubuntu-24.04
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v7
       - name: Install toolchain (rust-toolchain.toml)
@@ -28,6 +29,7 @@ jobs:
 
   clippy:
     runs-on: ubuntu-24.04
+    timeout-minutes: 60
     steps:
       - uses: actions/checkout@v7
       - run: rustup show active-toolchain || rustup toolchain install
@@ -37,6 +39,7 @@ jobs:
   test:
     name: test (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
+    timeout-minutes: 60
     strategy:
       fail-fast: false
       matrix:
@@ -49,6 +52,7 @@ jobs:
 
   gpu-test:
     runs-on: ubuntu-24.04
+    timeout-minutes: 20
     continue-on-error: true
     env:
       WGPU_BACKEND: vulkan
@@ -64,6 +68,7 @@ jobs:
 
   audit:
     runs-on: ubuntu-24.04
+    timeout-minutes: 60
     steps:
       - uses: actions/checkout@v7
       - uses: taiki-e/install-action@v2
@@ -76,6 +81,7 @@ jobs:
 
   drc-regression:
     runs-on: ubuntu-24.04
+    timeout-minutes: 60
     steps:
       - uses: actions/checkout@v7
       - run: rustup show active-toolchain || rustup toolchain install
@@ -91,6 +97,7 @@ jobs:
 
   build-musl:
     runs-on: ubuntu-24.04
+    timeout-minutes: 60
     steps:
       - uses: actions/checkout@v7
       - run: rustup show active-toolchain || rustup toolchain install
@@ -113,6 +120,7 @@ jobs:
   kicad10:
     needs: build-musl
     runs-on: ubuntu-24.04
+    timeout-minutes: 30
     container:
       image: kicad/kicad:10.0.8@sha256:3f4a01786dfbe803a65f345c3342b765db9add913f5e9448f8356793714ddc34
       options: --user root
@@ -167,6 +175,7 @@ jobs:
   kicad11-preview:
     needs: build-musl
     runs-on: ubuntu-24.04
+    timeout-minutes: 30
     continue-on-error: true
     steps:
       - uses: actions/checkout@v7
@@ -212,6 +221,7 @@ jobs:
 
   sonar:
     runs-on: ubuntu-24.04
+    timeout-minutes: 60
     env:
       SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
     steps:
