@@ -180,11 +180,19 @@ seeds replay across dependency upgrades and platforms.
   boundary contact). Policy: no via-in-pad.
 * Optional accelerator field (§6) prunes sites provably far from all obstacles.
 
-### 4.2 Pin access
-Interior terminals are lattice nodes inside the pad copper. Pads without interior nodes
-get up to four exact **stubs** (pad centre → nearby legal node) checked against fixed
-obstacles; each stub reserves every lattice node within
-`max required centre distance + pitch/√2` of its spine.
+### 4.2 Pin access — routes terminate at pad centres
+Every connection ends exactly at the pad centre (KiCad convention; avoids off-centre
+track ends):
+
+1. The lattice origin is chosen so the largest number of pad centres fall *on* lattice
+   nodes (mode of pad-centre residues modulo the pitch); such pads terminate directly.
+2. Otherwise up to four **contained centre-stubs** join an interior lattice node to the
+   centre, preferring 0°/45°/90° stubs, then the shortest. A stub whose copper lies
+   entirely inside the pad copper (exact erosion test) adds no copper outside the pad, so
+   it is legal by the pad's own legality and needs **no reservation**.
+3. Small/narrow pads fall back to exterior exact stubs (centre → nearby legal node,
+   checked against fixed obstacles) that reserve every lattice node within
+   `max required centre distance + pitch/√2` of the spine.
 
 ### 4.3 Negotiated congestion (PathFinder)
 * Nets are ordered by terminal HPWL (seeded SplitMix64 tie-break).
@@ -197,6 +205,14 @@ obstacles; each stub reserves every lattice node within
   wider search windows (×3) up to the whole board.
 * After negotiation, any residual conflict is resolved by dropping the lowest-priority
   conflicting nets (completion < 100 %, never a violation).
+
+### 4.3b Lattice-preserving smoothing
+After negotiation, each route (in priority order, two passes) is straightened: a
+sub-path between two of its nodes is replaced by a straight or two-segment octilinear
+lattice connection (one 45° run + one 0°/90° run) when that connection is legal and
+strictly cheaper (length + bend penalties). Endpoints, Steiner junctions and via sites
+stay pinned. The smoothed route is re-reserved and kept only if it creates no conflict,
+so INV-ROUTE-1 is preserved and every vertex stays on the lattice.
 
 ### 4.4 Deterministic parallelism
 Consecutive nets (in priority order) whose *footprint regions* — search window ∪ old route,
@@ -213,6 +229,8 @@ members cannot read or write each other's cells, the result equals sequential ro
 * **Hard constraints (exact):** displacement/rotation bounds; courtyard inside the board,
   not intersecting other courtyards on the same side or footprint keep-outs; moved pads
   clear of all other copper and the edge.
+* **Placement grid (INV-PLACE-3):** a translated footprint's anchor always lands on an
+  absolute multiple of the placement grid (`--move-grid`, default 0.1 mm).
 * **Search:** seeded multi-start annealing (parallel chains, deterministic winner), window
   shrinking with temperature; then routing; then LNS rounds that up-weight failed nets.
 
@@ -234,6 +252,8 @@ in property tests over thousands of random boards).
 | **INV-ROUTE-1** | *Lattice separation theorem* (below): no base node of one net in a ring of another ⇒ inter-net clearance holds | `debug_assert` + `routing_never_introduces_violations` proptest (400 dense boards in stress mode) |
 | **INV-EDIT-1** | Edits are additive (never delete/modify existing copper) and only move `Movable` footprints within bounds | `BoardEdit::check_invariants`, re-checked by the KiCad writer |
 | **INV-PLACE-1** | Locked/Fixed footprints never move; hard constraints always hold | Nudger proptest |
+| **INV-PLACE-3** | Translated footprints land on the absolute placement grid | `moves_land_on_the_placement_grid` |
+| **INV-ROUTE-2** | Every connection terminates at the pad centre; lattice segments are 0°/45°/90° | `tracks_terminate_at_pad_centres_and_stay_octilinear` |
 | **INV-CONN-1** | Connectivity is monotone: a run never disconnects pads that were connected | Additive edits + connectivity analysis |
 | **INV-COST-1** | PathFinder costs are non-negative; `pres_fac` and history are monotone non-decreasing | Construction (all factors ≥ 1, multipliers > 1) |
 | **INV-ACCEL-1** | Accelerators never change results | Legality tables equal with/without accelerator (test); routed edit equal for CPU-field vs exact |

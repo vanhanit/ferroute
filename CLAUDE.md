@@ -81,6 +81,8 @@ Update the benchmark baseline only on purpose:
 - [ ] **INV-ROUTE-1** no base node of one net inside another net's ring; `routing_never_introduces_violations` proptest green; `drc_gate_rips == 0`.
 - [ ] **INV-EDIT-1** edits are additive; only `Movable` footprints move, within bounds (`BoardEdit::check_invariants`).
 - [ ] **INV-PLACE-1** locked/fixed parts never move; nudged parts satisfy every hard constraint.
+- [ ] **INV-PLACE-3** translated footprints land on the absolute placement grid (`PlaceConfig::grid`, `--move-grid`).
+- [ ] **INV-ROUTE-2** every routed connection ends exactly at the pad centre; lattice segments are 0°/45°/90° only.
 - [ ] **INV-CONN-1** connectivity never decreases.
 - [ ] **INV-COST-1** PathFinder costs non-negative; present factor and history monotone.
 - [ ] **INV-ACCEL-1** accelerators never change results (legality tables equal with/without).

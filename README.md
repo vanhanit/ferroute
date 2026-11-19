@@ -9,7 +9,7 @@
 ![demo board routed by ferroute](docs/images/demo_2layer.routed.svg)
 
 *`testdata/boards/demo_2layer.kicad_pcb` (KiCad 10) routed by `ferroute route --allow-move`:
-100 % completion, 8 vias, 0 DRC errors in both ferroute's oracle and KiCad 10.0.8
+100 % completion, 6 vias, 0 DRC errors in both ferroute's oracle and KiCad 10.0.8
 `kicad-cli pcb drc`. Yellow arrows show unlocked passives that were nudged; the hatched
 area is a keep-out.*
 
@@ -22,8 +22,11 @@ when moving one resistor half a millimetre would open a channel. ferroute combin
 * **Negotiated congestion (PathFinder)** on a multi-layer octilinear lattice: all nets
   compete for resources with present + history costs instead of first-come-first-served.
 * **Placement co-optimisation:** explicitly *unlocked* parts (default `R*`, `C*`, `L*`,
-  `FB*`; your globs) may be translated within a bound and rotated by 90° when that helps
-  routing. **Locked footprints never move.**
+  `FB*`; your globs) may be translated within a bound — always onto an absolute placement
+  grid (`--move-grid`, default 0.1 mm) — and rotated by 90° when that helps routing.
+  **Locked footprints never move.**
+* **Clean geometry:** tracks run on a pad-aligned 0°/45°/90° lattice, are straightened by
+  a smoothing pass, and every connection terminates exactly at the pad centre.
 * **Correct by construction, verified anyway:** inter-net clearance follows from a
   *lattice separation theorem*; every fixed-obstacle decision uses exact integer
   geometry; and the independent DRC oracle refuses to emit anything it flags.
@@ -83,18 +86,18 @@ ferroute ipc export-svg --socket ipc:///tmp/k/api.sock --out plots/
 | `ferroute info` | Compute backends (CPU threads, GPU adapter) |
 
 Useful `route` flags: `--allow-move`, `--movable 'R*,C*,J5'`, `--exclude 'C1*'`,
-`--max-move 2mm`, `--no-rotate`, `--pitch 0.4mm`, `--layers F.Cu,B.Cu`,
+`--max-move 2mm`, `--move-grid 0.1mm`, `--no-rotate`, `--pitch 0.4mm`, `--layers F.Cu,B.Cu`,
 `--accel auto|cpu|gpu|none`, `--iterations 50`, `--lns-rounds 2`, `--seed N`.
 
 ## Benchmarks (v0.1 baseline)
 
 | board | DRC | completion | wirelength (mm) | vias | moved | runtime (ms) |
 |---|---|---|---|---|---|---|
-| ci-s2-small (2 layers) | ✅ | 100 % | 157.7 | 0 | 9 | 38 |
-| ci-s2-medium (2 layers) | ✅ | 100 % | 302.7 | 11 | 22 | 122 |
-| ci-s4-medium (4 layers) | ✅ | 100 % | 372.1 | 9 | 30 | 206 |
-| demo_2layer (KiCad 10 fixture) | ✅ | 100 % | 284.6 | 8 | 6 | 69 |
-| legacy_v9_numeric (KiCad 9 fixture) | ✅ | 100 % | 17.4 | 0 | 0 | 3 |
+| ci-s2-small (2 layers) | ✅ | 100 % | 163.4 | 2 | 9 | 44 |
+| ci-s2-medium (2 layers) | ✅ | 100 % | 333.1 | 14 | 22 | 132 |
+| ci-s4-medium (4 layers) | ✅ | 100 % | 396.2 | 13 | 30 | 210 |
+| demo_2layer (KiCad 10 fixture) | ✅ | 100 % | 318.8 | 6 | 6 | 245 |
+| legacy_v9_numeric (KiCad 9 fixture) | ✅ | 100 % | 18.2 | 0 | 0 | 4 |
 
 CI re-runs this suite on every PR and fails on any DRC regression, completion drop, or
 quality regression beyond tolerance (`crates/ferroute-engine/src/score.rs`). These v0.1

@@ -11,10 +11,10 @@
         "completion": 1.0,
         "connections_total": 20,
         "connections_missing": 0,
-        "wirelength_mm": 157.6576297914498,
-        "vias": 0,
+        "wirelength_mm": 163.44157513973389,
+        "vias": 2,
         "moved_footprints": 9,
-        "displacement_mm": 15.226146679014958,
+        "displacement_mm": 15.06796220338052,
         "runtime_ms": 100.0
       }
     },
@@ -28,10 +28,10 @@
         "completion": 1.0,
         "connections_total": 43,
         "connections_missing": 0,
-        "wirelength_mm": 302.6512985522208,
-        "vias": 11,
+        "wirelength_mm": 333.117286024959,
+        "vias": 14,
         "moved_footprints": 22,
-        "displacement_mm": 42.1837004064531,
+        "displacement_mm": 41.728505252050056,
         "runtime_ms": 200.0
       }
     },
@@ -45,10 +45,10 @@
         "completion": 1.0,
         "connections_total": 50,
         "connections_missing": 0,
-        "wirelength_mm": 372.14318164425765,
-        "vias": 9,
+        "wirelength_mm": 396.1793057071183,
+        "vias": 13,
         "moved_footprints": 30,
-        "displacement_mm": 52.51444310887097,
+        "displacement_mm": 51.83156486704026,
         "runtime_ms": 300.0
       }
     },
@@ -62,11 +62,11 @@
         "completion": 1.0,
         "connections_total": 18,
         "connections_missing": 0,
-        "wirelength_mm": 284.6225322406026,
-        "vias": 8,
+        "wirelength_mm": 318.7761806800331,
+        "vias": 6,
         "moved_footprints": 6,
-        "displacement_mm": 11.962994974529321,
-        "runtime_ms": 100.0
+        "displacement_mm": 11.95471488448714,
+        "runtime_ms": 300.0
       }
     },
     {
@@ -79,7 +79,7 @@
         "completion": 1.0,
         "connections_total": 1,
         "connections_missing": 0,
-        "wirelength_mm": 17.38233764908628,
+        "wirelength_mm": 18.2492223635865,
         "vias": 0,
         "moved_footprints": 0,
         "displacement_mm": 0.0,
