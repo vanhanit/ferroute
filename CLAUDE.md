@@ -82,7 +82,7 @@ Update the benchmark baseline only on purpose:
 - [ ] **INV-EDIT-1** edits are additive; only `Movable` footprints move, within bounds (`BoardEdit::check_invariants`).
 - [ ] **INV-PLACE-1** locked/fixed parts never move; nudged parts satisfy every hard constraint.
 - [ ] **INV-PLACE-3** translated footprints land on the absolute placement grid (`PlaceConfig::grid`, `--move-grid`).
-- [ ] **INV-ROUTE-2** every routed connection ends exactly at the pad centre; every segment (incl. the off-lattice pad approach) is 0°/45°/90°.
+- [ ] **INV-ROUTE-2** every routed connection ends exactly at the pad centre, crosses the pad edge on an axis through the centre (side midpoint for rectangular pads, any 0/45/90° line for circular pads), and every segment is 0°/45°/90°.
 - [ ] **INV-CONN-1** connectivity never decreases.
 - [ ] **INV-COST-1** PathFinder costs non-negative; present factor and history monotone.
 - [ ] **INV-ACCEL-1** accelerators never change results (legality tables equal with/without).

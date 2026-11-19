@@ -180,22 +180,25 @@ seeds replay across dependency upgrades and platforms.
   boundary contact). Policy: no via-in-pad.
 * Optional accelerator field (§6) prunes sites provably far from all obstacles.
 
-### 4.2 Pin access — routes terminate at pad centres
-Every connection ends exactly at the pad centre (KiCad convention; avoids off-centre
-track ends):
+### 4.2 Pin access — on-axis pad entry, ending at the pad centre
+Every connection ends exactly at the pad centre and crosses the pad edge on an axis
+through the centre:
 
-1. The lattice origin is chosen so the largest number of pad centres fall *on* lattice
-   nodes (mode of pad-centre residues modulo the pitch); such pads terminate directly.
-2. Otherwise up to four **contained centre-stubs** join an interior lattice node to the
-   centre. Stubs are always octilinear: a direct 0°/45°/90° segment, or a dog-leg of one
-   45° run and one 0°/90° run whose bend point may lie off the lattice (the lattice is
-   only relaxed for the final approach into the pad). Single segments are preferred,
-   then the shortest. A stub whose copper lies
-   entirely inside the pad copper (exact erosion test) adds no copper outside the pad, so
-   it is legal by the pad's own legality and needs **no reservation**.
-3. Small/narrow pads fall back to exterior exact stubs (centre → nearby legal node,
-   checked against fixed obstacles, also octilinear) that reserve every lattice node within
-   `max required centre distance + pitch/√2` of the spine.
+* **Entry directions:** rectangular, oval and round-rect pads are entered/left
+  perpendicular to a side through its midpoint (short or long side, following pad
+  rotation); circular pads (incl. through-hole pads) along any 0°/45°/90° line through
+  the centre. Non-octilinear pad rotations fall back to the 8 octilinear directions.
+* **Stub shape:** centre → break-out point `m` on the entry axis at or beyond the pad edge
+  (may be off the lattice) → optional single 0°/45°/90° leg pointing *away* from the pad
+  to a lattice node. Only this last approach leaves the lattice.
+* **Exactness:** each stub segment is checked against fixed obstacles exactly. The part of
+  the stub inside the pad copper (exact erosion test) needs no reservation; the outside
+  part reserves lattice nodes within `max(track requirement + pitch/√2, via/hole
+  requirement)`. Stub-vs-stub conflicts between nets are precomputed exactly and
+  negotiated like any other resource (present cost, history, rip-up).
+* **No pad crossing:** lattice nodes inside pad copper are blocked, so routes never cut
+  across a pad.
+* The lattice origin is still aligned so the most pad centres sit on lattice nodes.
 
 ### 4.3 Negotiated congestion (PathFinder)
 * Nets are ordered by terminal HPWL (seeded SplitMix64 tie-break).
@@ -256,7 +259,7 @@ in property tests over thousands of random boards).
 | **INV-EDIT-1** | Edits are additive (never delete/modify existing copper) and only move `Movable` footprints within bounds | `BoardEdit::check_invariants`, re-checked by the KiCad writer |
 | **INV-PLACE-1** | Locked/Fixed footprints never move; hard constraints always hold | Nudger proptest |
 | **INV-PLACE-3** | Translated footprints land on the absolute placement grid | `moves_land_on_the_placement_grid` |
-| **INV-ROUTE-2** | Every connection terminates at the pad centre; every segment, including the pad approach, is 0°/45°/90° | `tracks_terminate_at_pad_centres_and_stay_octilinear` |
+| **INV-ROUTE-2** | Every connection terminates at the pad centre, enters along a pad axis (side midpoint) or 0/45/90° line for circular pads, and every segment is 0°/45°/90° | `tracks_terminate_at_pad_centres_and_stay_octilinear` |
 | **INV-CONN-1** | Connectivity is monotone: a run never disconnects pads that were connected | Additive edits + connectivity analysis |
 | **INV-COST-1** | PathFinder costs are non-negative; `pres_fac` and history are monotone non-decreasing | Construction (all factors ≥ 1, multipliers > 1) |
 | **INV-ACCEL-1** | Accelerators never change results | Legality tables equal with/without accelerator (test); routed edit equal for CPU-field vs exact |

@@ -11,8 +11,8 @@
         "completion": 1.0,
         "connections_total": 20,
         "connections_missing": 0,
-        "wirelength_mm": 163.44157513973389,
-        "vias": 2,
+        "wirelength_mm": 163.79267237565477,
+        "vias": 5,
         "moved_footprints": 9,
         "displacement_mm": 15.06796220338052,
         "runtime_ms": 100.0
@@ -28,8 +28,8 @@
         "completion": 1.0,
         "connections_total": 43,
         "connections_missing": 0,
-        "wirelength_mm": 333.117286024959,
-        "vias": 14,
+        "wirelength_mm": 345.5230265358659,
+        "vias": 16,
         "moved_footprints": 22,
         "displacement_mm": 41.728505252050056,
         "runtime_ms": 200.0
@@ -45,11 +45,28 @@
         "completion": 1.0,
         "connections_total": 50,
         "connections_missing": 0,
-        "wirelength_mm": 396.1793057071183,
-        "vias": 13,
+        "wirelength_mm": 414.11951498609375,
+        "vias": 11,
         "moved_footprints": 30,
         "displacement_mm": 51.83156486704026,
-        "runtime_ms": 300.0
+        "runtime_ms": 200.0
+      }
+    },
+    {
+      "board": "demo_2layer-fixed",
+      "seed": 1,
+      "metrics": {
+        "drc_clean": true,
+        "introduced_violations": 0,
+        "total_violations": 0,
+        "completion": 1.0,
+        "connections_total": 18,
+        "connections_missing": 0,
+        "wirelength_mm": 338.05492831816144,
+        "vias": 7,
+        "moved_footprints": 0,
+        "displacement_mm": 0.0,
+        "runtime_ms": 100.0
       }
     },
     {
@@ -62,11 +79,28 @@
         "completion": 1.0,
         "connections_total": 18,
         "connections_missing": 0,
-        "wirelength_mm": 318.7761806800331,
-        "vias": 6,
+        "wirelength_mm": 313.0951974375074,
+        "vias": 8,
         "moved_footprints": 6,
-        "displacement_mm": 11.95471488448714,
-        "runtime_ms": 300.0
+        "displacement_mm": 11.921978840013155,
+        "runtime_ms": 100.0
+      }
+    },
+    {
+      "board": "legacy_v9_numeric-fixed",
+      "seed": 1,
+      "metrics": {
+        "drc_clean": true,
+        "introduced_violations": 0,
+        "total_violations": 0,
+        "completion": 1.0,
+        "connections_total": 1,
+        "connections_missing": 0,
+        "wirelength_mm": 18.24122112556947,
+        "vias": 0,
+        "moved_footprints": 0,
+        "displacement_mm": 0.0,
+        "runtime_ms": 100.0
       }
     },
     {
@@ -79,7 +113,7 @@
         "completion": 1.0,
         "connections_total": 1,
         "connections_missing": 0,
-        "wirelength_mm": 18.2492223635865,
+        "wirelength_mm": 18.24122112556947,
         "vias": 0,
         "moved_footprints": 0,
         "displacement_mm": 0.0,
