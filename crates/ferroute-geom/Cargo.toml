@@ -1,0 +1,21 @@
+[package]
+name = "ferroute-geom"
+description = "Exact integer (nanometre) geometry kernel and DRC predicates for ferroute"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+keywords.workspace = true
+categories.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+serde.workspace = true
+smallvec = { workspace = true, features = ["serde"] }
+
+[dev-dependencies]
+proptest.workspace = true
