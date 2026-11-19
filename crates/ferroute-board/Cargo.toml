@@ -1,0 +1,19 @@
+[package]
+name = "ferroute-board"
+description = "Board data model (layers, nets, footprints, pads, copper, rules) for ferroute"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+keywords.workspace = true
+categories.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+ferroute-geom.workspace = true
+serde.workspace = true
+thiserror.workspace = true
