@@ -122,8 +122,9 @@ pub struct PlaceConfig {
     pub starts: u32,
     /// Proposals per movable footprint per chain.
     pub moves_per_fp: u32,
-    /// Translation quantum (nm). Proposed positions are multiples of this offset.
-    pub quantum: Coord,
+    /// Placement grid (nm). A translated footprint's anchor always lands on an absolute
+    /// multiple of this step (INV-PLACE-3), like KiCad's placement grid.
+    pub grid: Coord,
     pub w_wire: f64,
     pub w_cong: f64,
     pub w_disp: f64,
@@ -139,7 +140,7 @@ impl Default for PlaceConfig {
             seed: 1,
             starts: 4,
             moves_per_fp: 400,
-            quantum: 50_000,
+            grid: 100_000,
             w_wire: 1.0,
             w_cong: 4.0,
             w_disp: 0.25,
@@ -259,6 +260,12 @@ impl<'a> Model<'a> {
     }
 }
 
+/// Rounds `v` to the nearest multiple of `g` (ties toward +∞), in absolute coordinates.
+#[must_use]
+pub const fn snap(v: Coord, g: Coord) -> Coord {
+    (v + g / 2).div_euclid(g) * g
+}
+
 /// Exact hard-constraint check for placing footprint `fid` at `pl` while every other
 /// footprint uses `placements`.
 #[must_use]
@@ -374,7 +381,7 @@ fn chain(
     // Initial temperature: a typical uphill move (≈ quantum-scale wire change) is
     // accepted with probability ~0.5 at the start.
     #[allow(clippy::cast_precision_loss)]
-    let t0 = (cfg.w_wire * mm(cfg.quantum as f64) * 20.0).max(1e-6);
+    let t0 = (cfg.w_wire * mm(cfg.grid as f64) * 20.0).max(1e-6);
     let t_end = t0 * 1e-3;
     let (mut accepted, mut proposed) = (0u64, 0u64);
     for step in 0..total {
@@ -392,12 +399,13 @@ fn chain(
         } else {
             // Window shrinks with temperature (coarse → fine).
             #[allow(clippy::cast_precision_loss, clippy::cast_possible_truncation)]
-            let r = ((max_displacement as f64 * (1.0 - 0.9 * frac)) / cfg.quantum as f64)
-                .ceil()
-                .max(1.0) as i64;
-            let dx = rng.range_i64(-r, r) * cfg.quantum;
-            let dy = rng.range_i64(-r, r) * cfg.quantum;
-            cand.pos = cand.pos + Point::new(dx, dy);
+            let g = cfg.grid.max(1);
+            let r =
+                ((max_displacement as f64 * (1.0 - 0.9 * frac)) / g as f64).ceil().max(1.0) as i64;
+            let dx = rng.range_i64(-r, r) * g;
+            let dy = rng.range_i64(-r, r) * g;
+            let p = cand.pos + Point::new(dx, dy);
+            cand.pos = Point::new(snap(p.x, g), snap(p.y, g));
         }
         proposed += 1;
         if cand == cur[fid.idx()] || !legal(board, &cur, fid, cand) {

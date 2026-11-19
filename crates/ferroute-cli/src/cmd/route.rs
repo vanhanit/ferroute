@@ -54,6 +54,9 @@ pub struct RouteArgs {
     /// Maximum displacement of a movable footprint.
     #[arg(long, default_value = "2mm", value_parser = parse_length)]
     pub max_move: Coord,
+    /// Placement grid for nudged footprints: moved anchors land on multiples of this step.
+    #[arg(long, default_value = "0.1mm", value_parser = parse_length)]
+    pub move_grid: Coord,
     /// Forbid 90° rotations of movable footprints.
     #[arg(long)]
     pub no_rotate: bool,
@@ -119,9 +122,12 @@ pub fn run(a: &RouteArgs) -> Result<ExitCode> {
             accel: a.accel.into(),
             ..RouterConfig::default()
         },
-        nudge: a
-            .allow_move
-            .then(|| (policy, PlaceConfig { seed: a.seed, ..PlaceConfig::default() })),
+        nudge: a.allow_move.then(|| {
+            (
+                policy,
+                PlaceConfig { seed: a.seed, grid: a.move_grid.max(1), ..PlaceConfig::default() },
+            )
+        }),
         lns_rounds: a.lns_rounds,
         ..PipelineConfig::default()
     };

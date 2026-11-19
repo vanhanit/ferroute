@@ -113,3 +113,26 @@ proptest::proptest! {
         proptest::prop_assert_eq!(new_viol, 0, "{:#?}", rep.violations);
     }
 }
+
+#[test]
+fn moves_land_on_the_placement_grid() {
+    let mut board = stretched();
+    // Put R2 off-grid first: its new position must still be snapped.
+    board.footprints[2].placement.pos =
+        board.footprints[2].placement.pos + Point::new(12_345, -6_789);
+    board.footprints[2].original = board.footprints[2].placement;
+    apply_policy(&mut board, &MovePolicy { max_displacement: mm(10), ..MovePolicy::default() });
+    for grid in [50_000, 100_000, 250_000] {
+        let r = optimize(&board, &PlaceConfig { seed: 3, grid, ..PlaceConfig::default() });
+        assert!(!r.moves.is_empty());
+        for m in &r.moves {
+            if m.to.pos != m.from.pos {
+                assert_eq!(
+                    (m.to.pos.x % grid, m.to.pos.y % grid),
+                    (0, 0),
+                    "{m:?} off the {grid} nm grid"
+                );
+            }
+        }
+    }
+}

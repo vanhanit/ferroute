@@ -115,6 +115,7 @@ pub fn run(c: &IpcCommand) -> Result<ExitCode> {
                 movable: Vec::new(),
                 exclude: Vec::new(),
                 max_move: 2_000_000,
+                move_grid: 100_000,
                 no_rotate: false,
                 pitch: None,
                 layers: Vec::new(),
