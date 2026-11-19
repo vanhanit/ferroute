@@ -11,7 +11,9 @@ fn fixtures_are_canonical() {
     // Set FERROUTE_REGEN_FIXTURES=1 to rewrite the fixtures in canonical form.
     for name in ["demo_2layer.kicad_pcb", "legacy_v9_numeric.kicad_pcb"] {
         let path = fixture(name);
-        let src = std::fs::read_to_string(&path).unwrap();
+        // Tolerate CRLF checkouts (e.g. git core.autocrlf on Windows): KiCad's lexer treats
+        // '\r' as whitespace and we always write LF, so compare modulo line endings.
+        let src = std::fs::read_to_string(&path).unwrap().replace("\r\n", "\n");
         let canon = sexpr::parse(&src).unwrap().serialize();
         if std::env::var_os("FERROUTE_REGEN_FIXTURES").is_some() {
             std::fs::write(&path, &canon).unwrap();

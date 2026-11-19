@@ -1,0 +1,17 @@
+# Normalise line endings: KiCad files, sources and fixtures are compared byte-for-byte
+# in tests, so they must be LF on every platform (Windows runners default to CRLF).
+* text=auto eol=lf
+*.kicad_pcb text eol=lf
+*.kicad_pro text eol=lf
+*.kicad_sch text eol=lf
+*.svg       text eol=lf
+*.json      text eol=lf
+*.rs        text eol=lf
+*.toml      text eol=lf
+*.md        text eol=lf
+*.yml       text eol=lf
+*.sh        text eol=lf
+.github/hooks/* text eol=lf
+*.png  binary
+*.jpg  binary
+*.gz   binary
