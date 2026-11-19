@@ -1,0 +1,15 @@
+{
+  "name": "ferroute-dev-tools",
+  "version": "0.0.0",
+  "private": true,
+  "description": "Dev-only tooling for ferroute (commit linting). Not part of the Rust build.",
+  "license": "AGPL-3.0-only",
+  "engines": { "node": ">=22.12.0" },
+  "scripts": {
+    "commitlint": "commitlint --config commitlint.config.mjs"
+  },
+  "devDependencies": {
+    "@commitlint/cli": "21.2.4",
+    "@commitlint/config-conventional": "21.2.4"
+  }
+}

@@ -1,0 +1,21 @@
+#!/usr/bin/env bash
+# Conventional-commit check. Installed by `make hooks`.
+# Uses local node_modules/npx if available, else a pinned node container.
+set -eu
+msg_file="$1"
+root="$(git rev-parse --show-toplevel)"
+cd "$root"
+NODE_IMAGE="node:24.22.3-trixie-slim@sha256:af02d57b57719b9657a45199a79264a9437940cd55b3c7b3fc99615654f124a0"
+if [ -x node_modules/.bin/commitlint ]; then
+  exec node_modules/.bin/commitlint --config commitlint.config.mjs --edit "$msg_file"
+elif command -v docker >/dev/null 2>&1; then
+  # Install into a throwaway dir so the repo stays clean; msg is piped on stdin.
+  exec docker run --rm -i -v "$root":/work:ro -w /tmp "$NODE_IMAGE" bash -c \
+    'cp /work/package.json /work/commitlint.config.mjs . && npm install --no-audit --no-fund --silent >/dev/null 2>&1 && npx --no-install commitlint --config commitlint.config.mjs' < "$msg_file"
+elif command -v npx >/dev/null 2>&1; then
+  exec npx --yes -p @commitlint/cli@21.2.4 -p @commitlint/config-conventional@21.2.4 \
+    commitlint --config commitlint.config.mjs --edit "$msg_file"
+else
+  echo "commit-msg hook: need node_modules, docker or npx to lint the message" >&2
+  exit 1
+fi

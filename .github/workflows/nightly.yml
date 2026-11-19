@@ -1,0 +1,20 @@
+name: nightly
+
+on:
+  schedule:
+    - cron: "17 3 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: nightly
+  cancel-in-progress: true
+
+jobs:
+  # Runs the whole verify suite, which includes the non-blocking kicad11-preview lane,
+  # so upstream KiCad API/format changes surface within a day.
+  verify:
+    uses: ./.github/workflows/verify.yml
+    secrets: inherit

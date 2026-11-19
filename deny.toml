@@ -1,0 +1,73 @@
+# cargo-deny 0.21 configuration. Docs: https://embarkstudios.github.io/cargo-deny/
+# ferroute is AGPL-3.0-only. Every dependency license must be compatible with AGPL-3.0:
+# only the SPDX ids listed in `[licenses].allow` pass; anything else is REJECTED by default.
+#
+# Explicitly forbidden (never add to `allow`):
+#   GPL-2.0-only / GPL-2.0 (no "or later" => incompatible with GPL-3/AGPL-3),
+#   SSPL-1.0, BUSL-1.1 (and other source-available terms), CC-BY-NC-* / any non-commercial
+#   clause (conflicts with the commercial dual-licensing in COMMERCIAL.md), Elastic-2.0,
+#   Commons-Clause, proprietary / LicenseRef-* / unlicensed crates, OpenSSL-era advertising
+#   licenses without an explicit exception.
+
+[graph]
+all-features = false
+no-default-features = false
+
+[output]
+feature-depth = 1
+
+[advisories]
+# Known vulnerabilities are always an error in cargo-deny >= 0.19 (no `vulnerability` key).
+yanked = "deny"
+unmaintained = "all"   # scope: all | workspace | transitive | none
+unsound = "all"
+ignore = [
+    # { id = "RUSTSEC-0000-0000", reason = "justify here, link tracking issue" },
+]
+
+[licenses]
+confidence-threshold = 0.93
+unused-allowed-license = "allow"
+allow = [
+    "MIT",
+    "MIT-0",                         # MIT without attribution requirement; permissive, AGPL-compatible
+    "Apache-2.0",                    # compatible with GPL-3.0 / AGPL-3.0 (not with GPL-2.0)
+    "Apache-2.0 WITH LLVM-exception",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "ISC",
+    "Zlib",
+    "MPL-2.0",                       # file-level copyleft; explicitly GPL/AGPL-compatible (secondary license clause)
+    "LGPL-2.1-or-later",             # "or later" lets us combine under LGPL-3.0 and then AGPL-3.0
+    "LGPL-3.0-only",
+    "LGPL-3.0-or-later",
+    "GPL-3.0-only",
+    "GPL-3.0-or-later",
+    "AGPL-3.0-only",                 # our own license (workspace crates)
+    "AGPL-3.0-or-later",
+    "Unicode-3.0",                   # required by unicode-ident & ICU data crates; permissive, GPL/AGPL-compatible
+    "BSL-1.0",                       # Boost Software License: permissive, GPL-compatible (NOT BUSL)
+    "CC0-1.0",                       # public-domain dedication; GPL-compatible
+]
+exceptions = []
+
+[licenses.private]
+# Workspace crates are AGPL-3.0-only and are checked like any other crate.
+ignore = false
+
+[bans]
+multiple-versions = "warn"
+wildcards = "deny"
+allow-wildcard-paths = true     # path dependencies between workspace crates
+highlight = "all"
+workspace-default-features = "allow"
+external-default-features = "allow"
+deny = []
+skip = []
+skip-tree = []
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]
+allow-git = []

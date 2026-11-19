@@ -1,0 +1,246 @@
+name: verify
+
+on:
+  workflow_call:
+    secrets:
+      SONAR_TOKEN:
+        required: false
+      SONAR_HOST_URL:
+        required: false
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: "0"
+  RUST_BACKTRACE: "1"
+
+jobs:
+  fmt:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v6
+      - name: Install toolchain (rust-toolchain.toml)
+        run: rustup show active-toolchain || rustup toolchain install
+      - run: cargo fmt --all -- --check
+
+  clippy:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v6
+      - run: rustup show active-toolchain || rustup toolchain install
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo clippy --workspace --all-targets --locked -- -D warnings
+
+  test:
+    name: test (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-24.04, macos-latest, windows-latest]
+    steps:
+      - uses: actions/checkout@v6
+      - run: rustup show active-toolchain || rustup toolchain install
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo test --workspace --locked
+
+  gpu-test:
+    runs-on: ubuntu-24.04
+    continue-on-error: true
+    env:
+      WGPU_BACKEND: vulkan
+    steps:
+      - uses: actions/checkout@v6
+      - run: rustup show active-toolchain || rustup toolchain install
+      - uses: Swatinem/rust-cache@v2
+      - name: Install software Vulkan (lavapipe)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends mesa-vulkan-drivers libvulkan1
+      - run: cargo test -p ferroute-gpu --features gpu --locked
+
+  audit:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v6
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-deny@0.21.0,cargo-audit@0.23.0
+      - name: cargo-deny (licenses, bans, sources, advisories)
+        run: cargo deny --locked check
+      - name: cargo-audit (RustSec)
+        run: cargo audit
+
+  drc-regression:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v6
+      - run: rustup show active-toolchain || rustup toolchain install
+      - uses: Swatinem/rust-cache@v2
+      - run: make NATIVE=1 e2e
+      - run: make NATIVE=1 drc-bench
+      - uses: actions/upload-artifact@v7
+        if: always()
+        with:
+          name: drc-regression-out
+          path: out/
+          if-no-files-found: warn
+
+  build-musl:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v6
+      - run: rustup show active-toolchain || rustup toolchain install
+      - run: rustup target add x86_64-unknown-linux-musl && sudo apt-get update && sudo apt-get install -y --no-install-recommends musl-tools
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo build --release --locked --target x86_64-unknown-linux-musl -p ferroute-cli
+      - name: Stage binary
+        run: |
+          mkdir -p dist
+          cp target/x86_64-unknown-linux-musl/release/ferroute dist/ferroute
+          file dist/ferroute || true
+          ./dist/ferroute --version
+      - uses: actions/upload-artifact@v7
+        with:
+          name: ferroute-linux-x86_64-musl
+          path: dist/ferroute
+          if-no-files-found: error
+
+  # Required lane: KiCad 10 stable must load our output and report zero DRC errors.
+  kicad10:
+    needs: build-musl
+    runs-on: ubuntu-24.04
+    container:
+      image: kicad/kicad:10.0.8@sha256:3f4a01786dfbe803a65f345c3342b765db9add913f5e9448f8356793714ddc34
+      options: --user root
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/download-artifact@v8
+        with:
+          name: ferroute-linux-x86_64-musl
+          path: bin
+      - name: Route boards
+        shell: bash
+        run: |
+          set -euo pipefail
+          chmod +x bin/ferroute
+          mkdir -p out
+          shopt -s nullglob
+          boards=(testdata/boards/*.kicad_pcb)
+          [ ${#boards[@]} -gt 0 ] || { echo "no boards"; exit 1; }
+          for f in "${boards[@]}"; do
+            n=$(basename "$f" .kicad_pcb)
+            ./bin/ferroute route "$f" -o "out/$n.routed.kicad_pcb" --report "out/$n.json" --svg "out/$n.svg" --seed 1
+          done
+      - name: KiCad DRC
+        shell: bash
+        run: |
+          set -euo pipefail
+          rc=0
+          for f in out/*.routed.kicad_pcb; do
+            n=$(basename "$f" .routed.kicad_pcb)
+            kicad-cli pcb drc --format json --severity-error --exit-code-violations -o "out/$n.drc.json" "$f" || rc=1
+            python3 -I scripts/check_kicad_drc.py "out/$n.drc.json" || rc=1
+          done
+          exit $rc
+      - name: KiCad loads outputs (SVG + Gerbers)
+        shell: bash
+        run: |
+          set -euo pipefail
+          for f in out/*.routed.kicad_pcb; do
+            n=$(basename "$f" .routed.kicad_pcb)
+            mkdir -p "out/kicad/$n/gerbers"
+            kicad-cli pcb export svg --layers "F.Cu,B.Cu,Edge.Cuts" --mode-single -o "out/kicad/$n/$n.svg" "$f"
+            kicad-cli pcb export gerbers -o "out/kicad/$n/gerbers/" "$f"
+          done
+      - uses: actions/upload-artifact@v7
+        if: always()
+        with:
+          name: kicad10-out
+          path: out/
+          if-no-files-found: warn
+
+  # Non-blocking: KiCad nightly (v11 preview) IPC API + DRC. Upstream churn must not break CI.
+  kicad11-preview:
+    needs: build-musl
+    runs-on: ubuntu-24.04
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/download-artifact@v8
+        with:
+          name: ferroute-linux-x86_64-musl
+          path: bin
+      - name: Install KiCad nightly
+        run: |
+          sudo add-apt-repository -y ppa:kicad/kicad-dev-nightly
+          sudo apt-get update
+          sudo apt-get install -y kicad-nightly xvfb
+      - name: Probe KiCad 11 API + DRC
+        shell: bash
+        run: |
+          set -uo pipefail
+          chmod +x bin/ferroute
+          mkdir -p out/kicad11 /tmp/ferroute-kicad
+          CLI=$(command -v kicad-cli-nightly || command -v kicad-cli || true)
+          [ -n "$CLI" ] || { echo "no kicad cli found"; dpkg -L kicad-nightly | grep bin/ | head; exit 1; }
+          "$CLI" version || true
+          board=$(ls testdata/boards/*.kicad_pcb | head -n1)
+          SOCK=/tmp/ferroute-kicad/api.sock
+          "$CLI" api-server --socket "$SOCK" "$board" > out/kicad11/api-server.log 2>&1 &
+          for _ in $(seq 1 30); do [ -S "$SOCK" ] && break; sleep 1; done
+          ls -l /tmp/ferroute-kicad || true
+          ./bin/ferroute ipc probe --socket "ipc://$SOCK" --json | tee out/kicad11/probe.json || echo "::warning::ipc probe failed"
+          ./bin/ferroute ipc export-svg --socket "ipc://$SOCK" --out out/kicad11 || echo "::warning::ipc export-svg failed"
+          for f in testdata/boards/*.kicad_pcb; do
+            n=$(basename "$f" .kicad_pcb)
+            ./bin/ferroute route "$f" -o "out/kicad11/$n.routed.kicad_pcb" --seed 1 || continue
+            "$CLI" pcb drc --format json --severity-error -o "out/kicad11/$n.drc.json" "out/kicad11/$n.routed.kicad_pcb" || true
+            python3 -I scripts/check_kicad_drc.py "out/kicad11/$n.drc.json" || true
+          done
+          echo "---- api-server log ----"; cat out/kicad11/api-server.log || true
+          kill %1 2>/dev/null || true
+      - uses: actions/upload-artifact@v7
+        if: always()
+        with:
+          name: kicad11-preview-out
+          path: out/
+          if-no-files-found: warn
+
+  sonar:
+    runs-on: ubuntu-24.04
+    env:
+      SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
+    steps:
+      - name: Check Sonar configuration
+        id: cfg
+        run: |
+          if [ -n "$SONAR_TOKEN" ]; then echo "enabled=true" >> "$GITHUB_OUTPUT"; else echo "enabled=false" >> "$GITHUB_OUTPUT"; echo "SONAR_TOKEN not set; skipping"; fi
+      - uses: actions/checkout@v6
+        if: steps.cfg.outputs.enabled == 'true'
+        with:
+          fetch-depth: 0
+      - if: steps.cfg.outputs.enabled == 'true'
+        run: rustup show active-toolchain || rustup toolchain install
+      - if: steps.cfg.outputs.enabled == 'true'
+        uses: Swatinem/rust-cache@v2
+      - if: steps.cfg.outputs.enabled == 'true'
+        run: rustup component add llvm-tools-preview
+      - if: steps.cfg.outputs.enabled == 'true'
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-llvm-cov@0.9.1
+      - name: Coverage + clippy reports
+        if: steps.cfg.outputs.enabled == 'true'
+        run: |
+          mkdir -p out
+          cargo llvm-cov --workspace --locked --lcov --output-path out/lcov.info
+          cargo clippy --workspace --all-targets --locked --message-format=json > out/clippy.json
+      - name: SonarQube scan
+        if: steps.cfg.outputs.enabled == 'true'
+        uses: SonarSource/sonarqube-scan-action@v8
+        env:
+          SONAR_HOST_URL: ${{ secrets.SONAR_HOST_URL }}
