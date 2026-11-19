@@ -60,8 +60,10 @@ pub fn emit(
     }
     for &s in &r.stubs {
         let st = &stubs[s as usize];
-        if st.from != st.to {
-            tracks.push(track(st.from, st.to, st.layer));
+        for w in st.path.windows(2) {
+            if w[0] != w[1] {
+                tracks.push(track(w[0], w[1], st.layer));
+            }
         }
     }
     let layers = board.all_layers();

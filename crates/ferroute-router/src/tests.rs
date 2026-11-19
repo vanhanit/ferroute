@@ -234,10 +234,10 @@ fn tracks_terminate_at_pad_centres_and_stay_octilinear() {
             );
         }
         for t in &out.edit.new_tracks {
-            let at_pad = centres.iter().any(|&(_, c)| c == t.start || c == t.end);
+            // Every segment, including the final approach into a pad, is 0°/45°/90°.
             let d = t.end - t.start;
             let octi = d.x == 0 || d.y == 0 || d.x.abs() == d.y.abs();
-            assert!(octi || at_pad, "seed {seed}: non-octilinear lattice segment {t:?}");
+            assert!(octi, "seed {seed}: non-octilinear segment {t:?}");
         }
     }
 }
