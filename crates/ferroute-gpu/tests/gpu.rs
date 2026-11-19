@@ -51,23 +51,39 @@ fn gpu_matches_cpu_random() {
         .unwrap();
 }
 
-#[test]
-fn gpu_large_grid_and_many_obstacles() {
-    let Some(gpu) = backend() else { return };
-    // > 65535*64 nodes forces the 2D dispatch; > 16384 obstacles forces passes.
-    let mut obs = Vec::new();
-    for k in 0..20_000i64 {
-        obs.push(Capsule {
-            a: [(k * 7919) % 400_000, (k * 104_729) % 400_000],
-            b: [(k * 7919) % 400_000 + 300, (k * 104_729) % 400_000],
+fn obstacles(n: i64, extent: i64) -> Vec<Capsule> {
+    (0..n)
+        .map(|k| Capsule {
+            a: [(k * 7919) % extent, (k * 104_729) % extent],
+            b: [(k * 7919) % extent + 300, (k * 104_729) % extent],
             radius: 20,
-        });
-    }
+        })
+        .collect()
+}
+
+// Kept cheap on purpose: CI runs these on lavapipe (software Vulkan on the CPU), where
+// nodes × obstacles evaluations cost real CPU time.
+#[test]
+fn gpu_large_grid_uses_2d_dispatch() {
+    let Some(gpu) = backend() else { return };
+    // > 65535*64 nodes forces the 2D dispatch path.
     let c = Case {
         grid: GridSpec { origin: [0, 0], pitch: 100, nx: 2200, ny: 2000 },
-        obstacles: obs,
+        obstacles: obstacles(64, 220_000),
         cutoff: 2_000,
     };
     assert!(u64::from(c.grid.nx) * u64::from(c.grid.ny) > 65_535 * 64);
+    compare(&gpu, &c);
+}
+
+#[test]
+fn gpu_many_obstacles_use_multiple_passes() {
+    let Some(gpu) = backend() else { return };
+    // > 16384 obstacles forces several obstacle passes (min-combined).
+    let c = Case {
+        grid: GridSpec { origin: [0, 0], pitch: 100, nx: 64, ny: 64 },
+        obstacles: obstacles(20_000, 6_400),
+        cutoff: 2_000,
+    };
     compare(&gpu, &c);
 }
