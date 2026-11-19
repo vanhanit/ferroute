@@ -1,0 +1,46 @@
+[package]
+name = "ferroute-cli"
+description = "ferroute: placement-aware, GPU/multi-core accelerated PCB autorouter for KiCad 10/11"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+keywords.workspace = true
+categories.workspace = true
+readme = "../../README.md"
+
+[lints]
+workspace = true
+
+[[bin]]
+name = "ferroute"
+path = "src/main.rs"
+
+[features]
+default = []
+# Portable GPU compute (wgpu: Vulkan / Metal / DX12) for the clearance-field accelerator.
+gpu = ["ferroute-gpu/gpu"]
+
+[dependencies]
+anyhow.workspace = true
+clap.workspace = true
+rayon.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+ferroute-geom.workspace = true
+ferroute-board.workspace = true
+ferroute-kicad.workspace = true
+ferroute-drc.workspace = true
+ferroute-router.workspace = true
+ferroute-place.workspace = true
+ferroute-render.workspace = true
+ferroute-ipc.workspace = true
+ferroute-gpu.workspace = true
+ferroute-engine.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
