@@ -1,0 +1,24 @@
+name: Bug report
+description: Something is wrong (crash, bad routing, DRC violation, KiCad can't open output)
+labels: [bug]
+body:
+  - type: input
+    id: version
+    attributes: { label: ferroute version, description: Output of `ferroute --version` }
+    validations: { required: true }
+  - type: input
+    id: kicad
+    attributes: { label: KiCad version, placeholder: "10.0.8" }
+  - type: dropdown
+    id: os
+    attributes: { label: OS, options: [Linux, macOS, Windows, Other] }
+  - type: textarea
+    id: what
+    attributes: { label: What happened, description: Include the command line and expected vs actual behaviour. }
+    validations: { required: true }
+  - type: textarea
+    id: repro
+    attributes: { label: Reproduction, description: Attach a minimal .kicad_pcb if possible. }
+  - type: textarea
+    id: logs
+    attributes: { label: Logs / DRC output, render: text }
