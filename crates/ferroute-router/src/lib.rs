@@ -20,6 +20,7 @@ pub mod legality;
 pub mod negotiate;
 pub mod plan;
 pub mod search;
+pub mod smooth;
 
 use access::{Stub, Terminal, pad_terminals};
 use ferroute_board::{Board, BoardEdit, LayerSet, NetId, PadId};
@@ -202,7 +203,8 @@ pub fn route(board: &Board, cfg: &RouterConfig) -> Result<RouteOutcome, RouteErr
     let pitch = cfg.pitch.unwrap_or_else(|| default_pitch(&board.rules));
     let plan = Plan::new(&board.rules, pitch);
     let bbox = board.outline.bbox().ok_or_else(|| RouteError::InvalidBoard("no outline".into()))?;
-    let grid = Grid::covering(bbox, pitch, layers);
+    let origin = aligned_origin(board, bbox, pitch);
+    let grid = Grid::covering(Rect::new(origin, bbox.max), pitch, layers);
     if grid.len() > (1 << 26) {
         return Err(RouteError::GridTooLarge(grid.len()));
     }
@@ -357,6 +359,31 @@ pub fn route(board: &Board, cfg: &RouterConfig) -> Result<RouteOutcome, RouteErr
         timings: Timings { legality_ms, negotiation_ms, gate_ms },
         failed,
     })
+}
+
+/// Lattice origin (≤ `bbox.min`) whose residue modulo `pitch` puts the largest number of
+/// pad centres exactly on lattice nodes, so tracks terminate at pad centres without stubs.
+/// Ties resolve to the smallest residue (deterministic).
+#[must_use]
+pub fn aligned_origin(board: &Board, bbox: Rect, pitch: Coord) -> ferroute_geom::Point {
+    let mut counts: std::collections::BTreeMap<(Coord, Coord), u32> =
+        std::collections::BTreeMap::new();
+    for id in board.pad_ids() {
+        let p = board.pad(id);
+        if p.layers.is_empty() || p.net == NetId::NONE {
+            continue;
+        }
+        let c = board.pad_position(id);
+        *counts
+            .entry(((c.x - bbox.min.x).rem_euclid(pitch), (c.y - bbox.min.y).rem_euclid(pitch)))
+            .or_insert(0) += 1;
+    }
+    let (rx, ry) =
+        counts.iter().max_by(|a, b| a.1.cmp(b.1).then(b.0.cmp(a.0))).map_or((0, 0), |(k, _)| *k);
+    // Largest origin ≤ bbox.min congruent to the chosen residue.
+    let ox = if rx == 0 { bbox.min.x } else { bbox.min.x + rx - pitch };
+    let oy = if ry == 0 { bbox.min.y } else { bbox.min.y + ry - pitch };
+    ferroute_geom::Point::new(ox, oy)
 }
 
 type NetCopper = (NetId, Vec<ferroute_board::Track>, Vec<ferroute_board::Via>, bool);

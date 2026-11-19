@@ -212,3 +212,32 @@ fn diag_header() {
         eprintln!("{:?} {:?}->{:?} L{}", board.nets[t.net.idx()].name, t.start, t.end, t.layer.0);
     }
 }
+
+#[test]
+fn tracks_terminate_at_pad_centres_and_stay_octilinear() {
+    for seed in 0..16 {
+        let board = random_board(seed, 12);
+        let out = route(&board, &exact_cfg()).expect("route");
+        let centres: Vec<(ferroute_board::NetId, ferroute_geom::Point)> =
+            board.pad_ids().map(|p| (board.pad(p).net, board.pad_position(p))).collect();
+        let pads_per_net = board.pads_by_net();
+        for &(net, c) in &centres {
+            if net == ferroute_board::NetId::NONE
+                || pads_per_net[net.idx()].len() < 2
+                || out.failed.contains(&net)
+            {
+                continue;
+            }
+            assert!(
+                out.edit.new_tracks.iter().any(|t| t.net == net && (t.start == c || t.end == c)),
+                "seed {seed}: no track of net {net:?} ends at pad centre {c:?}"
+            );
+        }
+        for t in &out.edit.new_tracks {
+            let at_pad = centres.iter().any(|&(_, c)| c == t.start || c == t.end);
+            let d = t.end - t.start;
+            let octi = d.x == 0 || d.y == 0 || d.x.abs() == d.y.abs();
+            assert!(octi || at_pad, "seed {seed}: non-octilinear lattice segment {t:?}");
+        }
+    }
+}

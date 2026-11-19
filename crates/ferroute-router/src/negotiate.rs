@@ -68,6 +68,8 @@ pub struct NegotiationStats {
     pub ripped_for_legality: usize,
     /// Up to 32 lattice sites `(i, j, layer)` still overused after negotiation.
     pub overused_sites: Vec<(u32, u32, u32)>,
+    /// Nets whose route was shortened / straightened by the smoothing pass.
+    pub smoothed_nets: usize,
 }
 
 struct State {
@@ -415,6 +417,45 @@ pub fn negotiate(
             let old = std::mem::take(&mut routes[j]);
             commit(&mut st, grid, plan, &old, -1);
             stats.ripped_for_legality += 1;
+        }
+    }
+    // Smoothing: straighten each route on the lattice; keep only conflict-free results.
+    for _pass in 0..2 {
+        for &j in order {
+            if routes[j].paths.is_empty() {
+                continue;
+            }
+            let job = &jobs[j];
+            let pins: rustc_hash::FxHashSet<NodeIdx> =
+                routes[j].paths.iter().flat_map(|p| [p[0], p[p.len() - 1]]).collect();
+            let mut cand = routes[j].clone();
+            cand.paths = routes[j]
+                .paths
+                .iter()
+                .map(|p| {
+                    crate::smooth::smooth_path(
+                        grid,
+                        &legal[job.class],
+                        job.net,
+                        p,
+                        &|n| pins.contains(&n),
+                        &cfg.costs,
+                    )
+                })
+                .collect();
+            if cand.paths == routes[j].paths {
+                continue;
+            }
+            reserve(grid, plan, job.class, stubs, &mut cand);
+            commit(&mut st, grid, plan, &routes[j], -1);
+            commit(&mut st, grid, plan, &cand, 1);
+            if conflicts(&st, grid, plan, &cand) {
+                commit(&mut st, grid, plan, &cand, -1);
+                commit(&mut st, grid, plan, &routes[j], 1);
+            } else {
+                routes[j] = cand;
+                stats.smoothed_nets += 1;
+            }
         }
     }
     debug_assert!(
