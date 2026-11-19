@@ -187,11 +187,14 @@ track ends):
 1. The lattice origin is chosen so the largest number of pad centres fall *on* lattice
    nodes (mode of pad-centre residues modulo the pitch); such pads terminate directly.
 2. Otherwise up to four **contained centre-stubs** join an interior lattice node to the
-   centre, preferring 0°/45°/90° stubs, then the shortest. A stub whose copper lies
+   centre. Stubs are always octilinear: a direct 0°/45°/90° segment, or a dog-leg of one
+   45° run and one 0°/90° run whose bend point may lie off the lattice (the lattice is
+   only relaxed for the final approach into the pad). Single segments are preferred,
+   then the shortest. A stub whose copper lies
    entirely inside the pad copper (exact erosion test) adds no copper outside the pad, so
    it is legal by the pad's own legality and needs **no reservation**.
 3. Small/narrow pads fall back to exterior exact stubs (centre → nearby legal node,
-   checked against fixed obstacles) that reserve every lattice node within
+   checked against fixed obstacles, also octilinear) that reserve every lattice node within
    `max required centre distance + pitch/√2` of the spine.
 
 ### 4.3 Negotiated congestion (PathFinder)
@@ -253,7 +256,7 @@ in property tests over thousands of random boards).
 | **INV-EDIT-1** | Edits are additive (never delete/modify existing copper) and only move `Movable` footprints within bounds | `BoardEdit::check_invariants`, re-checked by the KiCad writer |
 | **INV-PLACE-1** | Locked/Fixed footprints never move; hard constraints always hold | Nudger proptest |
 | **INV-PLACE-3** | Translated footprints land on the absolute placement grid | `moves_land_on_the_placement_grid` |
-| **INV-ROUTE-2** | Every connection terminates at the pad centre; lattice segments are 0°/45°/90° | `tracks_terminate_at_pad_centres_and_stay_octilinear` |
+| **INV-ROUTE-2** | Every connection terminates at the pad centre; every segment, including the pad approach, is 0°/45°/90° | `tracks_terminate_at_pad_centres_and_stay_octilinear` |
 | **INV-CONN-1** | Connectivity is monotone: a run never disconnects pads that were connected | Additive edits + connectivity analysis |
 | **INV-COST-1** | PathFinder costs are non-negative; `pres_fac` and history are monotone non-decreasing | Construction (all factors ≥ 1, multipliers > 1) |
 | **INV-ACCEL-1** | Accelerators never change results | Legality tables equal with/without accelerator (test); routed edit equal for CPU-field vs exact |
