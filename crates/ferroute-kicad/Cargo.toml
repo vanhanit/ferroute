@@ -1,0 +1,23 @@
+[package]
+name = "ferroute-kicad"
+description = "Lossless KiCad .kicad_pcb S-expression reader/writer for ferroute"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+keywords.workspace = true
+categories.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+ferroute-geom.workspace = true
+ferroute-board.workspace = true
+thiserror.workspace = true
+serde_json.workspace = true
+
+[dev-dependencies]
+proptest.workspace = true
