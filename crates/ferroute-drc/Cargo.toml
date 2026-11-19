@@ -1,0 +1,24 @@
+[package]
+name = "ferroute-drc"
+description = "Deterministic DRC oracle (clearance, connectivity, edge, courtyard) for ferroute"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+keywords.workspace = true
+categories.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+ferroute-geom.workspace = true
+ferroute-board.workspace = true
+serde.workspace = true
+rayon.workspace = true
+rustc-hash.workspace = true
+
+[dev-dependencies]
+proptest.workspace = true

@@ -1,0 +1,647 @@
+// SPDX-License-Identifier: AGPL-3.0-only
+//! # ferroute-drc — the deterministic DRC oracle
+//!
+//! A standalone, exact design-rule checker. It is the *final authority* on legality in
+//! ferroute: the router, the nudger and every accelerator only *propose* geometry; a run
+//! is accepted only if this oracle reports no violation introduced by ferroute.
+//!
+//! Guarantees:
+//! * **Exactness** — every legality decision uses the integer predicates of
+//!   `ferroute-geom` (no floating point), under INV-GEOM-1.
+//! * **Determinism** — the report is sorted, so it is identical for identical input
+//!   regardless of thread count or hash seeds.
+//! * **Conservativeness** — shapes are convex supersets of the true copper, so a clean
+//!   report implies the true design is clean for the checked rules.
+//!
+//! Checked rules: copper clearance & shorts (per net-class, KiCad "max of both"
+//! semantics), copper-to-edge clearance and out-of-board copper, hole-to-hole spacing,
+//! copper-to-hole clearance, keep-out areas, courtyard overlap, minimum track width /
+//! via size, and connectivity (unrouted connections + completion ratio).
+
+use ferroute_board::{Board, FootprintId, LayerId, LayerSet, NetId, Origin, PadId, Side};
+use ferroute_geom::{Coord, Hull, Point, Rect};
+use rayon::prelude::*;
+use rustc_hash::FxHashMap;
+use serde::{Deserialize, Serialize};
+
+pub mod connectivity;
+pub use connectivity::{Connectivity, Unconnected};
+
+/// What the oracle checks.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct DrcConfig {
+    pub copper: bool,
+    pub edge: bool,
+    pub holes: bool,
+    pub keepouts: bool,
+    pub courtyards: bool,
+    pub sizes: bool,
+    pub connectivity: bool,
+    /// Skip clearance checks between pads of the same footprint (library geometry is
+    /// outside ferroute's responsibility; KiCad reports these separately).
+    pub skip_intra_footprint_pads: bool,
+}
+
+impl Default for DrcConfig {
+    fn default() -> Self {
+        Self {
+            copper: true,
+            edge: true,
+            holes: true,
+            keepouts: true,
+            courtyards: true,
+            sizes: true,
+            connectivity: true,
+            skip_intra_footprint_pads: true,
+        }
+    }
+}
+
+/// Category of a violation.
+#[derive(Copy, Clone, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+pub enum ViolationKind {
+    /// Copper of different nets overlaps.
+    Short,
+    /// Copper of different nets closer than the required clearance.
+    Clearance,
+    /// Copper closer to the board edge than `edge_clearance` (or outside the board).
+    EdgeClearance,
+    HoleToHole,
+    HoleClearance,
+    Keepout,
+    CourtyardOverlap,
+    TrackWidth,
+    ViaDiameter,
+    ViaDrill,
+}
+
+/// Reference to a board item.
+#[derive(Copy, Clone, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+pub enum ItemRef {
+    Pad(PadId),
+    Track(u32),
+    Via(u32),
+    Footprint(FootprintId),
+    Keepout(u32),
+    BoardEdge,
+}
+
+/// A single rule violation.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct Violation {
+    pub kind: ViolationKind,
+    pub a: ItemRef,
+    pub b: Option<ItemRef>,
+    pub layer: Option<LayerId>,
+    /// Approximate location (for markers).
+    pub at: Point,
+    /// Measured gap / size in nm (reporting only).
+    pub actual: f64,
+    /// Required gap / size in nm.
+    pub required: Coord,
+    /// `true` when the violation involves copper created by ferroute or a footprint
+    /// ferroute moved. The router invariant is: *no introduced violations, ever*.
+    pub introduced: bool,
+}
+
+/// Full DRC result.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct DrcReport {
+    pub violations: Vec<Violation>,
+    pub connectivity: Connectivity,
+}
+
+impl DrcReport {
+    /// No violations of any kind (connectivity not considered).
+    #[must_use]
+    pub fn is_clean(&self) -> bool {
+        self.violations.is_empty()
+    }
+
+    /// Violations caused by ferroute (routed copper / moved footprints).
+    pub fn introduced(&self) -> impl Iterator<Item = &Violation> {
+        self.violations.iter().filter(|v| v.introduced)
+    }
+
+    #[must_use]
+    pub fn count(&self, kind: ViolationKind) -> usize {
+        self.violations.iter().filter(|v| v.kind == kind).count()
+    }
+}
+
+/// A copper item flattened for checking.
+#[derive(Clone, Debug)]
+pub struct CopperItem {
+    pub item: ItemRef,
+    pub hull: Hull,
+    pub layers: LayerSet,
+    pub net: NetId,
+    pub bbox: Rect,
+    /// Footprint owning the item (pads only).
+    pub footprint: Option<FootprintId>,
+    pub introduced: bool,
+}
+
+/// Collects every copper item of the board (pads with copper, tracks, vias).
+#[must_use]
+pub fn copper_items(board: &Board) -> Vec<CopperItem> {
+    let moved: Vec<bool> = board.footprints.iter().map(|f| f.placement != f.original).collect();
+    let mut v = Vec::with_capacity(board.pads.len() + board.tracks.len() + board.vias.len());
+    for id in board.pad_ids() {
+        let pad = board.pad(id);
+        if pad.layers.is_empty() {
+            continue;
+        }
+        let hull = board.pad_hull(id);
+        v.push(CopperItem {
+            item: ItemRef::Pad(id),
+            bbox: hull.bbox(),
+            hull,
+            layers: pad.layers,
+            net: pad.net,
+            footprint: Some(pad.footprint),
+            introduced: moved[pad.footprint.idx()],
+        });
+    }
+    for (i, t) in board.tracks.iter().enumerate() {
+        let hull = t.hull();
+        v.push(CopperItem {
+            item: ItemRef::Track(u32::try_from(i).unwrap_or(u32::MAX)),
+            bbox: hull.bbox(),
+            hull,
+            layers: LayerSet::single(t.layer),
+            net: t.net,
+            footprint: None,
+            introduced: t.origin == Origin::Routed,
+        });
+    }
+    for (i, via) in board.vias.iter().enumerate() {
+        let hull = via.hull();
+        v.push(CopperItem {
+            item: ItemRef::Via(u32::try_from(i).unwrap_or(u32::MAX)),
+            bbox: hull.bbox(),
+            hull,
+            layers: via.layers,
+            net: via.net,
+            footprint: None,
+            introduced: via.origin == Origin::Routed,
+        });
+    }
+    v
+}
+
+/// Uniform bucket grid over bounding boxes; yields each candidate pair exactly once.
+#[derive(Debug)]
+pub struct BucketGrid {
+    origin: Point,
+    cell: Coord,
+    nx: i64,
+    ny: i64,
+    cells: Vec<Vec<u32>>,
+}
+
+impl BucketGrid {
+    /// Builds a grid over `boxes` (already inflated by the caller as needed).
+    #[must_use]
+    pub fn new(boxes: &[Rect], cell: Coord) -> Self {
+        let cell = cell.max(1);
+        let all = boxes
+            .iter()
+            .copied()
+            .reduce(Rect::union)
+            .unwrap_or(Rect::new(Point::ORIGIN, Point::ORIGIN));
+        let nx = (all.width() / cell + 1).clamp(1, 4096);
+        let ny = (all.height() / cell + 1).clamp(1, 4096);
+        let cell = cell.max(all.width() / nx + 1).max(all.height() / ny + 1);
+        let mut g = Self { origin: all.min, cell, nx, ny, cells: Vec::new() };
+        #[allow(clippy::cast_sign_loss, clippy::cast_possible_truncation)]
+        {
+            g.cells = vec![Vec::new(); (nx * ny) as usize];
+        }
+        for (i, b) in boxes.iter().enumerate() {
+            let (x0, y0, x1, y1) = g.range(*b);
+            for cy in y0..=y1 {
+                for cx in x0..=x1 {
+                    #[allow(clippy::cast_sign_loss, clippy::cast_possible_truncation)]
+                    g.cells[(cy * nx + cx) as usize].push(u32::try_from(i).unwrap_or(u32::MAX));
+                }
+            }
+        }
+        g
+    }
+
+    fn range(&self, b: Rect) -> (i64, i64, i64, i64) {
+        let f = |v: Coord, o: Coord, n: i64| ((v - o).div_euclid(self.cell)).clamp(0, n - 1);
+        (
+            f(b.min.x, self.origin.x, self.nx),
+            f(b.min.y, self.origin.y, self.ny),
+            f(b.max.x, self.origin.x, self.nx),
+            f(b.max.y, self.origin.y, self.ny),
+        )
+    }
+
+    fn cell_of(&self, p: Point) -> (i64, i64) {
+        let (x, y, _, _) = self.range(Rect::new(p, p));
+        (x, y)
+    }
+
+    /// Candidate pairs `(i, j)` with `i < j` whose boxes intersect, each exactly once.
+    #[must_use]
+    pub fn pairs(&self, boxes: &[Rect]) -> Vec<(u32, u32)> {
+        let mut out: Vec<(u32, u32)> = (0..self.cells.len())
+            .into_par_iter()
+            .flat_map_iter(|ci| {
+                let cell = &self.cells[ci];
+                let mut local = Vec::new();
+                #[allow(clippy::cast_possible_wrap)]
+                let (cx, cy) = (ci as i64 % self.nx, ci as i64 / self.nx);
+                for (k, &i) in cell.iter().enumerate() {
+                    for &j in &cell[k + 1..] {
+                        let (a, b) = (boxes[i as usize], boxes[j as usize]);
+                        if !a.intersects(b) {
+                            continue;
+                        }
+                        // Report the pair only in the cell holding the min corner of the overlap.
+                        let m = Point::new(a.min.x.max(b.min.x), a.min.y.max(b.min.y));
+                        if self.cell_of(m) == (cx, cy) {
+                            local.push(if i < j { (i, j) } else { (j, i) });
+                        }
+                    }
+                }
+                local
+            })
+            .collect();
+        out.sort_unstable();
+        out
+    }
+
+    /// Indices whose boxes intersect `q` (deduplicated, sorted).
+    #[must_use]
+    pub fn query(&self, q: Rect, boxes: &[Rect]) -> Vec<u32> {
+        let (x0, y0, x1, y1) = self.range(q);
+        let mut v = Vec::new();
+        for cy in y0..=y1 {
+            for cx in x0..=x1 {
+                #[allow(clippy::cast_sign_loss, clippy::cast_possible_truncation)]
+                for &i in &self.cells[(cy * self.nx + cx) as usize] {
+                    if boxes[i as usize].intersects(q) {
+                        v.push(i);
+                    }
+                }
+            }
+        }
+        v.sort_unstable();
+        v.dedup();
+        v
+    }
+}
+
+fn mid(a: Rect, b: Rect) -> Point {
+    let lo = Point::new(a.min.x.max(b.min.x), a.min.y.max(b.min.y));
+    let hi = Point::new(a.max.x.min(b.max.x), a.max.y.min(b.max.y));
+    Point::new(lo.x / 2 + hi.x / 2, lo.y / 2 + hi.y / 2)
+}
+
+fn first_common_layer(a: LayerSet, b: LayerSet) -> Option<LayerId> {
+    LayerSet(a.0 & b.0).iter().next()
+}
+
+/// Runs the full DRC.
+#[must_use]
+pub fn check(board: &Board, cfg: &DrcConfig) -> DrcReport {
+    let items = copper_items(board);
+    let mut violations = Vec::new();
+    let r = &board.rules;
+    let max_req = r.max_clearance().max(r.hole_clearance).max(r.hole_to_hole);
+    let inflate = (max_req + 1) / 2 + 1;
+    let boxes: Vec<Rect> = items.iter().map(|it| it.bbox.inflate(inflate)).collect();
+    let grid = BucketGrid::new(&boxes, 2_000_000);
+
+    if cfg.copper {
+        violations.extend(check_copper(board, cfg, &items, &grid, &boxes));
+    }
+    if cfg.edge {
+        violations.extend(check_edges(board, &items));
+    }
+    if cfg.holes {
+        violations.extend(check_holes(board, &items));
+    }
+    if cfg.keepouts {
+        violations.extend(check_keepouts(board, &items));
+    }
+    if cfg.courtyards {
+        violations.extend(check_courtyards(board));
+    }
+    if cfg.sizes {
+        violations.extend(check_sizes(board));
+    }
+    violations.sort_by(|a, b| {
+        (a.kind, a.a, a.b, a.layer).cmp(&(b.kind, b.a, b.b, b.layer)).then(a.at.cmp(&b.at))
+    });
+    let connectivity = if cfg.connectivity {
+        connectivity::analyse(board, &items)
+    } else {
+        Connectivity::default()
+    };
+    DrcReport { violations, connectivity }
+}
+
+fn check_copper(
+    board: &Board,
+    cfg: &DrcConfig,
+    items: &[CopperItem],
+    grid: &BucketGrid,
+    boxes: &[Rect],
+) -> Vec<Violation> {
+    grid.pairs(boxes)
+        .into_par_iter()
+        .filter_map(|(i, j)| {
+            let (a, b) = (&items[i as usize], &items[j as usize]);
+            if a.net == b.net && a.net != NetId::NONE {
+                return None;
+            }
+            if !a.layers.intersects(b.layers) {
+                return None;
+            }
+            if cfg.skip_intra_footprint_pads && a.footprint.is_some() && a.footprint == b.footprint
+            {
+                return None;
+            }
+            let req = board.clearance_between(a.net, b.net);
+            if !a.hull.clearance_violated(&b.hull, req) {
+                return None;
+            }
+            let overlap = a.hull.clearance_violated(&b.hull, 0);
+            Some(Violation {
+                kind: if overlap { ViolationKind::Short } else { ViolationKind::Clearance },
+                a: a.item,
+                b: Some(b.item),
+                layer: first_common_layer(a.layers, b.layers),
+                at: mid(a.bbox, b.bbox),
+                actual: a.hull.distance(&b.hull),
+                required: req,
+                introduced: a.introduced || b.introduced,
+            })
+        })
+        .collect()
+}
+
+fn check_edges(board: &Board, items: &[CopperItem]) -> Vec<Violation> {
+    let ec = board.rules.edge_clearance;
+    items
+        .par_iter()
+        .filter(|it| !board.outline.admits(&it.hull, ec))
+        .map(|it| Violation {
+            kind: ViolationKind::EdgeClearance,
+            a: it.item,
+            b: Some(ItemRef::BoardEdge),
+            layer: it.layers.iter().next(),
+            at: it.bbox.center(),
+            actual: board
+                .outline
+                .outer
+                .edges()
+                .map(|e| it.hull.distance(&Hull::capsule(e.a, e.b, 0)))
+                .fold(f64::INFINITY, f64::min),
+            required: ec,
+            introduced: it.introduced,
+        })
+        .collect()
+}
+
+struct Hole {
+    item: ItemRef,
+    hull: Hull,
+    net: NetId,
+    introduced: bool,
+}
+
+fn holes(board: &Board, items: &[CopperItem]) -> Vec<Hole> {
+    let mut v = Vec::new();
+    for id in board.pad_ids() {
+        let pad = board.pad(id);
+        if let Some(d) = pad.drill {
+            let moved =
+                board.footprint(pad.footprint).placement != board.footprint(pad.footprint).original;
+            v.push(Hole {
+                item: ItemRef::Pad(id),
+                hull: Hull::disk(board.pad_position(id), d.diameter / 2),
+                net: pad.net,
+                introduced: moved,
+            });
+        }
+    }
+    for (i, via) in board.vias.iter().enumerate() {
+        let _ = items;
+        v.push(Hole {
+            item: ItemRef::Via(u32::try_from(i).unwrap_or(u32::MAX)),
+            hull: Hull::disk(via.pos, via.drill / 2),
+            net: via.net,
+            introduced: via.origin == Origin::Routed,
+        });
+    }
+    v
+}
+
+fn check_holes(board: &Board, items: &[CopperItem]) -> Vec<Violation> {
+    let hs = holes(board, items);
+    let r = &board.rules;
+    let mut out = Vec::new();
+    // Hole-to-hole (net independent).
+    let hb: Vec<Rect> = hs.iter().map(|h| h.hull.bbox().inflate(r.hole_to_hole / 2 + 1)).collect();
+    let hg = BucketGrid::new(&hb, 2_000_000);
+    for (i, j) in hg.pairs(&hb) {
+        let (a, b) = (&hs[i as usize], &hs[j as usize]);
+        if a.hull.clearance_violated(&b.hull, r.hole_to_hole) {
+            out.push(Violation {
+                kind: ViolationKind::HoleToHole,
+                a: a.item,
+                b: Some(b.item),
+                layer: None,
+                at: mid(a.hull.bbox(), b.hull.bbox()),
+                actual: a.hull.distance(&b.hull),
+                required: r.hole_to_hole,
+                introduced: a.introduced || b.introduced,
+            });
+        }
+    }
+    // Copper-to-hole for copper of other nets.
+    let cb: Vec<Rect> = items.iter().map(|it| it.bbox).collect();
+    let cg = BucketGrid::new(&cb, 2_000_000);
+    for h in &hs {
+        for k in cg.query(h.hull.bbox().inflate(r.hole_clearance + 1), &cb) {
+            let it = &items[k as usize];
+            if it.item == h.item || (it.net == h.net && it.net != NetId::NONE) {
+                continue;
+            }
+            if it.hull.clearance_violated(&h.hull, r.hole_clearance) {
+                out.push(Violation {
+                    kind: ViolationKind::HoleClearance,
+                    a: h.item,
+                    b: Some(it.item),
+                    layer: it.layers.iter().next(),
+                    at: h.hull.anchor(),
+                    actual: it.hull.distance(&h.hull),
+                    required: r.hole_clearance,
+                    introduced: h.introduced || it.introduced,
+                });
+            }
+        }
+    }
+    out
+}
+
+fn check_keepouts(board: &Board, items: &[CopperItem]) -> Vec<Violation> {
+    let mut out = Vec::new();
+    for (ki, k) in board.keepouts.iter().enumerate() {
+        let kref = ItemRef::Keepout(u32::try_from(ki).unwrap_or(u32::MAX));
+        for it in items {
+            let forbidden = match it.item {
+                ItemRef::Track(_) => k.no_tracks,
+                ItemRef::Via(_) => k.no_vias,
+                ItemRef::Pad(_) => k.no_pads,
+                _ => false,
+            };
+            if forbidden && it.layers.intersects(k.layers) && k.area.hull_violates(&it.hull, 0) {
+                out.push(Violation {
+                    kind: ViolationKind::Keepout,
+                    a: it.item,
+                    b: Some(kref),
+                    layer: first_common_layer(it.layers, k.layers),
+                    at: it.bbox.center(),
+                    actual: 0.0,
+                    required: 0,
+                    introduced: it.introduced,
+                });
+            }
+        }
+        if k.no_footprints {
+            for (fi, fp) in board.footprints.iter().enumerate() {
+                if fp.courtyard().intersects(&k.area) {
+                    out.push(Violation {
+                        kind: ViolationKind::Keepout,
+                        a: ItemRef::Footprint(FootprintId(u32::try_from(fi).unwrap_or(u32::MAX))),
+                        b: Some(kref),
+                        layer: None,
+                        at: fp.placement.pos,
+                        actual: 0.0,
+                        required: 0,
+                        introduced: fp.placement != fp.original,
+                    });
+                }
+            }
+        }
+    }
+    out
+}
+
+/// Courtyard overlap between footprints on the same side (exact polygon test).
+#[must_use]
+pub fn check_courtyards(board: &Board) -> Vec<Violation> {
+    let cys: Vec<_> = board.footprints.iter().map(ferroute_board::Footprint::courtyard).collect();
+    let boxes: Vec<Rect> =
+        cys.iter().map(|c| c.bbox().unwrap_or(Rect::new(Point::ORIGIN, Point::ORIGIN))).collect();
+    let grid = BucketGrid::new(&boxes, 5_000_000);
+    grid.pairs(&boxes)
+        .into_iter()
+        .filter_map(|(i, j)| {
+            let (fa, fb) = (&board.footprints[i as usize], &board.footprints[j as usize]);
+            if fa.side != fb.side || !cys[i as usize].intersects(&cys[j as usize]) {
+                return None;
+            }
+            Some(Violation {
+                kind: ViolationKind::CourtyardOverlap,
+                a: ItemRef::Footprint(FootprintId(i)),
+                b: Some(ItemRef::Footprint(FootprintId(j))),
+                layer: Some(LayerId(if fa.side == Side::Front {
+                    0
+                } else {
+                    board.layer_count().saturating_sub(1)
+                })),
+                at: mid(boxes[i as usize], boxes[j as usize]),
+                actual: 0.0,
+                required: 0,
+                introduced: fa.placement != fa.original || fb.placement != fb.original,
+            })
+        })
+        .collect()
+}
+
+fn check_sizes(board: &Board) -> Vec<Violation> {
+    let r = &board.rules;
+    let mut out = Vec::new();
+    for (i, t) in board.tracks.iter().enumerate() {
+        if t.width < r.min_track_width {
+            out.push(size_violation(
+                ViolationKind::TrackWidth,
+                ItemRef::Track(idx(i)),
+                t.start,
+                t.width,
+                r.min_track_width,
+                t.origin,
+            ));
+        }
+    }
+    for (i, v) in board.vias.iter().enumerate() {
+        if v.diameter < r.min_via_diameter {
+            out.push(size_violation(
+                ViolationKind::ViaDiameter,
+                ItemRef::Via(idx(i)),
+                v.pos,
+                v.diameter,
+                r.min_via_diameter,
+                v.origin,
+            ));
+        }
+        if v.drill < r.min_via_drill {
+            out.push(size_violation(
+                ViolationKind::ViaDrill,
+                ItemRef::Via(idx(i)),
+                v.pos,
+                v.drill,
+                r.min_via_drill,
+                v.origin,
+            ));
+        }
+    }
+    out
+}
+
+fn size_violation(
+    kind: ViolationKind,
+    a: ItemRef,
+    at: Point,
+    actual: Coord,
+    required: Coord,
+    origin: Origin,
+) -> Violation {
+    #[allow(clippy::cast_precision_loss)]
+    let actual = actual as f64;
+    Violation {
+        kind,
+        a,
+        b: None,
+        layer: None,
+        at,
+        actual,
+        required,
+        introduced: origin == Origin::Routed,
+    }
+}
+
+fn idx(i: usize) -> u32 {
+    u32::try_from(i).unwrap_or(u32::MAX)
+}
+
+/// Groups violations by kind (for summaries).
+#[must_use]
+pub fn summary(report: &DrcReport) -> FxHashMap<ViolationKind, usize> {
+    let mut m = FxHashMap::default();
+    for v in &report.violations {
+        *m.entry(v.kind).or_insert(0) += 1;
+    }
+    m
+}
+
+#[cfg(test)]
+mod tests;
