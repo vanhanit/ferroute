@@ -1,0 +1,90 @@
+{
+  "ferroute_version": "0.1.0",
+  "records": [
+    {
+      "board": "ci-s2-small",
+      "seed": 1,
+      "metrics": {
+        "drc_clean": true,
+        "introduced_violations": 0,
+        "total_violations": 0,
+        "completion": 1.0,
+        "connections_total": 20,
+        "connections_missing": 0,
+        "wirelength_mm": 157.6576297914498,
+        "vias": 0,
+        "moved_footprints": 9,
+        "displacement_mm": 15.226146679014958,
+        "runtime_ms": 100.0
+      }
+    },
+    {
+      "board": "ci-s2-medium",
+      "seed": 1,
+      "metrics": {
+        "drc_clean": true,
+        "introduced_violations": 0,
+        "total_violations": 0,
+        "completion": 1.0,
+        "connections_total": 43,
+        "connections_missing": 0,
+        "wirelength_mm": 302.6512985522208,
+        "vias": 11,
+        "moved_footprints": 22,
+        "displacement_mm": 42.1837004064531,
+        "runtime_ms": 200.0
+      }
+    },
+    {
+      "board": "ci-s4-medium",
+      "seed": 1,
+      "metrics": {
+        "drc_clean": true,
+        "introduced_violations": 0,
+        "total_violations": 0,
+        "completion": 1.0,
+        "connections_total": 50,
+        "connections_missing": 0,
+        "wirelength_mm": 372.14318164425765,
+        "vias": 9,
+        "moved_footprints": 30,
+        "displacement_mm": 52.51444310887097,
+        "runtime_ms": 300.0
+      }
+    },
+    {
+      "board": "demo_2layer",
+      "seed": 1,
+      "metrics": {
+        "drc_clean": true,
+        "introduced_violations": 0,
+        "total_violations": 0,
+        "completion": 1.0,
+        "connections_total": 18,
+        "connections_missing": 0,
+        "wirelength_mm": 284.6225322406026,
+        "vias": 8,
+        "moved_footprints": 6,
+        "displacement_mm": 11.962994974529321,
+        "runtime_ms": 100.0
+      }
+    },
+    {
+      "board": "legacy_v9_numeric",
+      "seed": 1,
+      "metrics": {
+        "drc_clean": true,
+        "introduced_violations": 0,
+        "total_violations": 0,
+        "completion": 1.0,
+        "connections_total": 1,
+        "connections_missing": 0,
+        "wirelength_mm": 17.38233764908628,
+        "vias": 0,
+        "moved_footprints": 0,
+        "displacement_mm": 0.0,
+        "runtime_ms": 100.0
+      }
+    }
+  ]
+}
