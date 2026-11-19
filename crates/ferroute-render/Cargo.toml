@@ -1,0 +1,21 @@
+[package]
+name = "ferroute-render"
+description = "Deterministic SVG board renderer for ferroute visual diffs"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+keywords.workspace = true
+categories.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+ferroute-geom.workspace = true
+ferroute-board.workspace = true
+
+[dev-dependencies]
+roxmltree = "0.21.2"
