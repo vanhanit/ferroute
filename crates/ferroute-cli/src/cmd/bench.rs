@@ -72,7 +72,11 @@ pub fn run(a: &BenchArgs) -> Result<ExitCode> {
         files.sort();
         for f in files {
             let name = f.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default();
-            boards.push((name, load(&f)?.board));
+            let board = load(&f)?.board;
+            // Fixtures run twice: with nudging and with placement fixed (what CI's KiCad
+            // lane does), so a completion drop in either mode fails the gate.
+            boards.push((format!("{name}-fixed"), board.clone()));
+            boards.push((name, board));
         }
     }
     let cfg = PipelineConfig {
@@ -84,8 +88,10 @@ pub fn run(a: &BenchArgs) -> Result<ExitCode> {
         ..PipelineConfig::default()
     };
     let mut records = Vec::new();
+    let fixed_cfg = PipelineConfig { nudge: None, ..cfg.clone() };
     for (name, board) in &boards {
-        let res = run_pipeline(board, &cfg).with_context(|| format!("benchmark {name}"))?;
+        let c = if name.ends_with("-fixed") { &fixed_cfg } else { &cfg };
+        let res = run_pipeline(board, c).with_context(|| format!("benchmark {name}"))?;
         let title = format!("{name} — ferroute {} (seed {})", env!("CARGO_PKG_VERSION"), a.seed);
         ferroute_render::write_svg(
             &a.out.join(format!("{name}.svg")),
