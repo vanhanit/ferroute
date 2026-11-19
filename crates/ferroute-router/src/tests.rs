@@ -233,6 +233,20 @@ fn tracks_terminate_at_pad_centres_and_stay_octilinear() {
                 "seed {seed}: no track of net {net:?} ends at pad centre {c:?}"
             );
         }
+        // Pads are entered only through a side midpoint along a pad axis (rectangular
+        // shapes) or along a 0/45/90-degree line through the centre (circular pads).
+        for pid in board.pad_ids() {
+            let c = board.pad_position(pid);
+            let dirs = access::entry_dirs(&board, pid);
+            for t in out.edit.new_tracks.iter().filter(|t| t.start == c || t.end == c) {
+                let o = if t.start == c { t.end } else { t.start } - c;
+                let d = (o.x.signum(), o.y.signum());
+                assert!(
+                    dirs.contains(&d) && (o.x == 0 || o.y == 0 || o.x.abs() == o.y.abs()),
+                    "seed {seed}: pad {pid:?} entered along {o:?}, allowed {dirs:?}"
+                );
+            }
+        }
         for t in &out.edit.new_tracks {
             // Every segment, including the final approach into a pad, is 0°/45°/90°.
             let d = t.end - t.start;

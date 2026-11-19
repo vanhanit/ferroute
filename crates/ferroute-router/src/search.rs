@@ -28,6 +28,8 @@ pub struct Ctx<'a> {
     pub occ: &'a [u16],
     /// Base occupancy (nets with copper on the node).
     pub nb: &'a [u16],
+    /// Per node: conflicting in-use stubs of other nets (stub-vs-stub congestion).
+    pub sextra: &'a [u16],
     pub hole_occ: &'a [u16],
     pub hist: &'a [f32],
     pub pres_fac: f32,
@@ -73,7 +75,8 @@ impl Ctx<'_> {
                 }
             }
         }
-        s += u32::from(self.occ[g.idx(i, j, l) as usize]);
+        let c = g.idx(i, j, l) as usize;
+        s += u32::from(self.occ[c]) + u32::from(self.sextra[c]);
         #[allow(clippy::cast_precision_loss)]
         let f = s as f32;
         f

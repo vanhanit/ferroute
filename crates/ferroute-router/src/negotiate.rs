@@ -73,6 +73,12 @@ pub struct NegotiationStats {
 }
 
 struct State {
+    /// Routes currently using each stub (0/1).
+    stub_used: Vec<u16>,
+    /// Per node: in-use stubs of other nets conflicting with a stub ending at the node.
+    sextra: Vec<u16>,
+    sconf: Vec<Vec<u32>>,
+    snode: Vec<NodeIdx>,
     /// Number of nets whose base set contains the node.
     nb: Vec<u16>,
     /// Number of nets whose ring set contains the node.
@@ -154,6 +160,19 @@ fn reserve(grid: &Grid, plan: &Plan, class: usize, stubs: &[Stub], r: &mut NetRo
 }
 
 fn commit(st: &mut State, grid: &Grid, plan: &Plan, r: &NetRoute, sign: i32) {
+    for &s in &r.stubs {
+        let u = &mut st.stub_used[s as usize];
+        *u = if sign > 0 { u.saturating_add(1) } else { u.saturating_sub(1) };
+        for k in 0..st.sconf[s as usize].len() {
+            let t = st.sconf[s as usize][k];
+            let n = st.snode[t as usize] as usize;
+            st.sextra[n] = if sign > 0 {
+                st.sextra[n].saturating_add(1)
+            } else {
+                st.sextra[n].saturating_sub(1)
+            };
+        }
+    }
     for &n in &r.base {
         let o = &mut st.nb[n as usize];
         *o = if sign > 0 { o.saturating_add(1) } else { o.saturating_sub(1) };
@@ -182,7 +201,14 @@ fn overused(st: &State, n: usize) -> bool {
     st.nb[n] >= 1 && st.occ[n] >= 2
 }
 
+fn stub_conflict(st: &State, s: u32) -> bool {
+    st.sconf[s as usize].iter().any(|&t| st.stub_used[t as usize] > 0)
+}
+
 fn conflicts(st: &State, grid: &Grid, plan: &Plan, r: &NetRoute) -> bool {
+    if r.stubs.iter().any(|&s| stub_conflict(st, s)) {
+        return true;
+    }
     if r.reserved.iter().any(|&n| overused(st, n as usize)) {
         return true;
     }
@@ -223,6 +249,7 @@ fn route_one(
         leg: &legal[job.class],
         occ: &st.occ,
         nb: &st.nb,
+        sextra: &st.sextra,
         hole_occ: &st.hole_occ,
         hist: &st.hist,
         pres_fac,
@@ -307,16 +334,22 @@ fn route_one(
 /// that had to be dropped) and statistics. Post-condition (INV-ROUTE-1): no base node of
 /// one net lies in a ring of another net, and no hole-channel cell holds two vias.
 #[must_use]
+#[allow(clippy::too_many_arguments)]
 pub fn negotiate(
     grid: &Grid,
     legal: &[ClassLegality],
     plan: &Plan,
     jobs: &[NetJob],
     stubs: &[Stub],
+    stub_conflicts: &[Vec<u32>],
     cfg: &NegotiationConfig,
     order: &[usize],
 ) -> (Vec<NetRoute>, NegotiationStats) {
     let mut st = State {
+        stub_used: vec![0; stubs.len()],
+        sextra: vec![0; grid.len()],
+        sconf: stub_conflicts.to_vec(),
+        snode: stubs.iter().map(|s| s.node).collect(),
         nb: vec![0; grid.len()],
         occ: vec![0; grid.len()],
         hole_occ: vec![0; grid.plane()],
@@ -388,6 +421,13 @@ pub fn negotiate(
                 routes[j] = r;
             }
         }
+        // History on terminals whose stub conflicts with another net's stub.
+        for (sidx, &used) in st.stub_used.clone().iter().enumerate() {
+            if used > 0 && stub_conflict(&st, u32::try_from(sidx).unwrap_or(u32::MAX)) {
+                let n = st.snode[sidx] as usize;
+                st.hist[n] += cfg.hist_fac;
+            }
+        }
         // History update on overused resources.
         for n in 0..st.occ.len() {
             if overused(&st, n) {
@@ -405,6 +445,11 @@ pub fn negotiate(
         pres_fac *= cfg.pres_fac_mult;
     }
     stats.overused_after_negotiation = (0..st.occ.len()).filter(|&n| overused(&st, n)).count()
+        + (0..st.stub_used.len())
+            .filter(|&k| {
+                st.stub_used[k] > 0 && stub_conflict(&st, u32::try_from(k).unwrap_or(u32::MAX))
+            })
+            .count()
         + st.hole_occ.iter().filter(|&&o| o > 1).count();
     stats.overused_sites = (0..st.occ.len())
         .filter(|&n| overused(&st, n))

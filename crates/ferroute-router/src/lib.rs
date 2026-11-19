@@ -216,6 +216,14 @@ pub fn route(board: &Board, cfg: &RouterConfig) -> Result<RouteOutcome, RouteErr
         .iter()
         .map(|cp| legality::compute(&grid, &obs, &cp.geom, accel.as_ref()))
         .collect();
+    // Routes never run across pads: pads are entered only through their stubs.
+    let interior = access::pad_interior_nodes(board, &grid);
+    let mut legal = legal;
+    for t in &mut legal {
+        for &n in &interior {
+            t.node[n as usize] = legality::BLOCKED;
+        }
+    }
     let legality_ms = t0.elapsed().as_secs_f64() * 1e3;
 
     // Jobs.
@@ -281,7 +289,16 @@ pub fn route(board: &Board, cfg: &RouterConfig) -> Result<RouteOutcome, RouteErr
         margin: cfg.margin,
     };
     let t1 = Instant::now();
-    let (routes, nstats) = negotiate(&grid, &legal, &plan, &jobs, &stubs, &ncfg, &order);
+    let (routes, nstats) = negotiate(
+        &grid,
+        &legal,
+        &plan,
+        &jobs,
+        &stubs,
+        &access::stub_conflicts(&stubs),
+        &ncfg,
+        &order,
+    );
     let negotiation_ms = t1.elapsed().as_secs_f64() * 1e3;
 
     // Emit + final DRC gate.
