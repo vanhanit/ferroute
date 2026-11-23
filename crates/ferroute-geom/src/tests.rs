@@ -175,3 +175,29 @@ proptest! {
         let _ = h.clearance_violated(&Hull::disk(p(cx, cy), r / 2), r / 2);
     }
 }
+
+#[test]
+fn dir8_from_delta_roundtrips_and_rejects_non_unit_steps() {
+    for d in Dir8::ALL {
+        let (di, dj) = d.delta();
+        assert_eq!(Dir8::from_delta(i64::from(di), i64::from(dj)), Some(d));
+    }
+    assert_eq!(Dir8::from_delta(0, 0), None);
+    assert_eq!(Dir8::from_delta(2, 0), None);
+    assert_eq!(Dir8::from_delta(1, 2), None);
+}
+
+#[test]
+fn octilinear_vectors_and_their_direction() {
+    assert!(p(0, 5).is_octilinear());
+    assert!(p(-7, 0).is_octilinear());
+    assert!(p(3, -3).is_octilinear());
+    assert!(p(0, 0).is_octilinear());
+    assert!(!p(3, 2).is_octilinear());
+    // Grid j grows with board y, so (+x, +y) is SE and (0, -y) is N.
+    assert_eq!(Dir8::from_vector(p(5, 5)), Some(Dir8::SE));
+    assert_eq!(Dir8::from_vector(p(0, -9)), Some(Dir8::N));
+    assert_eq!(Dir8::from_vector(p(-4, 0)), Some(Dir8::W));
+    assert_eq!(Dir8::from_vector(p(3, 2)), None);
+    assert_eq!(Dir8::from_vector(p(0, 0)), None);
+}

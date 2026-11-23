@@ -82,6 +82,12 @@ impl Point {
         detmath::hypot(dx, dy)
     }
 
+    /// `true` when the vector is 0°, 45° or 90° (or zero).
+    #[must_use]
+    pub const fn is_octilinear(self) -> bool {
+        self.x == 0 || self.y == 0 || self.x.abs() == self.y.abs()
+    }
+
     /// Chebyshev (L∞) distance.
     #[must_use]
     pub fn chebyshev(self, o: Self) -> Coord {
@@ -754,6 +760,25 @@ impl Dir8 {
             Self::S => (0, 1),
             Self::SE => (1, 1),
         }
+    }
+
+    /// Direction of a unit grid step `(di, dj)`; `None` for anything else.
+    #[must_use]
+    pub fn from_delta(di: i64, dj: i64) -> Option<Self> {
+        Self::ALL.into_iter().find(|d| {
+            let (a, b) = d.delta();
+            (i64::from(a), i64::from(b)) == (di, dj)
+        })
+    }
+
+    /// Direction of a non-zero octilinear vector (board coordinates, +y down);
+    /// `None` for zero or non-octilinear vectors.
+    #[must_use]
+    pub fn from_vector(v: Point) -> Option<Self> {
+        if v == Point::ORIGIN || !v.is_octilinear() {
+            return None;
+        }
+        Self::from_delta(v.x.signum(), v.y.signum())
     }
 
     #[must_use]
