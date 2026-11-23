@@ -179,4 +179,102 @@ mod tests {
                 .unwrap_err();
         assert!(matches!(err, IpcError::Timeout));
     }
+
+    #[test]
+    fn spawn_of_missing_binary_is_io_error() {
+        let d = tempfile::tempdir().unwrap();
+        let err = HeadlessServer::spawn(
+            &d.path().join("no-such-kicad-cli"),
+            None,
+            &d.path().join("s.sock"),
+            Duration::from_secs(1),
+        )
+        .unwrap_err();
+        assert!(matches!(err, IpcError::Io(_)), "{err:?}");
+    }
+
+    #[test]
+    fn spawn_passes_arguments_and_reports_exit_status() {
+        let d = tempfile::tempdir().unwrap();
+        let out = d.path().join("args.txt");
+        let cli =
+            script(d.path(), "kicad-cli", &format!("echo \"$@\" > '{}'\nexit 7", out.display()));
+        let sock = d.path().join("s.sock");
+        let board = d.path().join("b.kicad_pcb");
+        let err =
+            HeadlessServer::spawn(&cli, Some(&board), &sock, Duration::from_secs(5)).unwrap_err();
+        assert!(matches!(&err, IpcError::Protocol(m) if m.contains("exited early")), "{err:?}");
+        let args = std::fs::read_to_string(&out).unwrap();
+        assert_eq!(
+            args.trim(),
+            format!("api-server --socket {} {}", sock.display(), board.display())
+        );
+    }
+
+    #[test]
+    fn ready_server_exposes_endpoint_pid_and_cleans_up_on_drop() {
+        use std::os::unix::net::UnixListener;
+
+        use prost::Message;
+
+        use crate::nng::{self, PROTO_REP0, PROTO_REQ0};
+        use crate::proto::*;
+
+        let d = tempfile::tempdir().unwrap();
+        let cli = script(d.path(), "kicad-cli", "sleep 30");
+        let sock = d.path().join("s.sock");
+        // Stand in for the api-server: answer the readiness Ping.
+        let l = UnixListener::bind(&sock).unwrap();
+        let h = std::thread::spawn(move || {
+            let (mut s, _) = l.accept().unwrap();
+            nng::handshake(&mut s, PROTO_REP0, PROTO_REQ0).unwrap();
+            let msg = nng::read_msg(&mut s).unwrap();
+            let mut reply = msg[..4].to_vec();
+            reply.extend(
+                ApiResponse {
+                    header: None,
+                    status: Some(ApiResponseStatus {
+                        status: ApiStatusCode::Ok as i32,
+                        error_message: String::new(),
+                    }),
+                    message: Some(Any::pack(&Empty {})),
+                }
+                .encode_to_vec(),
+            );
+            nng::write_msg(&mut s, &reply).unwrap();
+            // keep the connection until the client side drops it
+            let _ = nng::read_msg(&mut s);
+        });
+        let server = HeadlessServer::spawn(&cli, None, &sock, Duration::from_secs(10)).unwrap();
+        assert_eq!(server.endpoint().socket_path(), sock);
+        assert!(server.pid() > 0);
+        drop(server);
+        assert!(!sock.exists(), "socket file removed on drop");
+        h.join().unwrap();
+    }
+
+    #[test]
+    fn common_install_dirs_are_absolute_and_nonempty() {
+        let v = common_install_dirs();
+        assert!(!v.is_empty());
+        assert!(v.iter().all(|p| p.is_absolute()));
+    }
+
+    #[test]
+    fn find_kicad_cli_ignores_directories_and_prefers_path_order() {
+        let a = tempfile::tempdir().unwrap();
+        let b = tempfile::tempdir().unwrap();
+        // A directory named like the binary must not match.
+        std::fs::create_dir(a.path().join("kicad-cli")).unwrap();
+        assert!(find_kicad_cli_in(Some(a.path().into()), &[]).is_none());
+        let pb = script(b.path(), "kicad-cli", "exit 0");
+        let joined = std::env::join_paths([a.path(), b.path()]).unwrap();
+        assert_eq!(find_kicad_cli_in(Some(joined), &[]), Some(pb));
+        assert!(find_kicad_cli_in(None, &[]).is_none());
+    }
+
+    #[test]
+    fn find_kicad_cli_does_not_panic() {
+        let _ = find_kicad_cli();
+    }
 }

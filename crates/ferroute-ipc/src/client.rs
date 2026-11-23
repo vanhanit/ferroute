@@ -344,4 +344,219 @@ mod tests {
         );
         assert!(matches!(c.open_document("/x/b.txt"), Err(IpcError::Unsupported(_))));
     }
+    use std::sync::{Arc, Mutex};
+
+    type Seen = Arc<Mutex<Vec<(String, Vec<u8>)>>>;
+
+    /// Transport that records `(type_url suffix, any payload)` and answers with `reply`.
+    fn recording(reply: Vec<u8>) -> (MockTransport, Seen) {
+        let seen: Seen = Arc::default();
+        let s2 = Arc::clone(&seen);
+        let t = MockTransport::new(move |req| {
+            let any = ApiRequest::decode(req).unwrap().message.unwrap();
+            s2.lock().unwrap().push((any.type_url.rsplit('/').next().unwrap().into(), any.value));
+            Ok(reply.clone())
+        });
+        (t, seen)
+    }
+
+    #[test]
+    fn builder_setters_and_into_transport() {
+        let t = MockTransport::new(|_| Ok(ok_reply(&Empty {})));
+        let mut c = KiCadClient::new(t, "n", None).with_timeout(Duration::from_millis(5));
+        c.set_timeout(Duration::from_millis(7));
+        c.ping().unwrap();
+        let mut t = c.into_transport();
+        assert!(t.roundtrip(b"", Duration::ZERO).is_ok());
+        assert!(format!("{t:?}").contains("MockTransport"));
+        assert_eq!(DEFAULT_TIMEOUT, Duration::from_secs(10));
+    }
+
+    #[test]
+    fn transport_errors_and_malformed_bytes_propagate() {
+        let t = MockTransport::new(|_| Err(IpcError::Timeout));
+        assert!(matches!(KiCadClient::new(t, "n", None).ping(), Err(IpcError::Timeout)));
+        let t = MockTransport::new(|_| Err(IpcError::Protocol("boom".into())));
+        assert!(matches!(KiCadClient::new(t, "n", None).get_version(), Err(IpcError::Protocol(_))));
+        let t = MockTransport::new(|_| Ok(vec![0xff, 0xff, 0xff]));
+        assert!(matches!(KiCadClient::new(t, "n", None).ping(), Err(IpcError::Decode(_))));
+    }
+
+    #[test]
+    fn missing_status_is_unknown_error() {
+        let bytes = ApiResponse { header: None, status: None, message: None }.encode_to_vec();
+        let t = MockTransport::new(move |_| Ok(bytes.clone()));
+        match KiCadClient::new(t, "n", None).ping() {
+            Err(IpcError::Api { code: ApiStatusCode::Unknown, message }) => {
+                assert!(message.is_empty());
+            }
+            other => panic!("{other:?}"),
+        }
+    }
+
+    #[test]
+    fn unknown_status_value_maps_to_unknown() {
+        let bytes = ApiResponse {
+            header: None,
+            status: Some(ApiResponseStatus { status: 9999, error_message: "x".into() }),
+            message: None,
+        }
+        .encode_to_vec();
+        let t = MockTransport::new(move |_| Ok(bytes.clone()));
+        let e = KiCadClient::new(t, "n", None).ping().unwrap_err();
+        assert!(matches!(e, IpcError::Api { code: ApiStatusCode::Unknown, .. }));
+    }
+
+    #[test]
+    fn ok_without_message_is_unexpected_type() {
+        let bytes = ApiResponse {
+            header: None,
+            status: Some(ApiResponseStatus {
+                status: ApiStatusCode::Ok as i32,
+                error_message: String::new(),
+            }),
+            message: None,
+        }
+        .encode_to_vec();
+        let t = MockTransport::new(move |_| Ok(bytes.clone()));
+        match KiCadClient::new(t, "n", None).get_binary_path("kicad-cli") {
+            Err(IpcError::UnexpectedType { got, .. }) => assert!(got.is_empty()),
+            other => panic!("{other:?}"),
+        }
+    }
+
+    #[test]
+    fn unhandled_is_classified_as_unsupported() {
+        let t = MockTransport::new(|_| Ok(err_reply(ApiStatusCode::Unhandled, "")));
+        let e = KiCadClient::new(t, "n", None).close_all_documents(true).unwrap_err();
+        assert!(e.is_unsupported_command());
+    }
+
+    #[test]
+    fn missing_payload_fields_are_protocol_errors() {
+        let t = MockTransport::new(|_| Ok(ok_reply(&GetVersionResponse { version: None })));
+        assert!(matches!(KiCadClient::new(t, "n", None).get_version(), Err(IpcError::Protocol(_))));
+        let t = MockTransport::new(|_| Ok(ok_reply(&BeginCommitResponse { id: None })));
+        let doc = DocumentSpecifier::pcb("a.kicad_pcb");
+        assert!(matches!(
+            KiCadClient::new(t, "n", None).begin_commit(&doc),
+            Err(IpcError::Protocol(_))
+        ));
+        let t = MockTransport::new(|_| Ok(ok_reply(&OpenDocumentResponse { document: None })));
+        assert!(matches!(
+            KiCadClient::new(t, "n", None).open_document_typed(DocumentType::Pcb, "a"),
+            Err(IpcError::Protocol(_))
+        ));
+    }
+
+    #[test]
+    fn binary_path_sends_name_and_returns_path() {
+        let (t, seen) = recording(ok_reply(&PathResponse { path: "/usr/bin/kicad-cli".into() }));
+        let mut c = KiCadClient::new(t, "n", None);
+        assert_eq!(c.get_binary_path("kicad-cli").unwrap(), "/usr/bin/kicad-cli");
+        let seen = seen.lock().unwrap();
+        assert!(seen[0].0.ends_with("GetKiCadBinaryPath"));
+        let m = GetKiCadBinaryPath::decode(seen[0].1.as_slice()).unwrap();
+        assert_eq!(m.binary_name, "kicad-cli");
+    }
+
+    #[test]
+    fn save_revert_refresh_send_expected_requests() {
+        let (t, seen) = recording(ok_reply(&Empty {}));
+        let mut c = KiCadClient::new(t, "n", None);
+        let doc = DocumentSpecifier::pcb("a.kicad_pcb");
+        c.save_document(&doc).unwrap();
+        c.revert_document(&doc).unwrap();
+        c.refresh_editor(FrameType::PcbEditor).unwrap();
+        c.close_all_documents(true).unwrap();
+        let seen = seen.lock().unwrap();
+        let names: Vec<&str> = seen.iter().map(|(n, _)| n.as_str()).collect();
+        assert_eq!(
+            names,
+            [
+                "kiapi.common.commands.SaveDocument",
+                "kiapi.common.commands.RevertDocument",
+                "kiapi.common.commands.RefreshEditor",
+                "kiapi.common.commands.CloseAllDocuments"
+            ]
+        );
+        let s = SaveDocument::decode(seen[0].1.as_slice()).unwrap();
+        assert_eq!(s.document.unwrap().board_filename(), Some("a.kicad_pcb"));
+        let r = RefreshEditor::decode(seen[2].1.as_slice()).unwrap();
+        assert_eq!(r.frame, FrameType::PcbEditor as i32);
+        assert!(CloseAllDocuments::decode(seen[3].1.as_slice()).unwrap().force);
+    }
+
+    #[test]
+    fn commit_round_trip() {
+        let t = MockTransport::new(|req| {
+            let any = ApiRequest::decode(req).unwrap().message.unwrap();
+            if any.type_url.ends_with("BeginCommit") {
+                let b: BeginCommit = any.unpack().unwrap();
+                assert_eq!(
+                    b.header.unwrap().document.unwrap().board_filename(),
+                    Some("a.kicad_pcb")
+                );
+                Ok(ok_reply(&BeginCommitResponse { id: Some(Kiid { value: "k1".into() }) }))
+            } else {
+                let e: EndCommit = any.unpack().unwrap();
+                assert_eq!(e.id.unwrap().value, "k1");
+                assert_eq!(e.action, CommitAction::Drop as i32);
+                assert_eq!(e.message, "why");
+                Ok(ok_reply(&EndCommitResponse {}))
+            }
+        });
+        let mut c = KiCadClient::new(t, "n", None);
+        let id = c.begin_commit(&DocumentSpecifier::pcb("a.kicad_pcb")).unwrap();
+        assert_eq!(id.value, "k1");
+        c.end_commit(id, CommitAction::Drop, "why").unwrap();
+    }
+
+    #[test]
+    fn open_document_infers_all_types() {
+        let t = MockTransport::new(|req| {
+            let any = ApiRequest::decode(req).unwrap().message.unwrap();
+            let o: OpenDocument = any.unpack().unwrap();
+            let want = if o.path.ends_with(".kicad_sch") {
+                DocumentType::Schematic
+            } else {
+                DocumentType::Project
+            };
+            assert_eq!(o.r#type, want as i32);
+            Ok(ok_reply(&OpenDocumentResponse { document: Some(DocumentSpecifier::pcb(o.path)) }))
+        });
+        let mut c = KiCadClient::new(t, "n", None);
+        c.open_document("/p/a.kicad_sch").unwrap();
+        c.open_document("/p/a.kicad_pro").unwrap();
+    }
+
+    #[test]
+    fn export_svg_builds_job_request() {
+        let (t, seen) = recording(ok_reply(&RunJobResponse {
+            status: JobStatus::Warning as i32,
+            output_path: vec!["o.svg".into()],
+            message: String::new(),
+        }));
+        let mut c = KiCadClient::new(t, "n", None);
+        let doc = DocumentSpecifier::pcb("a.kicad_pcb");
+        let r = c.export_svg(&doc, "o.svg", &[BoardLayer::BL_F_Cu, BoardLayer::BL_B_Cu]).unwrap();
+        assert!(r.is_ok());
+        let seen = seen.lock().unwrap();
+        let req = RunBoardJobExportSvg::decode(seen[0].1.as_slice()).unwrap();
+        assert_eq!(req.job_settings.unwrap().output_path, "o.svg");
+        assert_eq!(
+            req.plot_settings.unwrap().layers,
+            [BoardLayer::BL_F_Cu as i32, BoardLayer::BL_B_Cu as i32]
+        );
+        assert!(req.fit_page_to_board);
+        assert_eq!(req.page_mode, BoardJobPaginationMode::AllLayersOnePage as i32);
+    }
+
+    #[test]
+    fn export_svg_error_status_surfaces() {
+        let t = MockTransport::new(|_| Ok(err_reply(ApiStatusCode::BadRequest, "bad")));
+        let doc = DocumentSpecifier::pcb("a.kicad_pcb");
+        let e = KiCadClient::new(t, "n", None).export_svg(&doc, "o", &[]).unwrap_err();
+        assert!(matches!(e, IpcError::Api { code: ApiStatusCode::BadRequest, .. }));
+    }
 }

@@ -101,3 +101,76 @@ impl Transport for MockTransport {
         (self.handler)(request)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn mock_transport_passes_bytes_and_errors() {
+        let mut t = MockTransport::new(|req| {
+            if req.is_empty() {
+                Err(IpcError::Timeout)
+            } else {
+                Ok(req.iter().rev().copied().collect())
+            }
+        });
+        assert_eq!(t.roundtrip(b"abc", Duration::from_secs(1)).unwrap(), b"cba");
+        assert!(matches!(t.roundtrip(b"", Duration::ZERO), Err(IpcError::Timeout)));
+        assert!(format!("{t:?}").starts_with("MockTransport"));
+    }
+
+    #[test]
+    fn mock_transport_is_stateful() {
+        let mut n = 0u8;
+        let mut t = MockTransport::new(move |_| {
+            n += 1;
+            Ok(vec![n])
+        });
+        assert_eq!(t.roundtrip(b"", Duration::ZERO).unwrap(), [1]);
+        assert_eq!(t.roundtrip(b"", Duration::ZERO).unwrap(), [2]);
+    }
+
+    #[test]
+    fn boxed_dyn_transport_delegates() {
+        let mut t: Box<dyn Transport> = Box::new(MockTransport::new(|r| Ok(r.to_vec())));
+        assert_eq!(t.roundtrip(b"xy", Duration::ZERO).unwrap(), b"xy");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn connect_to_missing_socket_is_io_error() {
+        let d = tempfile::tempdir().unwrap();
+        let ep = Endpoint::parse(&d.path().join("none.sock").to_string_lossy()).unwrap();
+        assert!(matches!(NngIpcTransport::connect(&ep), Err(IpcError::Io(_))));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn connect_to_non_socket_file_fails() {
+        let d = tempfile::tempdir().unwrap();
+        let p = d.path().join("plain");
+        std::fs::write(&p, b"x").unwrap();
+        let ep = Endpoint::parse(&p.to_string_lossy()).unwrap();
+        assert!(NngIpcTransport::connect(&ep).is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn peer_closing_after_handshake_fails_roundtrip() {
+        use crate::nng::{self, PROTO_REP0, PROTO_REQ0};
+        let d = tempfile::tempdir().unwrap();
+        let path = d.path().join("c.sock");
+        let l = std::os::unix::net::UnixListener::bind(&path).unwrap();
+        let h = std::thread::spawn(move || {
+            let (mut s, _) = l.accept().unwrap();
+            nng::handshake(&mut s, PROTO_REP0, PROTO_REQ0).unwrap();
+            let _ = nng::read_msg(&mut s);
+            // drop: close without replying
+        });
+        let ep = Endpoint::parse(&path.to_string_lossy()).unwrap();
+        let mut t = NngIpcTransport::connect(&ep).unwrap();
+        assert!(t.roundtrip(b"hi", Duration::from_secs(2)).is_err());
+        h.join().unwrap();
+    }
+}

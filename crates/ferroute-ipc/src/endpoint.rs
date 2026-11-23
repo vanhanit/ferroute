@@ -162,4 +162,78 @@ mod tests {
     fn default_is_tmp_kicad() {
         assert_eq!(Endpoint::platform_default(&|_| None).url, "ipc:///tmp/kicad/api.sock");
     }
+
+    #[test]
+    fn with_token_filters_empty_and_keeps_value() {
+        let ep = Endpoint::parse("/a.sock").unwrap();
+        assert_eq!(ep.clone().with_token(Some(String::new())).token, None);
+        assert_eq!(ep.clone().with_token(None).token, None);
+        assert_eq!(ep.with_token(Some("t".into())).token.as_deref(), Some("t"));
+    }
+
+    #[test]
+    fn parse_trims_whitespace_and_rejects_other_schemes() {
+        assert_eq!(Endpoint::parse("  /a/b.sock \n").unwrap().url, "ipc:///a/b.sock");
+        for bad in ["   ", "http://x", "tcp://h:1", "inproc://x"] {
+            assert!(matches!(Endpoint::parse(bad), Err(IpcError::Unsupported(_))), "{bad}");
+        }
+    }
+
+    #[test]
+    fn socket_path_of_url_and_plain() {
+        let ep = Endpoint { url: "/raw/path".into(), token: None };
+        assert_eq!(ep.socket_path(), PathBuf::from("/raw/path"));
+        assert_eq!(
+            Endpoint::parse("ipc:///run/a b/x.sock").unwrap().socket_path(),
+            PathBuf::from("/run/a b/x.sock")
+        );
+    }
+
+    #[test]
+    fn discover_uses_process_env_without_panicking() {
+        let ep = Endpoint::discover();
+        assert!(ep.url.starts_with("ipc://"));
+    }
+
+    #[test]
+    fn candidates_without_directory_is_just_discovered() {
+        let c = Endpoint::candidates(&env_of(&[(
+            ENV_SOCKET,
+            "ipc:///nonexistent-ferroute-dir/api.sock",
+        )]));
+        assert_eq!(c.len(), 1);
+        assert_eq!(c[0].url, "ipc:///nonexistent-ferroute-dir/api.sock");
+    }
+
+    #[test]
+    fn candidates_lists_sibling_sockets_sorted_with_token() {
+        let d = tempfile::tempdir().unwrap();
+        for n in
+            ["api.sock", "api-200.sock", "api-100.sock", "other.sock", "api.txt", "api-1.sock.bak"]
+        {
+            std::fs::write(d.path().join(n), b"").unwrap();
+        }
+        let main = d.path().join("api.sock");
+        let main_s = main.to_string_lossy().into_owned();
+        let env = move |k: &str| match k {
+            ENV_SOCKET => Some(format!("ipc://{main_s}")),
+            ENV_TOKEN => Some("tok".to_owned()),
+            _ => None,
+        };
+        let c = Endpoint::candidates(&env);
+        let names: Vec<String> = c
+            .iter()
+            .map(|e| e.socket_path().file_name().unwrap().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(names, ["api.sock", "api-100.sock", "api-200.sock"]);
+        assert!(c.iter().all(|e| e.token.as_deref() == Some("tok")));
+    }
+
+    #[test]
+    fn endpoint_serializes_to_json() {
+        let ep = Endpoint::parse("/a.sock").unwrap().with_token(Some("t".into()));
+        let v = serde_json::to_value(&ep).unwrap();
+        assert_eq!(v["url"], "ipc:///a.sock");
+        assert_eq!(v["token"], "t");
+    }
 }
