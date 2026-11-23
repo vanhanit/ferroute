@@ -12,7 +12,7 @@ use crate::grid::{Grid, NodeIdx};
 use crate::legality::{ClassLegality, Obstacles, allows};
 use crate::plan::{ClassPlan, Plan};
 use ferroute_board::{Board, LayerId, NetId, PadId, PadShape};
-use ferroute_geom::{Coord, Hull, Point, Segment, point_segment_dist_lt};
+use ferroute_geom::{Coord, Dir8, Hull, Point, Segment, point_segment_dist_lt};
 
 /// A pad-centre → lattice-node stub.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -29,6 +29,19 @@ pub struct Stub {
     /// Track half-width and net-class clearance of the stub copper.
     pub radius: Coord,
     pub clearance: Coord,
+    /// Pad the stub serves and its entry direction (first leg, centre → outside).
+    pub pad: PadId,
+    pub dir: Dir8,
+    /// Lattice nodes / edges whose copper would overlap this stub's outside copper (its
+    /// own terminal node excluded). The stub's *own net* must keep its lattice paths off
+    /// them, so routes never run over or cross a break-out.
+    pub keepout_nodes: Vec<NodeIdx>,
+    pub keepout_edges: Vec<(NodeIdx, NodeIdx)>,
+    /// Bend between the two legs in 45° steps (0 for a straight stub).
+    pub bend: u8,
+    /// `true` when the outward leg is shorter than one lattice pitch (a visible kink
+    /// next to the pad). Such stubs are a last resort: the search charges a penalty.
+    pub kink: bool,
 }
 
 /// A lattice entry point of a pad.
@@ -36,11 +49,16 @@ pub struct Stub {
 pub struct Terminal {
     pub node: NodeIdx,
     pub stub: Option<u32>,
+    /// Heading from the lattice node into the stub (towards the pad). The route should
+    /// arrive with this heading so it runs straight into the stub without a kink.
+    pub heading: Option<Dir8>,
 }
 
 /// Maximum number of stub alternatives kept per pad, and per entry direction.
-const MAX_STUBS: usize = 8;
+const MAX_STUBS: usize = 12;
+/// Per entry direction: best clean break-outs, plus one kinked fallback.
 const MAX_PER_DIR: usize = 2;
+const MAX_KINK_PER_DIR: usize = 1;
 
 /// Allowed entry/exit directions of a pad, as integer unit steps `(ux, uy)`:
 /// * circular pads (and therefore through-hole pads, vias and holes): all 8 octilinear
@@ -61,8 +79,7 @@ pub fn entry_dirs(board: &Board, pad: PadId) -> Vec<(i64, i64)> {
     for axis in [(1, 0), (0, 1), (-1, 0), (0, -1)] {
         let v = Point::new(axis.0 * 1_000_000, axis.1 * 1_000_000).rotated(rot);
         let d = (v.x.signum(), v.y.signum());
-        let octi = v.x == 0 || v.y == 0 || v.x.abs() == v.y.abs();
-        if !octi {
+        if !v.is_octilinear() {
             return ALL8.to_vec();
         }
         out.push(d);
@@ -131,7 +148,9 @@ pub fn pad_terminals(
         .collect();
     let reach = stub_reach(plan, cp, obs.rules.hole_clearance);
     // (length, segments, dir index, node, layer, path)
-    let mut cands: Vec<(u64, usize, usize, NodeIdx, u32, Vec<Point>)> = Vec::new();
+    // (kink, length, bend, direction index, node, grid layer, polyline)
+    type Cand = (bool, u64, u8, usize, NodeIdx, u32, Vec<Point>);
+    let mut cands: Vec<Cand> = Vec::new();
     let Some((i0, j0, i1, j1)) = grid.index_range(bb.inflate(3 * grid.pitch)) else {
         return Vec::new();
     };
@@ -165,7 +184,7 @@ pub fn pad_terminals(
                         }
                         let m = c + Point::new(k * ux, k * uy);
                         let v = q - m;
-                        if !(v.x == 0 || v.y == 0 || v.x.abs() == v.y.abs()) {
+                        if !v.is_octilinear() {
                             continue;
                         }
                         // Must leave the pad: second leg points strictly outward.
@@ -180,24 +199,31 @@ pub fn pad_terminals(
                             )
                         });
                         if ok {
-                            cands.push((path_len(&path), path.len(), di, n, l, path));
+                            let (bend, kink) = stub_shape(&path, grid.pitch);
+                            cands.push((kink, path_len(&path), bend, di, n, l, path));
                         }
                     }
                 }
             }
         }
     }
-    cands.sort_by_key(|x| (x.0, x.1, x.2, x.3));
+    cands.sort_by_key(|x| (x.0, x.1, x.2, x.3, x.4));
     let mut per_dir = vec![0usize; dirs.len()];
+    let mut kinks_per_dir = vec![0usize; dirs.len()];
     let mut out = Vec::new();
-    for (_, _, di, n, l, path) in cands {
+    for (kink, _, bend, di, n, l, path) in cands {
         if out.len() >= MAX_STUBS
-            || per_dir[di] >= MAX_PER_DIR
+            || (!kink && per_dir[di] >= MAX_PER_DIR)
+            || (kink && kinks_per_dir[di] >= MAX_KINK_PER_DIR)
             || out.iter().any(|t: &Terminal| t.node == n)
         {
             continue;
         }
-        per_dir[di] += 1;
+        if kink {
+            kinks_per_dir[di] += 1;
+        } else {
+            per_dir[di] += 1;
+        }
         // Reserve the lattice only around copper outside the pad: the portion of the
         // first leg up to k_in is contained in the pad copper (adds nothing).
         let (ux, uy) = dirs[di];
@@ -207,7 +233,7 @@ pub fn pad_terminals(
             segs.push(Segment::new(path[1], path[2]));
         }
         let mut reserved = Vec::new();
-        for spine in segs {
+        for &spine in &segs {
             if let Some((a0, b0, a1, b1)) = grid.index_range(spine.bbox().inflate(reach)) {
                 for j in b0..=b1 {
                     for i in a0..=a1 {
@@ -221,18 +247,86 @@ pub fn pad_terminals(
         reserved.sort_unstable();
         reserved.dedup();
         let id = u32::try_from(stubs.len()).unwrap_or(u32::MAX);
+        let (keepout_nodes, keepout_edges) = stub_keepout(grid, l, n, &segs, r);
         stubs.push(Stub {
             path,
             layer: grid.layers[l as usize],
             reserved,
+            keepout_nodes,
+            keepout_edges,
+            bend,
+            kink,
             node: n,
             net,
             radius: r,
             clearance: cp.geom.clearance,
+            pad,
+            dir: Dir8::from_delta(dirs[di].0, dirs[di].1).unwrap_or(Dir8::E),
         });
-        out.push(Terminal { node: n, stub: Some(id) });
+        let heading = Dir8::from_vector(
+            stubs[id as usize].path[stubs[id as usize].path.len() - 2] - grid.pos(n),
+        );
+        out.push(Terminal { node: n, stub: Some(id), heading });
     }
     out
+}
+
+/// Shape facts of a stub polyline: bend between its legs in 45° steps, and whether the
+/// outward leg (to the lattice node) is shorter than `pitch`.
+#[must_use]
+pub fn stub_shape(path: &[Point], pitch: Coord) -> (u8, bool) {
+    if path.len() < 3 {
+        return (0, false);
+    }
+    let (a, b) = (Dir8::from_vector(path[1] - path[0]), Dir8::from_vector(path[2] - path[1]));
+    let bend = match (a, b) {
+        (Some(a), Some(b)) => a.turn(b),
+        _ => 0,
+    };
+    let short = (path[2] - path[1]).norm2() < u128::from(pitch.unsigned_abs()).pow(2);
+    (bend, short)
+}
+
+/// Lattice nodes and forward edges on grid layer `l` whose track copper (radius `r`)
+/// would touch the stub copper `segs` (radius `r`), excluding the terminal node `q` and
+/// edges incident to it (those are governed by the heading / acid-trap rules).
+#[must_use]
+pub fn stub_keepout(
+    grid: &Grid,
+    l: u32,
+    q: NodeIdx,
+    segs: &[Segment],
+    r: Coord,
+) -> (Vec<NodeIdx>, Vec<(NodeIdx, NodeIdx)>) {
+    let reach = 2 * r + 1;
+    let mut nodes = Vec::new();
+    let mut edges = Vec::new();
+    let Some(bb) = segs.iter().map(|s| s.bbox()).reduce(ferroute_geom::Rect::union) else {
+        return (nodes, edges);
+    };
+    let Some((i0, j0, i1, j1)) = grid.index_range(bb.inflate(reach + grid.pitch)) else {
+        return (nodes, edges);
+    };
+    for j in j0..=j1 {
+        for i in i0..=i1 {
+            let n = grid.idx(i, j, l);
+            let pn = grid.pos(n);
+            if n != q && segs.iter().any(|s| point_segment_dist_lt(pn, *s, reach)) {
+                nodes.push(n);
+            }
+            for d in crate::grid::FORWARD {
+                let Some(m) = grid.step(n, d) else { continue };
+                if n == q || m == q {
+                    continue;
+                }
+                let e = Segment::new(pn, grid.pos(m));
+                if segs.iter().any(|s| ferroute_geom::segment_segment_dist_lt(e, *s, reach)) {
+                    edges.push((n.min(m), n.max(m)));
+                }
+            }
+        }
+    }
+    (nodes, edges)
 }
 
 /// Lattice nodes strictly inside pad copper (on the pad's layers). Routes must not run
@@ -341,16 +435,12 @@ pub fn contains_eroded(h: &Hull, q: Point, s: Coord) -> bool {
     poly.contains(q) && !poly.edges().any(|e| point_segment_dist_lt(q, e, need))
 }
 
-fn is_octilinear(v: Point) -> bool {
-    v.x == 0 || v.y == 0 || v.x.abs() == v.y.abs()
-}
-
 /// Octilinear polylines from `c` to `q`: the direct segment if it is already 0°/45°/90°,
 /// otherwise the two dog-legs (45° run then straight run, and straight then 45°).
 #[must_use]
 pub fn octilinear_paths(c: Point, q: Point) -> Vec<Vec<Point>> {
     let d = q - c;
-    if is_octilinear(d) {
+    if d.is_octilinear() {
         return vec![vec![c, q]];
     }
     let (sx, sy) = (d.x.signum(), d.y.signum());
@@ -375,6 +465,39 @@ mod tests {
     use super::*;
 
     #[test]
+    fn stub_shape_reports_bend_and_short_legs() {
+        let c = Point::new(0, 0);
+        assert_eq!(stub_shape(&[c, Point::new(5_000, 0)], 1_000), (0, false));
+        // Straight W then 45° (NW): one 45° step, leg √2·300 < 1000 → kink.
+        assert_eq!(stub_shape(&[c, Point::new(-500, 0), Point::new(-800, -300)], 1_000), (1, true));
+        assert_eq!(
+            stub_shape(&[c, Point::new(-500, 0), Point::new(-500, -2_000)], 1_000),
+            (2, false)
+        );
+    }
+
+    #[test]
+    fn stub_keepout_covers_the_leg_but_not_its_terminal() {
+        use ferroute_board::LayerId;
+        use ferroute_geom::Rect;
+        let g = Grid::covering(
+            Rect::new(Point::new(0, 0), Point::new(10_000, 10_000)),
+            1_000,
+            vec![LayerId(0)],
+        );
+        // Leg from (2.5k, 5k) to the terminal node (5k, 5k).
+        let q = g.idx(5, 5, 0);
+        let leg = [Segment::new(Point::new(2_500, 5_000), Point::new(5_000, 5_000))];
+        let (nodes, edges) = stub_keepout(&g, 0, q, &leg, 100);
+        assert!(nodes.contains(&g.idx(3, 5, 0)) && nodes.contains(&g.idx(4, 5, 0)));
+        assert!(!nodes.contains(&q), "terminal stays usable");
+        assert!(!nodes.contains(&g.idx(4, 4, 0)), "nodes off the leg stay free");
+        // The vertical edge (3,4)-(3,6)... crossing the leg is blocked; edges at q are not.
+        assert!(edges.contains(&(g.idx(3, 4, 0), g.idx(3, 5, 0))));
+        assert!(!edges.iter().any(|&(a, b)| a == q || b == q));
+    }
+
+    #[test]
     fn dog_legs_are_octilinear_and_connect() {
         let c = Point::new(0, 0);
         for q in [
@@ -386,7 +509,7 @@ mod tests {
         ] {
             for path in octilinear_paths(c, q) {
                 assert_eq!((path[0], *path.last().unwrap()), (c, q));
-                assert!(path.windows(2).all(|w| is_octilinear(w[1] - w[0])), "{path:?}");
+                assert!(path.windows(2).all(|w| (w[1] - w[0]).is_octilinear()), "{path:?}");
             }
         }
     }

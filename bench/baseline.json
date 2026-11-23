@@ -11,8 +11,8 @@
         "completion": 1.0,
         "connections_total": 20,
         "connections_missing": 0,
-        "wirelength_mm": 163.79267237565477,
-        "vias": 5,
+        "wirelength_mm": 166.29451003749554,
+        "vias": 3,
         "moved_footprints": 9,
         "displacement_mm": 15.06796220338052,
         "runtime_ms": 100.0
@@ -28,7 +28,7 @@
         "completion": 1.0,
         "connections_total": 43,
         "connections_missing": 0,
-        "wirelength_mm": 345.5230265358659,
+        "wirelength_mm": 350.24950990995075,
         "vias": 16,
         "moved_footprints": 22,
         "displacement_mm": 41.728505252050056,
@@ -45,8 +45,8 @@
         "completion": 1.0,
         "connections_total": 50,
         "connections_missing": 0,
-        "wirelength_mm": 414.11951498609375,
-        "vias": 11,
+        "wirelength_mm": 420.1904644542457,
+        "vias": 15,
         "moved_footprints": 30,
         "displacement_mm": 51.83156486704026,
         "runtime_ms": 200.0
@@ -62,11 +62,11 @@
         "completion": 1.0,
         "connections_total": 18,
         "connections_missing": 0,
-        "wirelength_mm": 338.05492831816144,
-        "vias": 7,
+        "wirelength_mm": 339.4336151533519,
+        "vias": 10,
         "moved_footprints": 0,
         "displacement_mm": 0.0,
-        "runtime_ms": 100.0
+        "runtime_ms": 200.0
       }
     },
     {
@@ -79,8 +79,8 @@
         "completion": 1.0,
         "connections_total": 18,
         "connections_missing": 0,
-        "wirelength_mm": 313.0951974375074,
-        "vias": 8,
+        "wirelength_mm": 324.8771404447847,
+        "vias": 9,
         "moved_footprints": 6,
         "displacement_mm": 11.921978840013155,
         "runtime_ms": 100.0

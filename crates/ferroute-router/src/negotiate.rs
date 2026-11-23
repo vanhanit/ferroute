@@ -12,8 +12,9 @@ use crate::access::{Stub, Terminal};
 use crate::grid::{Grid, NodeIdx};
 use crate::legality::ClassLegality;
 use crate::plan::Plan;
-use crate::search::{Costs, Ctx, IBox, astar, ball};
+use crate::search::{Costs, Ctx, Endpoint, IBox, TargetInfo, astar, ball, stub_penalty};
 use ferroute_board::NetId;
+use ferroute_geom::Dir8;
 use rayon::prelude::*;
 use rustc_hash::FxHashMap;
 
@@ -228,6 +229,96 @@ fn conflicts(st: &State, grid: &Grid, plan: &Plan, r: &NetRoute) -> bool {
     })
 }
 
+/// Union of the self keep-outs of the stubs in `used`.
+fn keepout_of(
+    stubs: &[Stub],
+    used: &[u32],
+) -> (rustc_hash::FxHashSet<NodeIdx>, rustc_hash::FxHashSet<(NodeIdx, NodeIdx)>) {
+    let nodes =
+        used.iter().flat_map(|&s| stubs[s as usize].keepout_nodes.iter().copied()).collect();
+    let edges =
+        used.iter().flat_map(|&s| stubs[s as usize].keepout_edges.iter().copied()).collect();
+    (nodes, edges)
+}
+
+/// Lattice nodes and canonical `(min, max)` planar edges covered by `paths`.
+fn tree_geometry(
+    paths: &[Vec<NodeIdx>],
+) -> (rustc_hash::FxHashSet<NodeIdx>, rustc_hash::FxHashSet<(NodeIdx, NodeIdx)>) {
+    let nodes = paths.iter().flatten().copied().collect();
+    let edges =
+        paths.iter().flat_map(|p| p.windows(2).map(|w| (w[0].min(w[1]), w[0].max(w[1])))).collect();
+    (nodes, edges)
+}
+
+/// A terminal as seen from its lattice node.
+#[derive(Copy, Clone, Debug)]
+struct TerminalRef {
+    island: usize,
+    stub: Option<u32>,
+    /// Heading into the stub (towards the pad).
+    heading: Option<Dir8>,
+}
+
+/// `true` when terminal stub `s` would duplicate a break-out already used by the route:
+/// same pad and entry direction but a different stub (overlapping copper → acid trap).
+fn duplicates_breakout(stubs: &[Stub], used: &[u32], s: Option<u32>) -> bool {
+    let Some(s) = s else { return false };
+    let (pad, dir) = (stubs[s as usize].pad, stubs[s as usize].dir);
+    used.iter().any(|&u| u != s && stubs[u as usize].pad == pad && stubs[u as usize].dir == dir)
+}
+
+/// Headings into the stubs a route uses, at their terminal nodes.
+fn used_stub_heads(job: &NetJob, r: &NetRoute) -> Vec<(NodeIdx, Dir8)> {
+    job.islands
+        .iter()
+        .flatten()
+        .filter(|t| t.stub.is_some_and(|s| r.stubs.contains(&s)))
+        .filter_map(|t| t.heading.map(|h| (t.node, h)))
+        .collect()
+}
+
+/// Search sources for the next connection of a net: every lattice node of the tree built
+/// so far (with the departures that would create an acid trap forbidden) plus the
+/// terminals of connected islands (arriving with their stub heading).
+fn tree_sources(
+    grid: &Grid,
+    job: &NetJob,
+    connected: &[bool],
+    paths: &[Vec<NodeIdx>],
+    stub_heads: &[(NodeIdx, Dir8)],
+    blocked: &dyn Fn(Option<u32>) -> bool,
+    penalty: &dyn Fn(Option<u32>) -> f32,
+) -> Vec<Endpoint> {
+    let inc = crate::junction::incident(grid, paths, stub_heads);
+    let mut out: Vec<Endpoint> = Vec::new();
+    for (isl, ts) in job.islands.iter().enumerate() {
+        if !connected[isl] {
+            continue;
+        }
+        for t in ts.iter().filter(|t| !blocked(t.stub)) {
+            // Starting here uses this terminal's stub, so its copper counts too.
+            let mask =
+                inc.get(&t.node).copied().unwrap_or(0) | t.heading.map_or(0, crate::junction::bit);
+            out.push(Endpoint {
+                cost: penalty(t.stub),
+                node: t.node,
+                heading: t.heading.map(Dir8::opposite),
+                forbid: crate::junction::forbidden_departures(mask),
+            });
+        }
+    }
+    for (&n, &mask) in &inc {
+        out.push(Endpoint {
+            cost: 0.0,
+            node: n,
+            heading: None,
+            forbid: crate::junction::forbidden_departures(mask),
+        });
+    }
+    out
+}
+
 #[allow(clippy::too_many_arguments)]
 fn route_one(
     grid: &Grid,
@@ -244,7 +335,11 @@ fn route_one(
     let k_offs = ball(cp.k);
     let rv_offs = ball(cp.rv);
     let rh_offs = ball(plan.rh);
-    let ctx = Ctx {
+    let no_nodes = rustc_hash::FxHashSet::default();
+    let no_edges = rustc_hash::FxHashSet::default();
+    let base = Ctx {
+        own_nodes: &no_nodes,
+        own_edges: &no_edges,
         grid,
         leg: &legal[job.class],
         occ: &st.occ,
@@ -260,28 +355,51 @@ fn route_one(
         rv_offs: &rv_offs,
         rh_offs: &rh_offs,
     };
-    let mut term_of: FxHashMap<NodeIdx, Vec<(usize, Option<u32>)>> = FxHashMap::default();
+    // node → (island, stub, heading into the stub) for every terminal.
+    let mut term_of: FxHashMap<NodeIdx, Vec<TerminalRef>> = FxHashMap::default();
     for (isl, ts) in job.islands.iter().enumerate() {
         for t in ts {
-            term_of.entry(t.node).or_default().push((isl, t.stub));
+            term_of.entry(t.node).or_default().push(TerminalRef {
+                island: isl,
+                stub: t.stub,
+                heading: t.heading,
+            });
         }
     }
     let mut route = NetRoute::default();
     let mut connected = vec![false; job.islands.len()];
     connected[0] = true;
-    let mut sources: Vec<NodeIdx> = job.islands[0].iter().map(|t| t.node).collect();
     let mut searches = 0u64;
     let mut used_stubs: Vec<u32> = Vec::new();
-    let mark_stub = |n: NodeIdx, isl_ok: &dyn Fn(usize) -> bool, used: &mut Vec<u32>| {
-        if let Some(v) = term_of.get(&n) {
-            for &(isl, stub) in v {
-                if let Some(s) = stub
-                    && isl_ok(isl)
-                {
-                    used.push(s);
-                }
+    // Stub headings at terminals whose stub is part of the route (copper leaves there).
+    let mut stub_heads: Vec<(NodeIdx, Dir8)> = Vec::new();
+    // Attaches the terminals at lattice node `n` whose islands satisfy `want`: a stub
+    // becomes copper only if it does not duplicate a break-out in use and meets every copper
+    // direction already at `n` (`mask`) at ≥ 90° (no acid trap). Returns the islands
+    // actually connected.
+    let attach = |n: NodeIdx,
+                  want: &dyn Fn(usize) -> bool,
+                  mut mask: crate::junction::DirMask,
+                  used: &mut Vec<u32>,
+                  heads: &mut Vec<(NodeIdx, Dir8)>|
+     -> Vec<usize> {
+        let mut got = Vec::new();
+        for t in term_of.get(&n).map_or(&[][..], Vec::as_slice) {
+            let Some(s) = t.stub else { continue };
+            if !want(t.island) || duplicates_breakout(stubs, used, Some(s)) {
+                continue;
             }
+            if let Some(h) = t.heading {
+                if crate::junction::forbidden_departures(mask) & crate::junction::bit(h) != 0 {
+                    continue;
+                }
+                mask |= crate::junction::bit(h);
+                heads.push((n, h));
+            }
+            used.push(s);
+            got.push(t.island);
         }
+        got
     };
     while connected.iter().any(|c| !c) {
         let remaining: Vec<usize> = (0..job.islands.len()).filter(|&i| !connected[i]).collect();
@@ -294,32 +412,58 @@ fn route_one(
             })
             .reduce(union_box)
             .unwrap_or(job.tbox);
-        let is_target =
-            |n: NodeIdx| term_of.get(&n).is_some_and(|v| v.iter().any(|&(isl, _)| !connected[isl]));
+        // Break-outs in use are copper of this net: later paths must not run over them,
+        // and a candidate stub whose area the tree already covers can no longer be used.
+        let (own_nodes, own_edges) = keepout_of(stubs, &used_stubs);
+        let ctx = Ctx { own_nodes: &own_nodes, own_edges: &own_edges, ..base };
+        let (tree_nodes, tree_edges) = tree_geometry(&route.paths);
+        let blocked = |s: Option<u32>| {
+            duplicates_breakout(stubs, &used_stubs, s)
+                || s.is_some_and(|s| {
+                    let st = &stubs[s as usize];
+                    st.keepout_nodes.iter().any(|n| tree_nodes.contains(n))
+                        || st.keepout_edges.iter().any(|e| tree_edges.contains(e))
+                })
+        };
+        // Aesthetics yield to completion as negotiation pressure grows: kinked break-outs
+        // are strongly discouraged early and accepted only where nets keep fighting.
+        let stub_costs = Costs { kink: cfg.costs.kink / pres_fac.max(1.0), ..cfg.costs };
+        let penalty = |st: Option<u32>| {
+            st.filter(|s| !used_stubs.contains(s)).map_or(0.0, |s| {
+                stub_penalty(&stub_costs, stubs[s as usize].bend, stubs[s as usize].kink)
+            })
+        };
+        let sources =
+            tree_sources(grid, job, &connected, &route.paths, &stub_heads, &blocked, &penalty);
+        // Targets: terminals of unconnected islands; the route must continue into the stub.
+        let target = |n: NodeIdx| {
+            term_of.get(&n).and_then(|v| {
+                v.iter()
+                    .find(|t| !connected[t.island] && !blocked(t.stub))
+                    .map(|t| TargetInfo { heading: t.heading, cost: penalty(t.stub) })
+            })
+        };
         searches += 1;
-        let Some(path) = astar(&ctx, &sources, &is_target, tbox) else {
+        let Some(path) = astar(&ctx, &sources, &target, tbox) else {
             break;
         };
         let (start, end) = (path[0], path[path.len() - 1]);
         let conn_now = connected.clone();
-        mark_stub(start, &|isl| conn_now[isl], &mut used_stubs);
-        let mut reached = Vec::new();
-        if let Some(v) = term_of.get(&end) {
-            for &(isl, stub) in v {
-                if !connected[isl] {
-                    reached.push(isl);
-                    if let Some(s) = stub {
-                        used_stubs.push(s);
-                    }
-                }
-            }
+        // Starting on existing tree copper needs no stub; starting at a bare terminal does.
+        if !tree_nodes.contains(&start) {
+            let out_dir = path.windows(2).find_map(|w| crate::junction::step_dir(grid, w[0], w[1]));
+            let mask = out_dir.map_or(0, crate::junction::bit);
+            attach(start, &|isl| conn_now[isl], mask, &mut used_stubs, &mut stub_heads);
         }
-        // Reaching one terminal connects every island that owns it (shared stub node).
+        // Copper already leaving the end node: the path's last step (reversed), existing tree
+        // copper and stubs attached there.
+        let back = path.windows(2).rev().find_map(|w| crate::junction::step_dir(grid, w[1], w[0]));
+        let inc = crate::junction::incident(grid, &route.paths, &stub_heads);
+        let mask = inc.get(&end).copied().unwrap_or(0) | back.map_or(0, crate::junction::bit);
+        let reached = attach(end, &|isl| !conn_now[isl], mask, &mut used_stubs, &mut stub_heads);
         for isl in reached {
             connected[isl] = true;
-            sources.extend(job.islands[isl].iter().map(|t| t.node));
         }
-        sources.extend(path.iter().copied());
         route.paths.push(path);
     }
     route.complete = connected.iter().all(|&c| c);
@@ -473,6 +617,8 @@ pub fn negotiate(
             let job = &jobs[j];
             let pins: rustc_hash::FxHashSet<NodeIdx> =
                 routes[j].paths.iter().flat_map(|p| [p[0], p[p.len() - 1]]).collect();
+            let heads = used_stub_heads(job, &routes[j]);
+            let head_at = |n: NodeIdx| heads.iter().find(|&&(m, _)| m == n).map(|&(_, h)| h);
             let mut cand = routes[j].clone();
             cand.paths = routes[j]
                 .paths
@@ -485,9 +631,15 @@ pub fn negotiate(
                         p,
                         &|n| pins.contains(&n),
                         &cfg.costs,
+                        head_at(p[0]).map(Dir8::opposite),
+                        head_at(p[p.len() - 1]),
                     )
                 })
                 .collect();
+            // Never trade a jog for an acid trap.
+            if crate::junction::has_acute_or_overlap(grid, &cand.paths, &heads) {
+                continue;
+            }
             if cand.paths == routes[j].paths {
                 continue;
             }

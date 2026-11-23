@@ -12,26 +12,14 @@
 //! Pinned nodes (path endpoints, Steiner junctions, via sites) are never skipped.
 
 use crate::grid::{Grid, NodeIdx, forward_slot};
+use crate::junction::step_dir;
 use crate::legality::{ClassLegality, allows};
-use crate::search::Costs;
+use crate::search::{Costs, turn_cost};
 use ferroute_board::NetId;
 use ferroute_geom::Dir8;
 
 /// Longest window (in path nodes) considered for one shortcut.
 const MAX_WINDOW: usize = 96;
-
-fn dir_between(grid: &Grid, a: NodeIdx, b: NodeIdx) -> Option<Dir8> {
-    let (ai, aj, al) = grid.coords(a);
-    let (bi, bj, bl) = grid.coords(b);
-    if al != bl {
-        return None;
-    }
-    let d = (i64::from(bi) - i64::from(ai), i64::from(bj) - i64::from(aj));
-    Dir8::ALL.into_iter().find(|x| {
-        let (di, dj) = x.delta();
-        (i64::from(di), i64::from(dj)) == d
-    })
-}
 
 /// Cost of a node sequence (length + bends), including the turn from `prev` into the
 /// first step and from the last step into `next`. `None` if it contains an acute turn.
@@ -45,27 +33,25 @@ fn cost(
     let mut total = 0.0f32;
     let mut last = prev;
     for w in nodes.windows(2) {
-        let d = dir_between(grid, w[0], w[1])?;
+        let d = step_dir(grid, w[0], w[1])?;
         total += if d.is_diagonal() { std::f32::consts::SQRT_2 } else { 1.0 };
-        if let Some(p) = last {
-            match p.turn(d) {
-                0 => {}
-                1 => total += c.bend45,
-                2 => total += c.bend90,
-                _ => return None,
-            }
-        }
+        total += turn_cost(c, last, d)?;
         last = Some(d);
     }
-    if let (Some(l), Some(n)) = (last, next) {
-        match l.turn(n) {
-            0 => {}
-            1 => total += c.bend45,
-            2 => total += c.bend90,
-            _ => return None,
-        }
+    if let Some(n) = next {
+        total += turn_cost(c, last, n)?;
     }
     Some(total)
+}
+
+/// Heading of the last planar step in `seq` (vias keep the heading), else `start`.
+fn heading_before(grid: &Grid, seq: &[NodeIdx], start: Option<Dir8>) -> Option<Dir8> {
+    seq.windows(2).rev().find_map(|w| step_dir(grid, w[0], w[1])).or(start)
+}
+
+/// Heading of the first planar step after index `j` (across vias), else `end`.
+fn heading_after(grid: &Grid, path: &[NodeIdx], j: usize, end: Option<Dir8>) -> Option<Dir8> {
+    path[j..].windows(2).find_map(|w| step_dir(grid, w[0], w[1])).or(end)
 }
 
 fn step_ok(leg: &ClassLegality, net: NetId, a: NodeIdx, b: NodeIdx, d: Dir8) -> bool {
@@ -161,6 +147,11 @@ fn candidates(
 
 /// Smooths one path. `pinned(n)` marks nodes that must stay on the path.
 #[must_use]
+///
+/// `start` is the heading the route has when it enters `path[0]` (e.g. leaving a pad
+/// stub) and `end` the heading it must continue with after the last node (into a stub);
+/// both take part in the bend costs so smoothing never creates kinks next to pads.
+#[allow(clippy::too_many_arguments)]
 pub fn smooth_path(
     grid: &Grid,
     leg: &ClassLegality,
@@ -168,6 +159,8 @@ pub fn smooth_path(
     path: &[NodeIdx],
     pinned: &dyn Fn(NodeIdx) -> bool,
     costs: &Costs,
+    start: Option<Dir8>,
+    end: Option<Dir8>,
 ) -> Vec<NodeIdx> {
     if path.len() < 3 {
         return path.to_vec();
@@ -176,11 +169,7 @@ pub fn smooth_path(
     let mut i = 0usize;
     while i + 1 < path.len() {
         let layer = grid.coords(path[i]).2;
-        let prev = if out.len() >= 2 {
-            dir_between(grid, out[out.len() - 2], out[out.len() - 1])
-        } else {
-            None
-        };
+        let prev = heading_before(grid, &out, start);
         // Farthest same-layer index reachable without skipping a pinned node.
         let mut lim = i + 1;
         while lim + 1 < path.len()
@@ -196,7 +185,7 @@ pub fn smooth_path(
             if grid.coords(path[j]).2 != layer {
                 continue;
             }
-            let next = path.get(j + 1).and_then(|&n| dir_between(grid, path[j], n));
+            let next = heading_after(grid, path, j, end);
             let Some(old) = cost(grid, &path[i..=j], prev, next, costs) else { continue };
             let mut best: Option<(f32, Vec<NodeIdx>)> = None;
             for cand in candidates(grid, leg, net, path[i], path[j]) {

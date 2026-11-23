@@ -14,6 +14,11 @@ pub struct Costs {
     pub via: f32,
     pub bend45: f32,
     pub bend90: f32,
+    /// Extra penalty for turning immediately after a via, so vias sit in line with
+    /// straight traces and bends happen elsewhere.
+    pub via_turn: f32,
+    /// Penalty for using a pad break-out whose outward leg is a short kink.
+    pub kink: f32,
 }
 
 /// Inclusive planar index box `(i0, j0, i1, j1)`.
@@ -30,6 +35,9 @@ pub struct Ctx<'a> {
     pub nb: &'a [u16],
     /// Per node: conflicting in-use stubs of other nets (stub-vs-stub congestion).
     pub sextra: &'a [u16],
+    /// The net's own stub keep-out (nodes / canonical `(min, max)` edges it must avoid).
+    pub own_nodes: &'a rustc_hash::FxHashSet<NodeIdx>,
+    pub own_edges: &'a rustc_hash::FxHashSet<(NodeIdx, NodeIdx)>,
     pub hole_occ: &'a [u16],
     pub hist: &'a [f32],
     pub pres_fac: f32,
@@ -43,9 +51,6 @@ pub struct Ctx<'a> {
     /// Hole-channel offsets (radius rh), planar.
     pub rh_offs: &'a [(i32, i32)],
 }
-
-const FROM_SOURCE: u8 = 8;
-const FROM_VIA: u8 = 9;
 
 /// Chebyshev-ball offsets of radius `r`.
 #[must_use]
@@ -120,12 +125,79 @@ fn octile(i: u32, j: u32, t: IBox) -> f32 {
     h
 }
 
-/// Finds a least-cost path from any `sources` node to any node with `is_target`,
-/// restricted to `ctx.region` (all layers). Returns the node sequence source → target.
+/// A search endpoint: a lattice node and the heading the route has there, if fixed
+/// (e.g. the direction of a pad stub). For a source it is the heading the route arrives
+/// with; for a target, the heading it must continue with.
+#[derive(Copy, Clone, Debug, PartialEq)]
+pub struct Endpoint {
+    pub node: NodeIdx,
+    pub heading: Option<Dir8>,
+    /// First-step directions that are not allowed from this source (bit = `Dir8::index`),
+    /// e.g. departures that would form an acid trap with copper already at a junction.
+    pub forbid: u8,
+    /// Cost already incurred at this source (e.g. the quality penalty of its stub).
+    pub cost: f32,
+}
+
+/// What a target node requires: the heading to continue with (into a stub) and the
+/// cost of finishing there (e.g. the quality penalty of the stub).
+#[derive(Copy, Clone, Debug, PartialEq)]
+pub struct TargetInfo {
+    pub heading: Option<Dir8>,
+    pub cost: f32,
+}
+
+/// Bend penalty for turning from `from` into `to`; `None` for acute or U-turns
+/// (forbidden). Shared by the search and the smoothing pass so both score paths the same.
+#[must_use]
+pub fn turn_cost(costs: &Costs, from: Option<Dir8>, to: Dir8) -> Option<f32> {
+    match from.map_or(0, |f| f.turn(to)) {
+        0 => Some(0.0),
+        1 => Some(costs.bend45),
+        2 => Some(costs.bend90),
+        _ => None,
+    }
+}
+
+/// Quality penalty of a pad break-out: its bend (as a regular bend cost) plus the kink
+/// penalty if its outward leg is shorter than a lattice pitch.
+#[must_use]
+pub fn stub_penalty(costs: &Costs, bend: u8, kink: bool) -> f32 {
+    let b = match bend {
+        0 => 0.0,
+        1 => costs.bend45,
+        _ => costs.bend90,
+    };
+    b + if kink { costs.kink } else { 0.0 }
+}
+
+/// Packed arrival state per search node: heading (0–7, 8 = none) + "arrived by via".
+#[derive(Copy, Clone)]
+struct Arrival(u8);
+
+impl Arrival {
+    const VIA: u8 = 0x10;
+    fn new(heading: Option<Dir8>, via: bool) -> Self {
+        let h = heading.map_or(8, |d| u8::try_from(d.index()).unwrap_or(8));
+        Self(h | if via { Self::VIA } else { 0 })
+    }
+    fn heading(self) -> Option<Dir8> {
+        Dir8::ALL.get(usize::from(self.0 & 0x0f)).copied()
+    }
+    fn via(self) -> bool {
+        self.0 & Self::VIA != 0
+    }
+}
+
+/// Finds a least-cost path from any source to any target, restricted to `ctx.region`
+/// (all layers). `target(n)` returns `Some(heading)` for target nodes, where `heading`
+/// is the direction the route must continue with (bend costs and the no-acute-turn rule
+/// apply to it). Headings are carried through vias, so a via in line with a straight
+/// trace is cheaper than one that also bends. Returns the node sequence source → target.
 pub fn astar(
     ctx: &Ctx<'_>,
-    sources: &[NodeIdx],
-    is_target: &dyn Fn(NodeIdx) -> bool,
+    sources: &[Endpoint],
+    target: &dyn Fn(NodeIdx) -> Option<TargetInfo>,
     target_box: IBox,
 ) -> Option<Vec<NodeIdx>> {
     let g = ctx.grid;
@@ -147,17 +219,25 @@ pub fn astar(
     };
     let mut cost = vec![f32::INFINITY; size];
     let mut parent = vec![u32::MAX; size];
-    let mut arrive = vec![FROM_SOURCE; size];
+    let mut arrive = vec![Arrival::new(None, false); size];
     let mut closed = vec![false; size];
     let mut heap: BinaryHeap<Reverse<(u32, u32)>> = BinaryHeap::new();
-    for &s in sources {
-        if let Some(ls) = local(s)
-            && cost[ls] > 0.0
+    let mut src_forbid: rustc_hash::FxHashMap<usize, u8> = rustc_hash::FxHashMap::default();
+    for s in sources {
+        if let Some(ls) = local(s.node) {
+            *src_forbid.entry(ls).or_default() |= s.forbid;
+        }
+        if let Some(ls) = local(s.node)
+            && s.cost < cost[ls]
         {
-            cost[ls] = 0.0;
-            let (i, j, _) = g.coords(s);
+            cost[ls] = s.cost;
+            arrive[ls] = Arrival::new(s.heading, false);
+            let (i, j, _) = g.coords(s.node);
+            // A source that is also a target finishes with zero length: its priority must
+            // still include the target's finishing cost (e.g. a kinked stub's penalty).
+            let finish = target(s.node).map_or(0.0, |t| t.cost);
             heap.push(Reverse((
-                octile(i, j, target_box).to_bits(),
+                (s.cost + finish + octile(i, j, target_box)).to_bits(),
                 u32::try_from(ls).unwrap_or(u32::MAX),
             )));
         }
@@ -170,7 +250,16 @@ pub fn astar(
         }
         closed[lx] = true;
         let n = global(lx);
-        if is_target(n) {
+        // A source that is also a target (zero-length connection, e.g. two pad stubs on
+        // one lattice node) only counts if the target's heading is a legal departure.
+        let zero_len_ok = |t: TargetInfo| {
+            let hd = t.heading;
+            parent[lx] != u32::MAX
+                || hd.is_none_or(|h| {
+                    src_forbid.get(&lx).copied().unwrap_or(0) & (1 << h.index()) == 0
+                })
+        };
+        if target(n).is_some_and(zero_len_ok) {
             let mut path = vec![n];
             let mut cur = lx;
             while parent[cur] != u32::MAX {
@@ -183,17 +272,34 @@ pub fn astar(
         let (i, j, l) = g.coords(n);
         let base = cost[lx];
         let arr = arrive[lx];
+        let forbid =
+            if parent[lx] == u32::MAX { src_forbid.get(&lx).copied().unwrap_or(0) } else { 0 };
         let mut relax =
-            |m: NodeIdx, step: f32, dir: u8, heap: &mut BinaryHeap<Reverse<(u32, u32)>>| {
+            |m: NodeIdx, step: f32, next: Arrival, heap: &mut BinaryHeap<Reverse<(u32, u32)>>| {
                 let Some(lm) = local(m) else { return };
                 if closed[lm] {
                     return;
                 }
-                let c = base + step;
+                // Entering a target: charge the turn into its required heading.
+                let exit = match target(m) {
+                    Some(t) => {
+                        let turn = match t.heading {
+                            Some(hd) => match turn_cost(&costs, next.heading(), hd) {
+                                Some(x) if next.via() && x > 0.0 => x + costs.via_turn,
+                                Some(x) => x,
+                                None => return,
+                            },
+                            None => 0.0,
+                        };
+                        turn + t.cost
+                    }
+                    None => 0.0,
+                };
+                let c = base + step + exit;
                 if c < cost[lm] {
                     cost[lm] = c;
                     parent[lm] = u32::try_from(lx).unwrap_or(u32::MAX);
-                    arrive[lm] = dir;
+                    arrive[lm] = next;
                     let (mi, mj, _) = g.coords(m);
                     heap.push(Reverse((
                         (c + octile(mi, mj, target_box)).to_bits(),
@@ -203,17 +309,18 @@ pub fn astar(
             };
         for d in Dir8::ALL {
             let Some(m) = g.step(n, d) else { continue };
-            if !allows(ctx.leg.node[m as usize], ctx.net) || !ctx.edge_ok(n, m, d) {
+            if ctx.own_nodes.contains(&m) || ctx.own_edges.contains(&(n.min(m), n.max(m))) {
                 continue;
             }
-            let mut bend = 0.0;
-            if arr < FROM_SOURCE {
-                match Dir8::ALL[arr as usize].turn(d) {
-                    0 => {}
-                    1 => bend = costs.bend45,
-                    2 => bend = costs.bend90,
-                    _ => continue, // no acute or U turns
-                }
+            if forbid & (1 << d.index()) != 0
+                || !allows(ctx.leg.node[m as usize], ctx.net)
+                || !ctx.edge_ok(n, m, d)
+            {
+                continue;
+            }
+            let Some(mut bend) = turn_cost(&costs, arr.heading(), d) else { continue };
+            if arr.via() && bend > 0.0 {
+                bend += costs.via_turn;
             }
             let (mi, mj, _) = g.coords(m);
             let mut cong = ctx.sum_occ(mi, mj, l, ctx.k_offs);
@@ -227,20 +334,21 @@ pub fn astar(
                 1.0
             };
             let step = len * (1.0 + ctx.hist[m as usize]) * (1.0 + ctx.pres_fac * cong) + bend;
-            relax(m, step, u8::try_from(d.index()).unwrap_or(0), &mut heap);
+            relax(m, step, Arrival::new(Some(d), false), &mut heap);
         }
-        if arr != FROM_VIA && nl > 1 && allows(ctx.leg.via[g.planar(n) as usize], ctx.net) {
+        if !arr.via() && nl > 1 && allows(ctx.leg.via[g.planar(n) as usize], ctx.net) {
             let mut cong = ctx.sum_hole(i, j);
             for ll in 0..nl {
                 cong += ctx.sum_occ(i, j, ll, ctx.rv_offs);
             }
             for ll in (0..nl).filter(|&x| x != l) {
                 let m = g.idx(i, j, ll);
-                if !allows(ctx.leg.node[m as usize], ctx.net) {
+                if !allows(ctx.leg.node[m as usize], ctx.net) || ctx.own_nodes.contains(&m) {
                     continue;
                 }
                 let step = costs.via * (1.0 + ctx.hist[m as usize]) * (1.0 + ctx.pres_fac * cong);
-                relax(m, step, FROM_VIA, &mut heap);
+                // The heading survives the via: turning right after it costs a bend.
+                relax(m, step, Arrival::new(arr.heading(), true), &mut heap);
             }
         }
     }

@@ -1,8 +1,10 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 use super::*;
+use ferroute_board::NetId;
 use ferroute_board::builder::{BoardBuilder, mm, pt10};
 use ferroute_board::{Mobility, NetClass};
 use ferroute_drc::{DrcConfig, check};
+use ferroute_geom::Dir8;
 use proptest::prelude::*;
 
 fn exact_cfg() -> RouterConfig {
@@ -175,6 +177,8 @@ proptest! {
         let rep = check(&after, &DrcConfig::default());
         let introduced: Vec<_> = rep.introduced().cloned().collect();
         prop_assert!(introduced.is_empty(), "seed {} n {}: {:#?}", seed, n, introduced);
+        let traps = ferroute_drc::quality::acute_angles(&after);
+        prop_assert!(traps.is_empty(), "seed {} n {}: acid traps {:?}", seed, n, traps);
         prop_assert_eq!(out.stats.drc_gate_rips, 0);
     }
 }
@@ -254,4 +258,193 @@ fn tracks_terminate_at_pad_centres_and_stay_octilinear() {
             assert!(octi, "seed {seed}: non-octilinear segment {t:?}");
         }
     }
+}
+
+/// Directions (unit grid steps) of the routed tracks leaving `p` on each layer.
+fn exits_at(out: &RouteOutcome, p: ferroute_geom::Point) -> Vec<(u8, Option<ferroute_geom::Dir8>)> {
+    out.edit
+        .new_tracks
+        .iter()
+        .filter_map(|t| {
+            let other = if t.start == p {
+                t.end
+            } else if t.end == p {
+                t.start
+            } else {
+                return None;
+            };
+            Some((t.layer.0, ferroute_geom::Dir8::from_vector(other - p)))
+        })
+        .collect()
+}
+
+#[test]
+fn vias_sit_in_line_with_straight_traces() {
+    // Two nets that must cross: the via of the crossing net should not introduce a bend.
+    let mut b = BoardBuilder::new(mm(30), mm(20), 2);
+    let x = b.net("X");
+    let y = b.net("Y");
+    b.smd2("R1", pt10(50, 100), 0.0, x, x);
+    b.smd2("R2", pt10(250, 100), 0.0, x, x);
+    b.smd2("R3", pt10(150, 30), 90.0, y, y);
+    b.smd2("R4", pt10(150, 170), 90.0, y, y);
+    // Join R1.2 -> R2.1 (X, horizontal) and R3.2 -> R4.1 (Y, vertical): they cross.
+    let mut board = b.build();
+    board.pads[0].net = NetId::NONE;
+    board.pads[3].net = NetId::NONE;
+    board.pads[4].net = NetId::NONE;
+    board.pads[7].net = NetId::NONE;
+    let out = route(&board, &exact_cfg()).expect("route");
+    assert_clean_and_complete(&board, &out, true);
+    assert!(!out.edit.new_vias.is_empty(), "crossing requires a via");
+    for v in &out.edit.new_vias {
+        let ex = exits_at(&out, v.pos);
+        let straight = ex.iter().any(|&(la, da)| {
+            ex.iter().any(|&(lb, db)| {
+                la != lb && da.is_some() && db.is_some() && da.map(Dir8::opposite) == db
+            })
+        });
+        assert!(straight, "via at {:?} bends: exits {ex:?}", v.pos);
+    }
+}
+
+#[test]
+fn no_short_kinks_next_to_pads() {
+    for seed in 0..12 {
+        let board = random_board(seed, 12);
+        let out = route(&board, &exact_cfg()).expect("route");
+        let centres: Vec<_> = board.pad_ids().map(|p| board.pad_position(p)).collect();
+        let pitch = out.stats.pitch;
+        for t in &out.edit.new_tracks {
+            if centres.contains(&t.start) || centres.contains(&t.end) {
+                continue;
+            }
+            #[allow(clippy::cast_precision_loss)]
+            let min = pitch as f64 - 1.0;
+            assert!(
+                t.start.dist(t.end) >= min,
+                "seed {seed}: kink segment {t:?} shorter than the pitch {pitch}"
+            );
+        }
+    }
+}
+
+#[test]
+fn routed_copper_has_no_acid_traps() {
+    for seed in 0..16 {
+        let board = random_board(seed, 14);
+        let out = route(&board, &exact_cfg()).expect("route");
+        let mut after = board;
+        after.apply(&out.edit);
+        let traps = ferroute_drc::quality::acute_angles(&after);
+        assert!(traps.is_empty(), "seed {seed}: acid traps {traps:?}");
+    }
+}
+
+#[test]
+#[ignore = "diagnostic"]
+fn diag_acid() {
+    let board = random_board(
+        std::env::var("SEED").ok().and_then(|v| v.parse().ok()).unwrap_or(1),
+        std::env::var("N").ok().and_then(|v| v.parse().ok()).unwrap_or(14),
+    );
+    let out = route(&board, &exact_cfg()).expect("route");
+    let mut after = board.clone();
+    after.apply(&out.edit);
+    for t in ferroute_drc::quality::acute_angles(&after) {
+        eprintln!("TRAP {:?}", t.at);
+        for tr in after.tracks.iter().filter(|x| x.net == t.net && x.layer == t.layer) {
+            let s = ferroute_geom::Segment::new(tr.start, tr.end);
+            if ferroute_geom::point_segment_dist(t.at, s) < 1.0 {
+                eprintln!("   {:?} -> {:?}", tr.start, tr.end);
+            }
+        }
+        for p in board.pad_ids() {
+            if board.pad_position(p).dist(t.at) < 2_000_000.0 && board.pad(p).net == t.net {
+                eprintln!("   pad centre {:?}", board.pad_position(p));
+            }
+        }
+    }
+}
+
+#[test]
+#[ignore = "diagnostic"]
+fn diag_kink_stubs() {
+    let probe = || {
+        ferroute_geom::Point::new(
+            std::env::var("PX").ok().and_then(|v| v.parse().ok()).unwrap_or(24_800_000),
+            std::env::var("PY").ok().and_then(|v| v.parse().ok()).unwrap_or(5_000_000),
+        )
+    };
+    let board = random_board(0, 12);
+    let pitch = default_pitch(&board.rules);
+    let plan = Plan::new(&board.rules, pitch);
+    let bbox = board.outline.bbox().expect("outline");
+    let grid = Grid::covering(
+        ferroute_geom::Rect::new(choose_lattice(&board, bbox, Some(pitch)).1, bbox.max),
+        pitch,
+        vec![ferroute_board::LayerId(0), ferroute_board::LayerId(1)],
+    );
+    let obs = Obstacles::from_board(&board);
+    let leg = legality::compute(&grid, &obs, &plan.classes[0].geom, None);
+    for pid in board.pad_ids() {
+        let c = board.pad_position(pid);
+        if c.dist(probe()) > 1_000_000.0 {
+            continue;
+        }
+        let mut stubs = Vec::new();
+        let ts = access::pad_terminals(
+            &board,
+            &grid,
+            &obs,
+            &leg,
+            &plan.classes[0],
+            &plan,
+            board.pad(pid).net,
+            pid,
+            &mut stubs,
+        );
+        eprintln!("pad {:?} at {:?} net {:?}: {} terminals", pid, c, board.pad(pid).net, ts.len());
+        for s in &stubs {
+            eprintln!("   dir {:?} kink {} bend {} path {:?}", s.dir, s.kink, s.bend, s.path);
+        }
+    }
+    let out = route(&board, &exact_cfg()).expect("route");
+    for t in out
+        .edit
+        .new_tracks
+        .iter()
+        .filter(|t| t.start.dist(probe()) < 1_500_000.0 || t.end.dist(probe()) < 1_500_000.0)
+    {
+        eprintln!("TRACK net {:?} {:?} -> {:?}", t.net, t.start, t.end);
+    }
+}
+
+#[test]
+fn lattice_aligns_pad_rows_and_columns() {
+    // Parts on a 5 mm placement grid: a 0.5 mm lattice puts every pad *row* on a lattice
+    // line (straight E/W approaches), the minimum 0.45 mm pitch would not.
+    let mut b = BoardBuilder::new(mm(40), mm(30), 2);
+    let n: Vec<_> = (0..4).map(|i| b.net(&format!("N{i}"))).collect();
+    for k in 0..6i64 {
+        b.smd2(
+            &format!("R{k}"),
+            pt10(50 + k * 50, 50 + (k % 3) * 50),
+            0.0,
+            n[(k % 4) as usize],
+            n[((k + 1) % 4) as usize],
+        );
+    }
+    let board = b.build();
+    let (pitch, origin) = choose_lattice(&board, board.outline.bbox().expect("outline"), None);
+    assert_eq!(pitch, 500_000);
+    for p in board.pad_ids() {
+        let c = board.pad_position(p) - origin;
+        assert_eq!(c.y.rem_euclid(pitch), 0, "pad {p:?} row off lattice");
+    }
+    // An explicit pitch is respected.
+    assert_eq!(
+        choose_lattice(&board, board.outline.bbox().expect("outline"), Some(450_000)).0,
+        450_000
+    );
 }
