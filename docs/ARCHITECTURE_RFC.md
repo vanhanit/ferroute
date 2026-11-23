@@ -288,7 +288,7 @@ edge.
   `length_min`, and nets more than `skew_max` shorter than their group's longest member,
   are lengthened towards `length_min` or `longest − skew_max/2`, capped by `length_max`.
   The tuner replaces a routed axis-aligned or 45° run (longest first) by a centred
-  accordion with uniform bumps and 45° mitred corners. Parallel legs are one spacing
+  accordion with uniform bumps whose every corner is a quarter-circle arc (r = s/2). Parallel legs are one spacing
   apart (`w + max(clearance, 2w)`). It prefers the *lowest* amplitude that meets the
   whole need on the run (1–3 spacings), and uses taller bumps only for partial gains on
   short runs. Each candidate is accepted only if the exact oracle reports no new

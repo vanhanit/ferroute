@@ -103,7 +103,7 @@ max_vias = 2
 
 Selectors are `nets` / `classes` globs. Later rules override only the fields they set.
 Nets below `length_min_mm` or outside their group's skew are length-tuned with accordion
-meanders (45° mitred, uniform, verified by the DRC oracle). Rules that are still not met
+meanders (rounded corners as true arcs, uniform, verified by the DRC oracle). Rules that are still not met
 are reported, and `--strict-rules` turns them into exit code 2.
 See [`testdata/rules/`](testdata/rules) and RFC §4.7.
 
