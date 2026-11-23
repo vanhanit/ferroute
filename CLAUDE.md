@@ -29,6 +29,20 @@ written in Rust. Priorities, in order:
   invariants and core data structures, writes the contract and acceptance tests, and
   *verifies the output* (diff review, tests, oracle/KiCad DRC, rendered result) instead of
   writing the code itself. Workers on disjoint crates run in parallel.
+* **Token economy (always):** pick the cheapest option that will do the job right.
+  1. The lead decides *what* to do and *how* (design, contract, acceptance criteria) —
+     briefly; no exploratory reading beyond what the decision needs.
+  2. Then decides *whether* to delegate and *to whom*: trivial or mechanical edits the lead
+     does inline (cheaper than briefing anyone); scoped work goes to the cheapest capable
+     worker (Haiku → Sonnet); only maths/invariants/architecture stay with the lead.
+  3. Prompts are short and self-contained: files allowed, API contract, acceptance
+     criteria, exact finish commands. Workers report concisely (files, tests, results) —
+     no file dumps.
+  4. Use targeted reads (`grep -n`, line ranges) instead of whole files; filter command
+     output (`| grep`, `| tail`); run disjoint workers in parallel (worktrees when they
+     share a crate); don't re-run green checks without a change in between.
+  5. The lead always verifies the result against what was ordered (diff review, tests,
+     oracle/KiCad DRC, rendered output) and fixes or re-delegates gaps before committing.
 * **Delegation rules:** the lead writes the interface contract (types + signatures), the
   acceptance tests or criteria, and the list of files the worker may touch. Workers never
   edit crates they do not own, never edit the root `Cargo.toml` (add crate-local deps and
