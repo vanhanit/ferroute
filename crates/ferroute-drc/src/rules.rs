@@ -3,12 +3,11 @@
 //! required width (INV-RULE-1), routed length limits, length-matching skew within a group,
 //! and via-count limits. Unmet constraints are *reported*, never hidden.
 
-use ferroute_board::constraints::required_width;
+use ferroute_board::constraints::{match_groups, required_width};
 use ferroute_board::{Board, NetId};
 use ferroute_geom::Coord;
 use ferroute_geom::units::format_mm;
 use serde::{Deserialize, Serialize};
-use std::collections::BTreeMap;
 
 /// What kind of constraint is unmet.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -61,7 +60,7 @@ impl ConstraintIssue {
             ),
             IssueKind::Skew { group, spread, max } => format!(
                 "match group {group} (net {net}…): length spread {} mm > allowed {} mm",
-                mm(*spread),
+                mm((*spread + 500) / 1000 * 1000),
                 mm(*max)
             ),
             IssueKind::ViaCount { actual, max } => {
@@ -101,7 +100,6 @@ pub fn check_constraints(board: &Board) -> Vec<ConstraintIssue> {
         }
     }
     let mut out = Vec::new();
-    let mut groups: BTreeMap<&str, (Coord, Vec<NetId>)> = BTreeMap::new();
     for (i, net) in board.nets.iter().enumerate().skip(1) {
         let id = NetId(u32::try_from(i).unwrap_or(u32::MAX));
         let c = &net.constraints;
@@ -134,19 +132,14 @@ pub fn check_constraints(board: &Board) -> Vec<ConstraintIssue> {
                 kind: IssueKind::ViaCount { actual: vias[i], max },
             });
         }
-        if let (Some(g), Some(skew)) = (c.match_group.as_deref(), c.skew_max) {
-            let e = groups.entry(g).or_insert((skew, Vec::new()));
-            e.0 = e.0.min(skew);
-            e.1.push(id);
-        }
     }
-    for (g, (max, nets)) in groups {
-        let ls: Vec<Coord> = nets.iter().map(|n| lengths[n.idx()]).collect();
+    for g in match_groups(board) {
+        let ls: Vec<Coord> = g.nets.iter().map(|n| lengths[n.idx()]).collect();
         let spread = ls.iter().max().copied().unwrap_or(0) - ls.iter().min().copied().unwrap_or(0);
-        if spread > max {
+        if spread > g.skew_max {
             out.push(ConstraintIssue {
-                net: nets[0],
-                kind: IssueKind::Skew { group: g.to_owned(), spread, max },
+                net: g.nets[0],
+                kind: IssueKind::Skew { group: g.name, spread, max: g.skew_max },
             });
         }
     }
@@ -157,6 +150,7 @@ pub fn check_constraints(board: &Board) -> Vec<ConstraintIssue> {
 mod tests {
     use super::*;
     use ferroute_board::builder::{BoardBuilder, mm, pt10};
+    use ferroute_board::constraints::MatchGroup;
     use ferroute_board::{Origin, Via};
 
     fn two_nets() -> (ferroute_board::Board, ferroute_board::NetId, ferroute_board::NetId) {
@@ -227,5 +221,26 @@ mod tests {
         let issues = check_constraints(&board);
         assert!(issues.iter().any(|i| matches!(i.kind, IssueKind::ViaCount { actual: 1, max: 0 })));
         assert!(issues.iter().any(|i| matches!(i.kind, IssueKind::Width { actual: 250_000, .. })));
+    }
+
+    #[test]
+    fn outer_group_violation_is_one_issue_while_inner_pairs_are_fine() {
+        let mut b = BoardBuilder::new(mm(60), mm(30), 2);
+        let ids: Vec<_> = ["A_P", "A_N", "B_P", "B_N"].iter().map(|n| b.net(n)).collect();
+        for (k, (y, len)) in [(5, 100), (10, 101), (15, 160), (20, 161)].into_iter().enumerate() {
+            b.track(pt10(10, y * 10), pt10(10 + len, y * 10), 250_000, 0, ids[k], Origin::Routed);
+        }
+        let mut board = b.build();
+        let g = |name: &str, skew, nets: &[ferroute_board::NetId]| MatchGroup {
+            name: name.into(),
+            skew_max: skew,
+            nets: nets.to_vec(),
+        };
+        board.match_groups =
+            vec![g("a", mm(1) / 5, &ids[..2]), g("b", mm(1) / 5, &ids[2..]), g("bus", mm(1), &ids)];
+        let issues = check_constraints(&board);
+        assert_eq!(issues.len(), 1, "{issues:?}");
+        assert!(matches!(&issues[0].kind, IssueKind::Skew { group, .. } if group == "bus"));
+        assert_eq!(issues[0].net, ids[0]);
     }
 }
