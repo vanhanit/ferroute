@@ -159,6 +159,27 @@ pub fn turn_cost(costs: &Costs, from: Option<Dir8>, to: Dir8) -> Option<f32> {
     }
 }
 
+/// Per-net cost policy, derived only from the net's own rules:
+/// * high-speed nets (≥ 50 MHz or impedance-controlled) avoid layer changes and right
+///   angles: vias ×3 and 90° bends ×4 (45° bends are preferred);
+/// * nets with a via limit pay `1 + 4/(1 + max_vias)` more per via (×5 for "no vias"), so
+///   the search spends vias only where a single layer cannot route.
+#[must_use]
+pub fn net_costs(base: &Costs, c: &ferroute_board::constraints::NetConstraints) -> Costs {
+    let mut k = *base;
+    if c.is_high_speed() {
+        k.via *= 3.0;
+        k.bend90 *= 4.0;
+        k.via_turn *= 2.0;
+    }
+    if let Some(max) = c.max_vias {
+        #[allow(clippy::cast_precision_loss)]
+        let f = 1.0 + 4.0 / (1.0 + max.min(1 << 20) as f32);
+        k.via *= f;
+    }
+    k
+}
+
 /// Quality penalty of a pad break-out: its bend (as a regular bend cost) plus the kink
 /// penalty if its outward leg is shorter than a lattice pitch.
 #[must_use]
@@ -353,4 +374,50 @@ pub fn astar(
         }
     }
     None
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ferroute_board::constraints::NetConstraints;
+
+    fn base() -> Costs {
+        Costs { via: 8.0, bend45: 0.3, bend90: 1.0, via_turn: 2.0, kink: 20.0 }
+    }
+
+    #[test]
+    fn high_speed_nets_pay_more_for_vias_and_right_angles() {
+        let slow = net_costs(&base(), &NetConstraints::default());
+        assert_eq!(slow, base());
+        let hs = net_costs(
+            &base(),
+            &NetConstraints { frequency_hz: Some(480_000_000), ..NetConstraints::default() },
+        );
+        assert!(hs.via > slow.via && hs.bend90 > slow.bend90);
+        assert!(hs.bend90 > 2.0 * hs.bend45, "two 45° bends beat one 90° bend");
+        assert_eq!(hs.kink, slow.kink);
+    }
+
+    #[test]
+    fn via_limited_nets_pay_more_for_vias() {
+        let limited = |max| NetConstraints { max_vias: Some(max), ..NetConstraints::default() };
+        let none = net_costs(&base(), &limited(0));
+        let two = net_costs(&base(), &limited(2));
+        let many = net_costs(&base(), &limited(10));
+        assert!(none.via > two.via && two.via > many.via && many.via > base().via);
+        assert_eq!(two.bend90, base().bend90, "only vias are affected");
+        // Compounds with the high-speed policy.
+        let hs = NetConstraints { impedance_mohm: Some(50_000), ..limited(2) };
+        assert!(net_costs(&base(), &hs).via > two.via);
+    }
+
+    #[test]
+    fn turn_costs_forbid_acute_turns() {
+        let c = base();
+        assert_eq!(turn_cost(&c, None, Dir8::E), Some(0.0));
+        assert_eq!(turn_cost(&c, Some(Dir8::E), Dir8::NE), Some(0.3));
+        assert_eq!(turn_cost(&c, Some(Dir8::E), Dir8::N), Some(1.0));
+        assert_eq!(turn_cost(&c, Some(Dir8::E), Dir8::NW), None);
+        assert_eq!(stub_penalty(&c, 1, true), 20.3);
+    }
 }

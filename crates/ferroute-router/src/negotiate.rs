@@ -28,6 +28,8 @@ pub struct NetJob {
     pub islands: Vec<Vec<Terminal>>,
     /// Planar bounding box of all terminals.
     pub tbox: IBox,
+    /// Cost policy of this net (e.g. high-speed nets avoid vias and 90° bends).
+    pub costs: Costs,
 }
 
 /// The lattice route of one net.
@@ -329,7 +331,6 @@ fn route_one(
     job: &NetJob,
     margin: u32,
     pres_fac: f32,
-    cfg: &NegotiationConfig,
 ) -> (NetRoute, u64) {
     let cp = &plan.classes[job.class];
     let k_offs = ball(cp.k);
@@ -348,7 +349,7 @@ fn route_one(
         hole_occ: &st.hole_occ,
         hist: &st.hist,
         pres_fac,
-        costs: cfg.costs,
+        costs: job.costs,
         net: job.net,
         region: inflate(job.tbox, margin, grid),
         k_offs: &k_offs,
@@ -427,7 +428,7 @@ fn route_one(
         };
         // Aesthetics yield to completion as negotiation pressure grows: kinked break-outs
         // are strongly discouraged early and accepted only where nets keep fighting.
-        let stub_costs = Costs { kink: cfg.costs.kink / pres_fac.max(1.0), ..cfg.costs };
+        let stub_costs = Costs { kink: job.costs.kink / pres_fac.max(1.0), ..job.costs };
         let penalty = |st: Option<u32>| {
             st.filter(|s| !used_stubs.contains(s)).map_or(0.0, |s| {
                 stub_penalty(&stub_costs, stubs[s as usize].bend, stubs[s as usize].kink)
@@ -551,9 +552,7 @@ pub fn negotiate(
             }
             let results: Vec<(NetRoute, u64)> = batch
                 .par_iter()
-                .map(|&j| {
-                    route_one(grid, legal, plan, stubs, &st, &jobs[j], margins[j], pres_fac, cfg)
-                })
+                .map(|&j| route_one(grid, legal, plan, stubs, &st, &jobs[j], margins[j], pres_fac))
                 .collect();
             for (&j, (r, s)) in batch.iter().zip(results) {
                 stats.searches += s;
@@ -630,7 +629,7 @@ pub fn negotiate(
                         job.net,
                         p,
                         &|n| pins.contains(&n),
-                        &cfg.costs,
+                        &job.costs,
                         head_at(p[0]).map(Dir8::opposite),
                         head_at(p[p.len() - 1]),
                     )

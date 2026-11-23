@@ -251,6 +251,13 @@ pub fn route(board: &Board, cfg: &RouterConfig) -> Result<RouteOutcome, RouteErr
     let legality_ms = t0.elapsed().as_secs_f64() * 1e3;
 
     // Jobs.
+    let base_costs = Costs {
+        via: cfg.via_cost,
+        bend45: cfg.bend45_cost,
+        bend90: cfg.bend90_cost,
+        via_turn: cfg.via_turn_cost,
+        kink: cfg.kink_cost,
+    };
     let islands = pad_islands(board);
     let mut stubs: Vec<Stub> = Vec::new();
     let mut jobs: Vec<NetJob> = Vec::new();
@@ -303,7 +310,8 @@ pub fn route(board: &Board, cfg: &RouterConfig) -> Result<RouteOutcome, RouteErr
             })
             .reduce(|a, b| (a.0.min(b.0), a.1.min(b.1), a.2.max(b.2), a.3.max(b.3)))
             .unwrap_or((0, 0, 0, 0));
-        jobs.push(NetJob { net, class, islands: term_groups, tbox });
+        let costs = search::net_costs(&base_costs, &board.nets[net.idx()].constraints);
+        jobs.push(NetJob { net, class, islands: term_groups, tbox, costs });
     }
     let mut order: Vec<usize> = (0..jobs.len()).collect();
     order.sort_by_key(|&j| {
@@ -316,13 +324,7 @@ pub fn route(board: &Board, cfg: &RouterConfig) -> Result<RouteOutcome, RouteErr
         pres_fac_first: cfg.pres_fac_first,
         pres_fac_mult: cfg.pres_fac_mult,
         hist_fac: cfg.hist_fac,
-        costs: Costs {
-            via: cfg.via_cost,
-            bend45: cfg.bend45_cost,
-            bend90: cfg.bend90_cost,
-            via_turn: cfg.via_turn_cost,
-            kink: cfg.kink_cost,
-        },
+        costs: base_costs,
         margin: cfg.margin,
     };
     let t1 = Instant::now();
