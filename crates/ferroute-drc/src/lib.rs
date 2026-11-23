@@ -25,6 +25,7 @@ use rustc_hash::FxHashMap;
 use serde::{Deserialize, Serialize};
 
 pub mod connectivity;
+pub mod quality;
 pub use connectivity::{Connectivity, Unconnected};
 
 /// What the oracle checks.
