@@ -221,6 +221,7 @@ Completion and DRC come first; within that, every result must look hand-tuned:
 | 24 | Push-and-shove local moves (KiCad PNS-style walkaround/shove) as LNS operator | Lead + worker | P3 |
 | 25 | Next-generation core: topological (rubber-band) routing on an octilinear visibility/escape graph — topology first, then tight geometry; removes lattice artefacts at the source | Lead | M3 |
 | 14 | Routing-quality residuals: demo has ≤ 1 sliver and ≤ 1 right angle per mode (diagonal–diagonal corner next to a T junction near (108.5, 126.5) with nudging); ci-s2-medium has 3 right angles and ci-s4-medium 2 slivers, where chamfers are illegal and need a local re-route; near-pad bends > 0 on synth boards; tighten the `fixture_quality` bounds to 0 | Lead + worker | commits a8e4162/5244ce8 landed with swapped scopes (a8e4162 also holds the router chamfer, stub and straighten work) |
+| 26 | Via-jog residuals after `router::vias`: layer changes whose far anchors are fixed on both sides; demo U1 right side (V-kink before a long diagonal whose parallel neighbour blocks the shift — needs coordinated multi-chain moves, see #24) and a via beside the U1 top-right pad that cannot sit on the pad axis without crowding its own pad | Lead + worker | bounds in `fixture_quality.rs` |
 | 13 | Coverage ≥ 85 % per crate: CLI output via injected `&mut dyn Write`, ipc/render/kicad gaps | Worker | `make coverage` |
 
 ## Environment notes for cloud sessions
