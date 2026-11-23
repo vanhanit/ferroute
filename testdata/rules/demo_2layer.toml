@@ -11,10 +11,10 @@ epsilon_r = 4.3
 nets = ["+3V3", "GND"]
 max_current_a = 0.8
 
-[[net]]                   # I²C fast-mode plus: keep it short, few vias, matched
+[[net]]                   # I²C: short, few vias, and matched (exercises length tuning)
 nets = ["SCL", "SDA"]
 frequency_mhz = 1
 length_max_mm = 60
 match_group = "i2c"
-skew_max_mm = 25
+skew_max_mm = 1
 max_vias = 2
