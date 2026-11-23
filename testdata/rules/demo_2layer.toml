@@ -1,0 +1,20 @@
+# Per-net electrical rules for testdata/boards/demo_2layer.kicad_pcb
+# (`ferroute route --rules testdata/rules/demo_2layer.toml`).
+# Rules apply in order; a later rule overrides only the fields it sets.
+
+[stackup]
+copper_um = 35            # 1 oz on every copper layer
+outer_dielectric_mm = 1.51
+epsilon_r = 4.3
+
+[[net]]                   # power: IPC-2221 width for 0.8 A at ΔT = 10 °C
+nets = ["+3V3", "GND"]
+max_current_a = 0.8
+
+[[net]]                   # I²C fast-mode plus: keep it short, few vias, matched
+nets = ["SCL", "SDA"]
+frequency_mhz = 1
+length_max_mm = 60
+match_group = "i2c"
+skew_max_mm = 25
+max_vias = 2

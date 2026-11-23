@@ -5,6 +5,7 @@ use super::{load, out, render_opts};
 use crate::length::parse_length;
 use anyhow::{Context, Result, bail};
 use ferroute_board::LayerSet;
+use ferroute_board::netrules::RuleSet;
 use ferroute_engine::{PipelineConfig, run as run_pipeline};
 use ferroute_geom::Coord;
 use ferroute_place::{MovePolicy, PlaceConfig};
@@ -84,13 +85,37 @@ pub struct RouteArgs {
     /// Exit with status 1 if any connection remains unrouted.
     #[arg(long)]
     pub fail_on_incomplete: bool,
+    /// Per-net electrical rules (TOML): current, frequency, impedance, length, skew, vias.
+    #[arg(long)]
+    pub rules: Option<PathBuf>,
+    /// Exit with status 2 if any per-net electrical rule is not met.
+    #[arg(long)]
+    pub strict_rules: bool,
+}
+
+/// Parses a rules file (`[stackup]` + `[[net]]` tables).
+///
+/// # Errors
+/// TOML syntax, unknown keys or invalid values.
+pub fn parse_rules(text: &str) -> Result<RuleSet> {
+    let rs: RuleSet = toml::from_str(text).context("parsing rules")?;
+    rs.validate()?;
+    Ok(rs)
 }
 
 /// Executes `ferroute route`.
 pub fn run(a: &RouteArgs) -> Result<ExitCode> {
     let kb = load(&a.input)?;
     let mut doc = kb.doc;
-    let board = kb.board;
+    let mut board = kb.board;
+    if let Some(path) = &a.rules {
+        let text =
+            std::fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
+        let rules = parse_rules(&text).with_context(|| format!("in {}", path.display()))?;
+        for w in rules.apply(&mut board)? {
+            out(&format!("rules warning: {w}"));
+        }
+    }
     let layers = if a.layers.is_empty() {
         None
     } else {
@@ -178,12 +203,21 @@ pub fn run(a: &RouteArgs) -> Result<ExitCode> {
     if !failed.is_empty() {
         out(&format!("unrouted nets: {}", failed.join(", ")));
     }
+    for n in &res.rule_notes {
+        out(&format!("rules: {n}"));
+    }
+    let issues: Vec<String> =
+        res.constraint_issues.iter().map(|i| i.describe(&res.board_after)).collect();
+    for i in &issues {
+        out(&format!("rule not met: {i}"));
+    }
     if let Some(p) = &a.report {
         let report = json!({
             "ferroute_version": env!("CARGO_PKG_VERSION"),
             "input": a.input, "output": a.output, "seed": a.seed,
             "metrics": m, "route": res.route, "place": res.place, "failed_nets": failed,
             "lns_rounds_run": res.rounds,
+            "rule_notes": res.rule_notes, "rule_issues": issues,
             "drc": { "violations": res.drc.violations.len(), "connectivity": res.drc.connectivity },
         });
         std::fs::write(p, serde_json::to_string_pretty(&report)?)?;
@@ -203,7 +237,45 @@ pub fn run(a: &RouteArgs) -> Result<ExitCode> {
     }
     Ok(if a.fail_on_incomplete && m.connections_missing > 0 {
         ExitCode::from(1)
+    } else if a.strict_rules && !issues.is_empty() {
+        ExitCode::from(2)
     } else {
         ExitCode::SUCCESS
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::parse_rules;
+
+    #[test]
+    fn rules_file_round_trip() {
+        let rs = parse_rules(
+            r#"
+            [stackup]
+            copper_um = 35
+            outer_dielectric_mm = 0.2
+
+            [[net]]
+            nets = ["VBUS", "+5V"]
+            max_current_a = 2.0
+
+            [[net]]
+            nets = ["USB_D?"]
+            impedance_ohm = 45
+            match_group = "usb"
+            skew_max_mm = 0.15
+            "#,
+        )
+        .expect("valid");
+        assert_eq!(rs.rules.len(), 2);
+        assert_eq!(rs.rules[1].impedance_ohm, Some(45.0));
+        assert_eq!(rs.stackup.and_then(|s| s.outer_dielectric_mm), Some(0.2));
+    }
+
+    #[test]
+    fn rules_file_rejects_typos_and_bad_values() {
+        assert!(parse_rules("[[net]]\nnets=[\"A\"]\nmax_curent_a = 1").is_err());
+        assert!(parse_rules("[[net]]\nnets=[\"A\"]\nmax_current_a = -1").is_err());
+    }
 }

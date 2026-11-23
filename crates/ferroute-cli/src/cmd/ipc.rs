@@ -19,6 +19,13 @@ use std::time::Duration;
 
 const CLIENT: &str = "io.github.vanhanit.ferroute";
 
+/// Printed before every file-bridge run: until native IPC commits land (task board #6),
+/// the GUI board is saved, routed on disk and reloaded, which discards KiCad's undo
+/// history and any edit made in the GUI while routing runs.
+pub const FILE_BRIDGE_WARNING: &str = "warning: KiCad 10 file bridge — the open board is saved, \
+routed on disk and reloaded (RevertDocument). Undo history is lost and any edit made in KiCad \
+while routing runs is discarded. A backup is written next to the board (*.ferroute-bak).";
+
 #[derive(clap::Subcommand, Debug)]
 pub enum IpcCommand {
     /// Negotiate capabilities with a running KiCad (GUI or `kicad-cli api-server`).
@@ -40,6 +47,9 @@ pub enum IpcCommand {
         seed: u64,
         #[arg(long)]
         allow_move: bool,
+        /// Per-net electrical rules (TOML), as for `ferroute route --rules`.
+        #[arg(long)]
+        rules: Option<PathBuf>,
     },
     /// KiCad 11+: export the open (or given) board to SVG via the IPC job API.
     ExportSvg {
@@ -99,13 +109,14 @@ pub fn run(c: &IpcCommand) -> Result<ExitCode> {
             }
             Ok(ExitCode::SUCCESS)
         }
-        IpcCommand::Route { socket, seed, allow_move } => {
+        IpcCommand::Route { socket, seed, allow_move, rules } => {
             let mut client = connect(socket.as_ref(), Duration::from_secs(30))?;
             let caps = negotiate(&mut client)?;
             let docs = client.get_open_documents(DocumentType::Pcb)?;
             let Some(doc) = docs.first() else { bail!("no board is open in KiCad") };
             let Some(path) = board_path(doc) else { bail!("open document has no board file name") };
             tracing::info!(?caps, path = %path.display(), "routing open board via file bridge");
+            out(FILE_BRIDGE_WARNING);
             client.save_document(doc).context("SaveDocument")?;
             let args = RouteArgs {
                 input: path.clone(),
@@ -125,6 +136,8 @@ pub fn run(c: &IpcCommand) -> Result<ExitCode> {
                 report: None,
                 svg: None,
                 fail_on_incomplete: false,
+                rules: rules.clone(),
+                strict_rules: false,
             };
             let code = route_run(&args)?;
             client.revert_document(doc).context("RevertDocument (reload)")?;
