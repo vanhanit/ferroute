@@ -7,11 +7,12 @@
 //! exceeds the net's `length_max`. Only copper ferroute routed in this run is touched,
 //! widths never change (INV-RULE-1), and every meander is accepted only if the exact oracle
 //! finds no introduced violation, connectivity does not drop (INV-CONN-1), no acid trap
-//! appears (INV-ROUTE-3) and the bumps keep the net's clearance to its own other copper.
+//! appears (INV-ROUTE-3) and the bumps keep the net's clearance to its own other copper. Every
+//! meander corner is a true circular arc (`ArcTrack`), never a mitre.
 //! Rules still unmet afterwards are reported by `ferroute_drc::rules`.
 
-use crate::meander::{MeanderSpec, polyline_length, run_frame};
-use ferroute_board::{Board, BoardEdit, NetId, Origin, Track};
+use crate::meander::{MeanderSpec, Piece, pieces_length, run_frame};
+use ferroute_board::{ArcTrack, Board, BoardEdit, NetId, Origin, Track};
 use ferroute_drc::rules::net_lengths;
 use ferroute_drc::{DrcConfig, quality};
 use ferroute_geom::{Coord, Hull, units::nm_to_mm};
@@ -86,18 +87,34 @@ impl Gate {
     }
 }
 
-/// `true` if any bump track comes closer than the net's clearance to the net's *other*
-/// copper (pads, vias, tracks not part of this meander) — no crowding or overlap.
-fn crowds_own_copper(board: &Board, bumps: &[Track], meander: &[Track]) -> bool {
-    let Some(first) = bumps.first() else { return false };
-    let (net, layer) = (first.net, first.layer);
+/// `true` if any bump piece comes closer than the net's clearance to the net's *other*
+/// copper (pads, vias, tracks and arcs not part of this meander) — no crowding or overlap.
+fn crowds_own_copper(
+    board: &Board,
+    bump_tracks: &[Track],
+    bump_arcs: &[ArcTrack],
+    meander_tracks: &[Track],
+    meander_arcs: &[ArcTrack],
+) -> bool {
+    let (net, layer) = match (bump_tracks.first(), bump_arcs.first()) {
+        (Some(t), _) => (t.net, t.layer),
+        (None, Some(a)) => (a.net, a.layer),
+        (None, None) => return false,
+    };
     let cl = board.rules.class_of(board, net).clearance;
     let mut others: Vec<Hull> = board
         .tracks
         .iter()
-        .filter(|t| t.net == net && t.layer == layer && !meander.contains(t))
+        .filter(|t| t.net == net && t.layer == layer && !meander_tracks.contains(t))
         .map(Track::hull)
         .collect();
+    others.extend(
+        board
+            .arcs
+            .iter()
+            .filter(|t| t.net == net && t.layer == layer && !meander_arcs.contains(t))
+            .flat_map(ArcTrack::hulls),
+    );
     others.extend(
         board.vias.iter().filter(|v| v.net == net && v.layers.contains(layer)).map(|v| v.hull()),
     );
@@ -107,10 +124,9 @@ fn crowds_own_copper(board: &Board, bumps: &[Track], meander: &[Track]) -> bool 
             .filter(|&p| board.pad(p).net == net && board.pad(p).layers.contains(layer))
             .map(|p| board.pad_hull(p)),
     );
-    bumps.iter().any(|t| {
-        let h = t.hull();
-        others.iter().any(|o| h.clearance_violated(o, cl))
-    })
+    let hulls =
+        bump_tracks.iter().map(|t| vec![t.hull()]).chain(bump_arcs.iter().map(ArcTrack::hulls));
+    hulls.into_iter().flatten().any(|h| others.iter().any(|o| h.clearance_violated(o, cl)))
 }
 
 /// Candidate runs of `net` in `edit`: routed, axis-aligned or 45°, longest (real length)
@@ -140,23 +156,40 @@ fn tune_run(base: &Board, edit: &mut BoardEdit, i: usize, need: f64, gate: &Gate
     let spacing = seg.width + cl.max(2 * seg.width);
     // Lowest amplitude that meets the whole need on this run first (a long, low accordion
     // looks hand-made); only then taller bumps for a partial gain on a short run.
-    let amps = [spacing, 2 * spacing, 3 * spacing];
+    let amps = [spacing, spacing * 3 / 2, 2 * spacing, 3 * spacing];
     let full = amps.iter().map(|&a| (a, true));
     let partial = amps.iter().rev().map(|&a| (a, false));
+    // Fillets keep the copper's inner edge at a positive radius.
+    let min_radius = seg.width / 2 + 1;
     for (amp, must_be_full) in full.chain(partial) {
         for side in [1i8, -1] {
-            let Some(spec) =
-                MeanderSpec::plan_run(seg.start, seg.end, need, spacing, amp, spacing, side)
-            else {
+            let Some(spec) = MeanderSpec::plan_run(
+                seg.start, seg.end, need, spacing, amp, spacing, min_radius, side,
+            ) else {
                 continue;
             };
-            let Some(pts) = spec.polyline(seg.start, seg.end) else { continue };
-            let gain = polyline_length(&pts) - seg.start.dist(seg.end);
+            let Some(pieces) = spec.pieces(seg.start, seg.end) else { continue };
+            let gain = pieces_length(&pieces) - seg.start.dist(seg.end);
             if must_be_full && gain < need - 1_000.0 {
                 continue;
             }
-            let meander: Vec<Track> =
-                pts.windows(2).map(|w| Track { start: w[0], end: w[1], ..seg.clone() }).collect();
+            let mut meander: Vec<Track> = Vec::new();
+            let mut meander_arcs: Vec<ArcTrack> = Vec::new();
+            for p in &pieces {
+                match *p {
+                    Piece::Line(a, b) => meander.push(Track { start: a, end: b, ..seg.clone() }),
+                    Piece::Arc(arc) => meander_arcs.push(ArcTrack {
+                        start: arc.start,
+                        mid: arc.mid,
+                        end: arc.end,
+                        width: seg.width,
+                        layer: seg.layer,
+                        net: seg.net,
+                        locked: seg.locked,
+                        origin: seg.origin,
+                    }),
+                }
+            }
             let on_base = |t: &Track| {
                 let d = seg.end - seg.start;
                 let cross = |p: ferroute_geom::Point| {
@@ -168,8 +201,11 @@ fn tune_run(base: &Board, edit: &mut BoardEdit, i: usize, need: f64, gate: &Gate
             let bumps: Vec<Track> = meander.iter().filter(|t| !on_base(t)).cloned().collect();
             let mut cand = edit.clone();
             cand.new_tracks.splice(i..=i, meander.iter().cloned());
+            cand.new_arcs.extend(meander_arcs.iter().cloned());
             let board = after(base, &cand);
-            if crowds_own_copper(&board, &bumps, &meander) || !gate.admits(&board) {
+            if crowds_own_copper(&board, &bumps, &meander_arcs, &meander, &meander_arcs)
+                || !gate.admits(&board)
+            {
                 continue;
             }
             *edit = cand;
@@ -274,6 +310,29 @@ mod tests {
         (board, edit, p, n)
     }
 
+    /// Every corner of the net's copper is rounded: no two tracks meet at a shared endpoint
+    /// unless they are collinear, and the net's arcs and tracks all have the given width.
+    fn assert_rounded_corners(out: &Board, net: NetId, width: Coord) {
+        let ts: Vec<&Track> = out.tracks.iter().filter(|t| t.net == net).collect();
+        for (i, a) in ts.iter().enumerate() {
+            for b in &ts[i + 1..] {
+                for (p, q) in
+                    [(a.start, b.start), (a.start, b.end), (a.end, b.start), (a.end, b.end)]
+                {
+                    if p != q {
+                        continue;
+                    }
+                    let (u, v) = (a.end - a.start, b.end - b.start);
+                    let cross =
+                        i128::from(u.x) * i128::from(v.y) - i128::from(u.y) * i128::from(v.x);
+                    assert_eq!(cross, 0, "mitred corner at {p:?}");
+                }
+            }
+        }
+        assert!(ts.iter().all(|t| t.width == width));
+        assert!(out.arcs.iter().filter(|a| a.net == net).all(|a| a.width == width));
+    }
+
     #[test]
     fn targets_follow_group_skew_min_and_max() {
         let (board, edit, p, n) = pair(mm(1));
@@ -306,10 +365,17 @@ mod tests {
         assert!(quality::acute_angles(&out).is_empty());
         assert!(out.tracks.iter().all(|t| (t.end - t.start).is_octilinear()));
         assert!(out.tracks.iter().all(|t| t.width == 250_000), "never narrowed");
-        // A long run gets a low accordion, not tall fingers: bumps stay within one spacing
-        // (0.75 mm) of N's original line at y = 12 mm.
-        let dev = out.tracks.iter().filter(|t| t.net == n).flat_map(|t| [t.start.y, t.end.y]);
-        assert!(dev.map(|y| (y - mm(12)).abs()).max() <= Some(750_000));
+        assert!(out.arcs.iter().all(|t| t.width == 250_000), "arcs never narrowed");
+        assert!(!edit.new_arcs.is_empty(), "meander corners are true arcs");
+        assert!(edit.new_arcs.iter().all(|a| a.net == n && a.origin == Origin::Routed));
+        assert_rounded_corners(&out, n, 250_000);
+        // A long run gets a low accordion, not tall fingers: bumps stay within 1.5 spacings
+        // (1.125 mm) of N's original line at y = 12 mm.
+        let dev =
+            out.tracks.iter().filter(|t| t.net == n).flat_map(|t| [t.start.y, t.end.y]).chain(
+                out.arcs.iter().filter(|a| a.net == n).flat_map(|a| [a.start.y, a.mid.y, a.end.y]),
+            );
+        assert!(dev.map(|y| (y - mm(12)).abs()).max() <= Some(1_125_000));
     }
 
     #[test]
@@ -335,7 +401,9 @@ mod tests {
         assert!(quality::acute_angles(&out).is_empty());
         let n_tracks: Vec<_> = out.tracks.iter().filter(|t| t.net == n).collect();
         assert!(n_tracks.iter().all(|t| (t.end - t.start).is_octilinear()));
-        assert!(n_tracks.len() > 5, "meandered");
+        assert!(out.arcs.iter().filter(|a| a.net == n).count() > 5, "meandered with arcs");
+        assert!(!edit.new_arcs.is_empty());
+        assert_rounded_corners(&out, n, 250_000);
         assert!(check_constraints(&out).is_empty(), "{:?}", check_constraints(&out));
     }
 

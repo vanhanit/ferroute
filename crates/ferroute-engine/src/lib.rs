@@ -400,6 +400,7 @@ mod tune_tests {
         assert_eq!(r.metrics.connections_missing, 0);
         assert!(r.constraint_issues.is_empty(), "{:?}", r.constraint_issues);
         assert!(r.rule_notes.iter().any(|n| n.contains("length tuned")), "{:?}", r.rule_notes);
+        assert!(!r.edit.new_arcs.is_empty(), "meander corners are arcs");
         assert!(ferroute_drc::quality::acute_angles(&r.board_after).is_empty());
         let l = net_lengths(&r.board_after);
         assert!((l[p.idx()] - l[n.idx()]).abs() <= mm(1) / 2);
