@@ -3,7 +3,7 @@
 //! required width (INV-RULE-1), routed length limits, length-matching skew within a group,
 //! and via-count limits. Unmet constraints are *reported*, never hidden.
 
-use ferroute_board::constraints::{match_groups, required_width};
+use ferroute_board::constraints::{MatchBy, match_groups, net_delays_fs, required_width};
 use ferroute_board::{Board, NetId};
 use ferroute_geom::Coord;
 use ferroute_geom::units::format_mm;
@@ -18,6 +18,8 @@ pub enum IssueKind {
     Length { actual: Coord, min: Option<Coord>, max: Option<Coord> },
     /// Length spread within a matching group above the allowed skew.
     Skew { group: String, spread: Coord, max: Coord },
+    /// Propagation-delay spread (fs) within a delay-matching group above the allowed skew.
+    SkewDelay { group: String, spread_fs: i64, max_fs: i64 },
     /// More vias than allowed.
     ViaCount { actual: u32, max: u32 },
     /// The impedance target cannot be reached by any width with this stack-up.
@@ -30,7 +32,7 @@ impl IssueKind {
         match self {
             Self::Width { .. } => "width",
             Self::Length { .. } => "length",
-            Self::Skew { .. } => "skew",
+            Self::Skew { .. } | Self::SkewDelay { .. } => "skew",
             Self::ViaCount { .. } => "vias",
             Self::Impedance { .. } => "impedance",
         }
@@ -66,6 +68,11 @@ impl ConstraintIssue {
                 mm((*spread + 500) / 1000 * 1000),
                 mm(*max)
             ),
+            IssueKind::SkewDelay { group, spread_fs, max_fs } => format!(
+                "match group {group} (net {net}…): delay spread {} ps > allowed {} ps",
+                fmt_ps(*spread_fs),
+                fmt_ps(*max_fs)
+            ),
             IssueKind::ViaCount { actual, max } => {
                 format!("net {net}: {actual} vias > allowed {max}")
             }
@@ -75,6 +82,11 @@ impl ConstraintIssue {
             ),
         }
     }
+}
+
+/// Femtoseconds as picoseconds with three decimals, in integer maths.
+fn fmt_ps(fs: i64) -> String {
+    format!("{}{}.{:03}", if fs < 0 { "-" } else { "" }, fs.abs() / 1000, fs.abs() % 1000)
 }
 
 /// Routed copper length of every net (nm, sum of track lengths, rounded).
@@ -145,14 +157,17 @@ pub fn check_constraints(board: &Board) -> Vec<ConstraintIssue> {
             });
         }
     }
+    let delays = net_delays_fs(board);
     for g in match_groups(board) {
-        let ls: Vec<Coord> = g.nets.iter().map(|n| lengths[n.idx()]).collect();
-        let spread = ls.iter().max().copied().unwrap_or(0) - ls.iter().min().copied().unwrap_or(0);
+        let spread = g.spread(&lengths, &delays);
         if spread > g.skew_max {
-            out.push(ConstraintIssue {
-                net: g.nets[0],
-                kind: IssueKind::Skew { group: g.name, spread, max: g.skew_max },
-            });
+            let kind = match g.by {
+                MatchBy::Length => IssueKind::Skew { group: g.name, spread, max: g.skew_max },
+                MatchBy::Delay => {
+                    IssueKind::SkewDelay { group: g.name, spread_fs: spread, max_fs: g.skew_max }
+                }
+            };
+            out.push(ConstraintIssue { net: g.nets[0], kind });
         }
     }
     out
@@ -246,6 +261,7 @@ mod tests {
         let g = |name: &str, skew, nets: &[ferroute_board::NetId]| MatchGroup {
             name: name.into(),
             skew_max: skew,
+            by: ferroute_board::constraints::MatchBy::Length,
             nets: nets.to_vec(),
         };
         board.match_groups =
@@ -254,5 +270,30 @@ mod tests {
         assert_eq!(issues.len(), 1, "{issues:?}");
         assert!(matches!(&issues[0].kind, IssueKind::Skew { group, .. } if group == "bus"));
         assert_eq!(issues[0].net, ids[0]);
+    }
+    #[test]
+    fn delay_group_reports_spread_in_ps_not_length() {
+        // Equal physical length (10 mm), but B sits on an inner layer of a 4-layer board.
+        let mut b = BoardBuilder::new(mm(40), mm(30), 4);
+        let a = b.net("A");
+        let c = b.net("B");
+        b.track(pt10(10, 10), pt10(110, 10), 250_000, 0, a, Origin::Routed);
+        b.track(pt10(10, 20), pt10(110, 20), 250_000, 1, c, Origin::Routed);
+        let mut board = b.build();
+        let group = |by, skew_max| MatchGroup { name: "g".into(), skew_max, by, nets: vec![a, c] };
+        board.match_groups = vec![group(ferroute_board::constraints::MatchBy::Length, mm(1) / 10)];
+        assert!(check_constraints(&board).is_empty(), "length group is met");
+        board.match_groups = vec![group(ferroute_board::constraints::MatchBy::Delay, 2_000)];
+        let issues = check_constraints(&board);
+        assert_eq!(issues.len(), 1, "{issues:?}");
+        let IssueKind::SkewDelay { spread_fs, max_fs, .. } = issues[0].kind else {
+            panic!("{issues:?}")
+        };
+        assert!(spread_fs > 2_000 && max_fs == 2_000, "{spread_fs}");
+        assert_eq!(issues[0].kind.label(), "skew");
+        let text = issues[0].describe(&board);
+        assert!(text.contains("delay spread") && text.contains("> allowed 2.000 ps"), "{text}");
+        board.match_groups = vec![group(ferroute_board::constraints::MatchBy::Delay, 20_000)];
+        assert!(check_constraints(&board).is_empty());
     }
 }

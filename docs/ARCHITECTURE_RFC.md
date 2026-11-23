@@ -294,6 +294,12 @@ edge.
   `[[match]]` groups (members = net/class globs ∪ members of referenced groups, resolved to a
   fixpoint) plus legacy per-net `match_group`s; `match_targets` raises short members
   monotonically until every group, inner pairs and outer buses alike, meets its skew.
+* **Delay matching (`MatchBy::Delay`, task #19):** a group may equalise propagation delay
+  (`net_delays_fs`: Σ length × `layer_delay_ps_per_mm` — microstrip on outer, stripline on
+  inner layers — plus via barrels `board_thickness × span × √εr / c`, integer fs, one rounding
+  per net) with `skew_max` in fs (`skew_ps` in rules). `match_delay_targets` raises in delay
+  space; the tuner converts extra delay to length per chosen run and iterates length and delay
+  groups to a joint fixpoint. The DRC reports `IssueKind::SkewDelay` in ps.
 * **Length tuning (router::tune, router::meander):** after routing, nets below
   `length_min`, and nets more than `skew_max` shorter than their group's longest member,
   are lengthened towards `length_min` or `longest − skew_max/2`, capped by `length_max`.

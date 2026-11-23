@@ -283,9 +283,23 @@ mod tests {
         assert_eq!(rs.rules[1].impedance_ohm, Some(45.0));
         assert_eq!(rs.matches.len(), 2);
         assert_eq!(rs.matches[1].groups, vec!["pair*".to_owned()]);
-        assert_eq!(rs.matches[1].skew_mm, 0.5);
+        assert_eq!(rs.matches[1].skew_mm, Some(0.5));
         assert!(parse_rules("[[match]]\nname=\"x\"\nskew_mm=0.1\nbogus=1").is_err());
         assert_eq!(rs.stackup.and_then(|s| s.outer_dielectric_mm), Some(0.2));
+    }
+
+    #[test]
+    fn delay_match_rules_parse() {
+        let rs = parse_rules(
+            "[stackup]\nboard_thickness_mm = 1.2\n[[match]]\nname = \"d\"\nnets = [\"A\", \"B\"]\nby = \"delay\"\nskew_ps = 2.5",
+        )
+        .expect("valid");
+        assert_eq!(rs.matches[0].by, ferroute_board::constraints::MatchBy::Delay);
+        assert_eq!(rs.matches[0].skew_ps, Some(2.5));
+        assert_eq!(rs.stackup.and_then(|s| s.board_thickness_mm), Some(1.2));
+        assert!(parse_rules("[[match]]\nname=\"x\"\nby=\"time\"\nskew_ps=1").is_err());
+        let both = "[[match]]\nname=\"x\"\nby=\"delay\"\nskew_ps=1\nskew_mm=1";
+        assert!(parse_rules(both).is_err(), "both skew keys");
     }
 
     #[test]

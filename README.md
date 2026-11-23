@@ -111,6 +111,10 @@ nets = ["CLK"]
 skew_mm = 0.5
 ```
 
+A `[[match]]` with `by = "delay"` equalises propagation delay instead of length (inner layers
+are slower, vias add barrel delay): give its spread as `skew_ps` (not `skew_mm`); optional
+`[stackup] board_thickness_mm` (default 1.6) sets the via barrel length.
+
 Selectors are `nets` / `classes` globs. Later rules override only the fields they set.
 Nets below `length_min_mm` or outside their group's skew are length-tuned with accordion
 meanders (rounded corners as true arcs, uniform, verified by the DRC oracle). Rules that are still not met

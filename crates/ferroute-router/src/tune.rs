@@ -10,15 +10,23 @@
 //! finds no introduced violation, connectivity does not drop (INV-CONN-1), no acid trap
 //! appears (INV-ROUTE-3) and the bumps keep the net's clearance to its own other copper. Every
 //! meander corner is a true circular arc (`ArcTrack`), never a mitre.
+//! Delay groups (`by = "delay"`, [`match_delay_targets`]) are tuned the same way in delay
+//! space: the extra delay of a net is converted to length per chosen run with that run's
+//! layer and width (`layer_delay_ps_per_mm`), so a net on a slower inner layer needs less
+//! copper. Nets in both kinds of groups get the larger of the two needs, re-evaluated over
+//! several rounds until both hold.
 //! Rules still unmet afterwards are reported by `ferroute_drc::rules`.
 
 use crate::meander::{MeanderSpec, Piece, pieces_length, run_frame};
-use ferroute_board::constraints::{MatchGroup, match_groups, match_targets};
+use ferroute_board::constraints::{
+    MatchGroup, layer_delay_ps_per_mm, match_delay_targets, match_groups, match_targets,
+    net_delays_fs,
+};
 use ferroute_board::{ArcTrack, Board, BoardEdit, NetId, Origin, Track};
 use ferroute_drc::rules::net_lengths;
 use ferroute_drc::{DrcConfig, quality};
 use ferroute_geom::{Coord, Hull, units::nm_to_mm};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 /// Length targets (nm) of nets that must grow, in net order: the board's
 /// [`match_targets`] that exceed the current length by more than 1 µm.
@@ -30,6 +38,20 @@ pub fn length_targets(board: &Board) -> BTreeMap<NetId, Coord> {
         .enumerate()
         .skip(1)
         .filter(|&(i, t)| t > lengths[i] + 1_000)
+        .map(|(i, t)| (NetId(u32::try_from(i).unwrap_or(u32::MAX)), t))
+        .collect()
+}
+
+/// Delay targets (fs) of nets that must grow because of a delay group: the board's
+/// [`match_delay_targets`] that exceed the current delay by more than 10 fs.
+#[must_use]
+pub fn delay_targets(board: &Board) -> BTreeMap<NetId, i64> {
+    let delays = net_delays_fs(board);
+    match_delay_targets(board, &delays)
+        .into_iter()
+        .enumerate()
+        .skip(1)
+        .filter(|&(i, t)| t > delays[i] + 10)
         .map(|(i, t)| (NetId(u32::try_from(i).unwrap_or(u32::MAX)), t))
         .collect()
 }
@@ -200,37 +222,44 @@ pub fn tune_lengths(base: &Board, edit: &mut BoardEdit) -> Vec<String> {
     let mut gained: BTreeMap<NetId, (f64, u32)> = BTreeMap::new();
     let start = net_lengths(&after(base, edit));
     let original = edit.clone();
-    // Several rounds: lengthening a net can raise the longest member of an enclosing group.
-    for _ in 0..6 {
+    // Several rounds: lengthening a net can raise the longest member of an enclosing group
+    // (or, via the other unit, of a group it shares with a differently-measured one).
+    for _ in 0..8 {
         let before = edit.clone();
-        let targets = length_targets(&after(base, edit));
-        if targets.is_empty() {
+        let current = after(base, edit);
+        let targets = length_targets(&current);
+        let dtargets = delay_targets(&current);
+        let nets: BTreeSet<NetId> = targets.keys().chain(dtargets.keys()).copied().collect();
+        if nets.is_empty() {
             break;
         }
-        let gate = Gate::of(&after(base, edit));
-        for (net, target) in targets {
-            let mut have = net_lengths(&after(base, edit))[net.idx()];
+        let gate = Gate::of(&current);
+        for net in nets {
+            let (lt, dt) = (targets.get(&net).copied(), dtargets.get(&net).copied());
+            let measure = |b: &Board| (net_lengths(b)[net.idx()], net_delays_fs(b)[net.idx()]);
+            let (mut have, mut have_d) = measure(&current);
             let mut tried: Vec<(ferroute_geom::Point, ferroute_geom::Point)> = Vec::new();
-            loop {
+            while let Some(i) = runs(edit, net).into_iter().find(|&i| {
+                let t = &edit.new_tracks[i];
+                !tried.contains(&(t.start, t.end))
+            }) {
+                let t = &edit.new_tracks[i];
+                // fs ÷ (ps/mm × 1e-3 fs/nm) = nm of extra length on this run's layer.
+                let rate = layer_delay_ps_per_mm(base, t.layer, t.width);
                 #[allow(clippy::cast_precision_loss)]
-                let need = (target - have) as f64;
+                let need = lt
+                    .map_or(0.0, |l| (l - have) as f64)
+                    .max(dt.map_or(0.0, |d| (d - have_d) as f64 * 1000.0 / rate));
                 if need < 1_000.0 {
                     break;
                 }
-                let Some(i) = runs(edit, net).into_iter().find(|&i| {
-                    let t = &edit.new_tracks[i];
-                    !tried.contains(&(t.start, t.end))
-                }) else {
-                    break;
-                };
-                let t = &edit.new_tracks[i];
                 tried.push((t.start, t.end));
                 let g = tune_run(base, edit, i, need, &gate);
                 if g > 0.0 {
                     let e = gained.entry(net).or_insert((0.0, 0));
                     e.0 += g;
                     e.1 += 1;
-                    have = net_lengths(&after(base, edit))[net.idx()];
+                    (have, have_d) = measure(&after(base, edit));
                 }
             }
         }
@@ -262,14 +291,10 @@ fn revert_futile(
 ) -> Vec<String> {
     let board = after(base, edit);
     let lengths = net_lengths(&board);
+    let delays = net_delays_fs(&board);
     let groups = match_groups(&board);
-    let unmet: Vec<&MatchGroup> = groups
-        .iter()
-        .filter(|g| {
-            let ls = g.nets.iter().map(|n| lengths[n.idx()]);
-            ls.clone().max().unwrap_or(0) - ls.min().unwrap_or(0) > g.skew_max
-        })
-        .collect();
+    let unmet: Vec<&MatchGroup> =
+        groups.iter().filter(|g| g.spread(&lengths, &delays) > g.skew_max).collect();
     let gate = Gate::of(&board);
     let mut notes = Vec::new();
     let nets: Vec<NetId> = gained.keys().copied().collect();
@@ -303,6 +328,7 @@ fn revert_futile(
 mod tests {
     use super::*;
     use ferroute_board::builder::{BoardBuilder, mm, pt10};
+    use ferroute_board::constraints::MatchBy;
     use ferroute_board::{LayerId, Track};
     use ferroute_drc::rules::{IssueKind, check_constraints};
     use ferroute_geom::{Point, Rect};
@@ -491,6 +517,7 @@ mod tests {
         let g = |name: &str, skew, nets: &[NetId]| MatchGroup {
             name: name.into(),
             skew_max: skew,
+            by: MatchBy::Length,
             nets: nets.to_vec(),
         };
         board.match_groups = vec![
@@ -526,5 +553,124 @@ mod tests {
         for &(net, ..) in &lines {
             assert_rounded_corners(&out, net, 250_000);
         }
+    }
+    /// 4-layer board, two nets of equal physical length (20 mm): P is all on F.Cu, N runs
+    /// 10 mm on In1.Cu between two through vias (slower stripline + 2 barrels).
+    fn inner_layer_pair() -> (Board, BoardEdit, NetId, NetId) {
+        let (board, edit, [p, n, _]) = inner_layer_nets(false);
+        (board, edit, p, n)
+    }
+
+    /// [`inner_layer_pair`] plus (if `with_q`) CLK, a 10 mm F.Cu-only run at y = 20 mm.
+    fn inner_layer_nets(with_q: bool) -> (Board, BoardEdit, [NetId; 3]) {
+        let mut b = BoardBuilder::new(mm(40), mm(30), 4);
+        let p = b.net("D_P");
+        let n = b.net("D_N");
+        let q = if with_q { b.net("CLK") } else { NetId::NONE };
+        if with_q {
+            b.smd2("R5", pt10(50, 200), 0.0, NetId::NONE, q);
+            b.smd2("R6", pt10(166, 200), 0.0, q, NetId::NONE);
+        }
+        b.smd2("R1", pt10(50, 50), 0.0, NetId::NONE, p);
+        b.smd2("R2", pt10(266, 50), 0.0, p, NetId::NONE);
+        b.smd2("R3", pt10(50, 120), 0.0, NetId::NONE, n);
+        b.smd2("R4", pt10(266, 120), 0.0, n, NetId::NONE);
+        let board = b.build();
+        let track = |a: Point, z: Point, layer: u8, net| Track {
+            start: a,
+            end: z,
+            width: 250_000,
+            layer: LayerId(layer),
+            net,
+            locked: false,
+            origin: Origin::Routed,
+        };
+        let via = |at: Point| ferroute_board::Via {
+            pos: at,
+            diameter: 600_000,
+            drill: 300_000,
+            layers: board.all_layers(),
+            net: n,
+            locked: false,
+            origin: Origin::Routed,
+        };
+        let mut edit = BoardEdit {
+            new_tracks: vec![
+                track(pt10(58, 50), pt10(258, 50), 0, p),
+                track(pt10(58, 120), pt10(108, 120), 0, n),
+                track(pt10(108, 120), pt10(208, 120), 1, n),
+                track(pt10(208, 120), pt10(258, 120), 0, n),
+            ],
+            new_vias: vec![via(pt10(108, 120)), via(pt10(208, 120))],
+            ..BoardEdit::default()
+        };
+        if with_q {
+            edit.new_tracks.push(track(pt10(58, 200), pt10(158, 200), 0, q));
+        }
+        (board, edit, [p, n, q])
+    }
+
+    fn group(name: &str, by: MatchBy, skew_max: Coord, nets: &[NetId]) -> MatchGroup {
+        MatchGroup { name: name.into(), skew_max, by, nets: nets.to_vec() }
+    }
+
+    fn delay_spread(b: &Board, p: NetId, n: NetId) -> i64 {
+        let d = net_delays_fs(b);
+        (d[p.idx()] - d[n.idx()]).abs()
+    }
+
+    #[test]
+    fn equal_length_nets_differ_in_delay_and_delay_tuning_fixes_it() {
+        let (mut board, mut edit, p, n) = inner_layer_pair();
+        let start = after(&board, &edit);
+        let l = net_lengths(&start);
+        assert_eq!(l[p.idx()], l[n.idx()], "equal physical length");
+        let skew_fs = 4_000; // 4 ps
+        board.match_groups = vec![group("lenmatch", MatchBy::Length, mm(1) / 10, &[p, n])];
+        assert!(check_constraints(&start).is_empty(), "length group met");
+        board.match_groups = vec![group("delay", MatchBy::Delay, skew_fs, &[p, n])];
+        let before = delay_spread(&after(&board, &edit), p, n);
+        assert!(before > 25_000, "inner layer + vias add ≈ 30 ps: {before}");
+        assert!(length_targets(&after(&board, &edit)).is_empty(), "length tuning sees nothing");
+        assert_eq!(
+            delay_targets(&after(&board, &edit)).keys().copied().collect::<Vec<_>>(),
+            vec![p]
+        );
+        let notes = tune_lengths(&board, &mut edit);
+        assert_eq!(notes.len(), 1, "{notes:?}");
+        let out = after(&board, &edit);
+        assert!(delay_spread(&out, p, n) <= skew_fs, "spread {}", delay_spread(&out, p, n));
+        assert!(check_constraints(&out).is_empty(), "{:?}", check_constraints(&out));
+        let drc = ferroute_drc::check(&out, &DrcConfig::default());
+        assert_eq!(drc.introduced().count(), 0, "{:?}", drc.violations);
+        assert!(quality::acute_angles(&out).is_empty());
+        assert!(edit.new_arcs.iter().all(|a| a.net == p && a.layer == LayerId(0)));
+        assert!(!edit.new_arcs.is_empty(), "rounded meander arcs");
+        assert!(out.tracks.iter().chain(&edit.new_tracks).all(|t| t.width == 250_000));
+        assert_rounded_corners(&out, p, 250_000);
+    }
+
+    #[test]
+    fn nets_in_a_length_and_a_delay_group_satisfy_both() {
+        let (mut board, mut edit, [p, n, q]) = inner_layer_nets(true);
+        // CLK (10 mm, outer only) is 10 mm short and ≈ 70 ps too fast; the length group
+        // raises it by length, the delay group by delay (P and CLK to N's ≈ 147 ps, i.e.
+        // ≈ 6 mm longer than N), and each round changes what the other group sees.
+        board.match_groups = vec![
+            group("len", MatchBy::Length, mm(8), &[p, n, q]),
+            group("delay", MatchBy::Delay, 4_000, &[p, n, q]),
+        ];
+        let notes = tune_lengths(&board, &mut edit);
+        assert!(!notes.is_empty(), "{notes:?}");
+        let out = after(&board, &edit);
+        let l = net_lengths(&out);
+        let ls = [l[p.idx()], l[n.idx()], l[q.idx()]];
+        assert!(ls.iter().max().unwrap() - ls.iter().min().unwrap() <= mm(8), "{ls:?}");
+        let d = net_delays_fs(&out);
+        let ds = [d[p.idx()], d[n.idx()], d[q.idx()]];
+        assert!(ds.iter().max().unwrap() - ds.iter().min().unwrap() <= 4_000, "{ds:?}");
+        assert!(check_constraints(&out).is_empty(), "{:?}", check_constraints(&out));
+        let drc = ferroute_drc::check(&out, &DrcConfig::default());
+        assert_eq!(drc.introduced().count(), 0, "{:?}", drc.violations);
     }
 }

@@ -6,7 +6,7 @@
 //! converted once, at this edge, into the exact integer units of
 //! [`NetConstraints`](crate::constraints::NetConstraints).
 
-use crate::constraints::{MatchGroup, NetConstraints};
+use crate::constraints::{MatchBy, MatchGroup, NetConstraints};
 use crate::{Board, NetId, glob};
 use ferroute_geom::Coord;
 use ferroute_geom::units::mm_to_nm;
@@ -25,6 +25,8 @@ pub struct StackupSpec {
     pub epsilon_r: Option<f64>,
     /// Plane-to-plane spacing of inner (stripline) layers (mm).
     pub inner_dielectric_mm: Option<f64>,
+    /// Overall board thickness (mm); sets via barrel delay.
+    pub board_thickness_mm: Option<f64>,
 }
 
 /// One rule: selector globs plus the constraints it sets.
@@ -62,8 +64,36 @@ pub struct MatchRule {
     /// Globs over the names of other match rules.
     #[serde(default)]
     pub groups: Vec<String>,
-    /// Allowed length spread within the group (mm).
-    pub skew_mm: f64,
+    /// What to equalise: `"length"` (default) or `"delay"` (layer- and via-aware).
+    #[serde(default)]
+    pub by: MatchBy,
+    /// Allowed length spread within a `by = "length"` group (mm).
+    #[serde(default)]
+    pub skew_mm: Option<f64>,
+    /// Allowed propagation-delay spread within a `by = "delay"` group (ps; stored as fs).
+    #[serde(default)]
+    pub skew_ps: Option<f64>,
+}
+
+impl MatchRule {
+    /// The allowed spread in the group's unit (nm or fs), or the error for a missing,
+    /// non-positive or wrong-unit skew key.
+    fn skew(&self, index: usize) -> Result<Coord, RuleError> {
+        let ok = |v: f64| v.is_finite() && v > 0.0;
+        match (self.by, self.skew_mm, self.skew_ps) {
+            (_, Some(_), Some(_)) => Err(RuleError::MatchSkewBoth { index }),
+            (MatchBy::Length, Some(mm), None) if ok(mm) => Ok(mm_to_nm(mm)),
+            (MatchBy::Delay, None, Some(ps)) if ok(ps) =>
+            {
+                #[allow(clippy::cast_possible_truncation)]
+                Ok((ps * 1000.0).round() as Coord)
+            }
+            (_, None, None)
+            | (MatchBy::Length, Some(_), None)
+            | (MatchBy::Delay, None, Some(_)) => Err(RuleError::MatchSkew { index }),
+            _ => Err(RuleError::MatchSkewUnit { index }),
+        }
+    }
 }
 
 /// A complete rules file.
@@ -85,8 +115,14 @@ pub enum RuleError {
     NotPositive { index: usize, field: &'static str },
     #[error("rule {index}: length_min_mm exceeds length_max_mm")]
     LengthRange { index: usize },
-    #[error("match rule {index}: skew_mm must be a finite positive number")]
+    #[error(
+        "match rule {index}: skew_mm (by = \"length\") or skew_ps (by = \"delay\") must be a finite positive number"
+    )]
     MatchSkew { index: usize },
+    #[error("match rule {index}: skew_mm and skew_ps are mutually exclusive")]
+    MatchSkewBoth { index: usize },
+    #[error("match rule {index}: by = \"length\" takes skew_mm, by = \"delay\" takes skew_ps")]
+    MatchSkewUnit { index: usize },
     #[error("stackup: {field} must be a finite positive number")]
     Stackup { field: &'static str },
 }
@@ -164,6 +200,7 @@ impl RuleSet {
                 (s.outer_dielectric_mm, "outer_dielectric_mm"),
                 (s.epsilon_r, "epsilon_r"),
                 (s.inner_dielectric_mm, "inner_dielectric_mm"),
+                (s.board_thickness_mm, "board_thickness_mm"),
             ] {
                 if v.is_some_and(|x| !(x.is_finite() && x > 0.0)) {
                     return Err(RuleError::Stackup { field });
@@ -171,9 +208,7 @@ impl RuleSet {
             }
         }
         for (index, m) in self.matches.iter().enumerate() {
-            if !(m.skew_mm.is_finite() && m.skew_mm > 0.0) {
-                return Err(RuleError::MatchSkew { index });
-            }
+            m.skew(index)?;
         }
         self.rules.iter().enumerate().try_for_each(|(i, r)| r.validate(i))
     }
@@ -219,14 +254,15 @@ impl RuleSet {
                 break;
             }
         }
-        for (m, nets) in self.matches.iter().zip(members) {
+        for (index, (m, nets)) in self.matches.iter().zip(members).enumerate() {
             if nets.len() < 2 {
                 warnings.push(format!("match rule {} has fewer than 2 nets", m.name));
                 continue;
             }
             board.match_groups.push(MatchGroup {
                 name: m.name.clone(),
-                skew_max: mm_to_nm(m.skew_mm),
+                skew_max: m.skew(index).unwrap_or(0),
+                by: m.by,
                 nets: nets
                     .into_iter()
                     .map(|n| NetId(u32::try_from(n).unwrap_or(u32::MAX)))
@@ -252,6 +288,9 @@ impl RuleSet {
             }
             if let Some(b) = s.inner_dielectric_mm {
                 board.stackup.inner_dielectric = Some(mm_to_nm(b));
+            }
+            if let Some(b) = s.board_thickness_mm {
+                board.stackup.board_thickness = mm_to_nm(b);
             }
             if let Some(e) = s.epsilon_r {
                 board.stackup.epsilon_r_milli = scaled(e, 1000.0).unwrap_or(u32::MAX);
@@ -396,6 +435,7 @@ mod tests {
                 outer_dielectric_mm: Some(0.2),
                 epsilon_r: Some(3.66),
                 inner_dielectric_mm: Some(0.4),
+                board_thickness_mm: None,
             }),
             rules: vec![],
             ..RuleSet::default()
@@ -412,7 +452,7 @@ mod tests {
             name: name.into(),
             nets: nets.iter().map(|s| (*s).into()).collect(),
             groups: groups.iter().map(|s| (*s).into()).collect(),
-            skew_mm: skew,
+            skew_mm: Some(skew),
             ..MatchRule::default()
         }
     }
@@ -464,5 +504,52 @@ mod tests {
         assert_eq!(nets_of(&b, "a").len(), 2);
         let neg = RuleSet { matches: vec![mr("x", &[], &[], -1.0)], ..RuleSet::default() };
         assert_eq!(neg.validate(), Err(RuleError::MatchSkew { index: 0 }));
+    }
+
+    #[test]
+    fn delay_rules_parse_convert_and_reject_bad_skew_keys() {
+        let rule = |name: &str, by, mm, ps| MatchRule {
+            name: name.into(),
+            nets: vec!["USB_D+".into(), "USB_D-".into()],
+            by,
+            skew_mm: mm,
+            skew_ps: ps,
+            ..MatchRule::default()
+        };
+        let rs = RuleSet {
+            stackup: Some(StackupSpec { board_thickness_mm: Some(1.2), ..StackupSpec::default() }),
+            matches: vec![
+                rule("d", MatchBy::Delay, None, Some(2.5)),
+                rule("l", MatchBy::Length, Some(0.1), None),
+            ],
+            ..RuleSet::default()
+        };
+        let mut b = board();
+        rs.apply(&mut b).expect("valid");
+        assert_eq!(b.stackup.board_thickness, 1_200_000);
+        let by = |n: &str| b.match_groups.iter().find(|m| m.name == n).expect("g");
+        assert_eq!((by("d").by, by("d").skew_max), (MatchBy::Delay, 2_500), "fs");
+        assert_eq!((by("l").by, by("l").skew_max), (MatchBy::Length, 100_000));
+        let bad = |by, mm, ps| {
+            let m = MatchRule {
+                name: "x".into(),
+                by,
+                skew_mm: mm,
+                skew_ps: ps,
+                ..MatchRule::default()
+            };
+            RuleSet { matches: vec![m], ..RuleSet::default() }.validate()
+        };
+        let (d, l) = (MatchBy::Delay, MatchBy::Length);
+        assert_eq!(bad(d, Some(1.0), Some(1.0)), Err(RuleError::MatchSkewBoth { index: 0 }));
+        assert_eq!(bad(d, Some(1.0), None), Err(RuleError::MatchSkewUnit { index: 0 }));
+        assert_eq!(bad(l, None, Some(1.0)), Err(RuleError::MatchSkewUnit { index: 0 }));
+        assert_eq!(bad(d, None, None), Err(RuleError::MatchSkew { index: 0 }));
+        assert_eq!(bad(d, None, Some(0.0)), Err(RuleError::MatchSkew { index: 0 }));
+        let neg = RuleSet {
+            stackup: Some(StackupSpec { board_thickness_mm: Some(-1.0), ..StackupSpec::default() }),
+            ..RuleSet::default()
+        };
+        assert_eq!(neg.validate(), Err(RuleError::Stackup { field: "board_thickness_mm" }));
     }
 }

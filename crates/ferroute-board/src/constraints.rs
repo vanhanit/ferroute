@@ -6,7 +6,7 @@
 //! (`ferroute_geom::detmath`) and are rounded **up** to a 10 µm fabrication step, so a
 //! derived width is never narrower than the formula requires (INV-RULE-1).
 
-use crate::{Board, NetClass, NetId};
+use crate::{Board, LayerId, NetClass, NetId};
 use ferroute_geom::Coord;
 use ferroute_geom::detmath::{exp, ln, pow};
 use ferroute_geom::units::format_mm;
@@ -46,14 +46,43 @@ impl NetConstraints {
     }
 }
 
-/// A length-matching group: every member's routed length must lie within `skew_max` of the
-/// others. Groups may share nets, so a pair can sit inside a bus (nesting).
+/// Which quantity a [`MatchGroup`] equalises.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum MatchBy {
+    /// Routed physical length; `skew_max` is in nm.
+    #[default]
+    Length,
+    /// Propagation delay (layer- and via-aware, see [`net_delays_fs`]); `skew_max` is in fs.
+    Delay,
+}
+
+/// A matching group: every member's routed length (or delay, see [`MatchBy`]) must lie
+/// within `skew_max` of the others. Groups may share nets, so a pair can sit inside a bus
+/// (nesting).
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct MatchGroup {
     pub name: String,
+    /// Allowed spread: nm for [`MatchBy::Length`], femtoseconds for [`MatchBy::Delay`].
     pub skew_max: Coord,
+    #[serde(default)]
+    pub by: MatchBy,
     /// Member nets, sorted and de-duplicated.
     pub nets: Vec<NetId>,
+}
+
+impl MatchGroup {
+    /// Spread (max − min) of the members in this group's own unit: `lengths` (nm) or
+    /// `delays_fs`, indexed by net id.
+    #[must_use]
+    pub fn spread(&self, lengths: &[Coord], delays_fs: &[i64]) -> i64 {
+        let v = match self.by {
+            MatchBy::Length => lengths,
+            MatchBy::Delay => delays_fs,
+        };
+        let it = self.nets.iter().filter_map(|n| v.get(n.idx()).copied());
+        it.clone().max().unwrap_or(0) - it.min().unwrap_or(0)
+    }
 }
 
 /// Explicit `board.match_groups` plus legacy per-net groups (`match_group` + `skew_max`),
@@ -61,50 +90,40 @@ pub struct MatchGroup {
 /// nets are dropped.
 #[must_use]
 pub fn match_groups(board: &Board) -> Vec<MatchGroup> {
-    let mut by_name: BTreeMap<String, (Coord, BTreeSet<NetId>)> = BTreeMap::new();
-    let mut add = |name: &str, skew: Coord, nets: &mut dyn Iterator<Item = NetId>| {
-        let e = by_name.entry(name.to_owned()).or_insert((skew, BTreeSet::new()));
+    type Entry = (Coord, MatchBy, BTreeSet<NetId>);
+    let mut by_name: BTreeMap<String, Entry> = BTreeMap::new();
+    let mut add = |name: &str, skew: Coord, by: MatchBy, nets: &mut dyn Iterator<Item = NetId>| {
+        let e = by_name.entry(name.to_owned()).or_insert((skew, by, BTreeSet::new()));
         e.0 = e.0.min(skew);
-        e.1.extend(nets);
+        e.2.extend(nets);
     };
     for g in &board.match_groups {
-        add(&g.name, g.skew_max, &mut g.nets.iter().copied());
+        add(&g.name, g.skew_max, g.by, &mut g.nets.iter().copied());
     }
     for (i, net) in board.nets.iter().enumerate().skip(1) {
         let c = &net.constraints;
         if let (Some(g), Some(skew)) = (c.match_group.as_deref(), c.skew_max) {
             let id = NetId(u32::try_from(i).unwrap_or(u32::MAX));
-            add(g, skew, &mut std::iter::once(id));
+            add(g, skew, MatchBy::Length, &mut std::iter::once(id));
         }
     }
     by_name
         .into_iter()
-        .filter(|(_, (_, nets))| nets.len() >= 2)
-        .map(|(name, (skew_max, nets))| MatchGroup {
+        .filter(|(_, (_, _, nets))| nets.len() >= 2)
+        .map(|(name, (skew_max, by, nets))| MatchGroup {
             name,
             skew_max,
+            by,
             nets: nets.into_iter().collect(),
         })
         .collect()
 }
 
-/// Per-net target lengths (index = net id), never below the current `lengths`. Nets below
-/// `length_min` rise to `length_min + 2 µm`; then, until stable, every group whose spread
-/// exceeds its skew raises members below `max − skew` to `max − skew/2`. A target never
-/// exceeds the net's `length_max` (the rule then stays unmet and is reported by the DRC).
-#[must_use]
-pub fn match_targets(board: &Board, lengths: &[Coord]) -> Vec<Coord> {
-    let mut t = lengths.to_vec();
-    let cap = |i: usize, v: Coord| board.nets[i].constraints.length_max.map_or(v, |m| v.min(m));
-    for i in 1..t.len().min(board.nets.len()) {
-        if let Some(min) = board.nets[i].constraints.length_min
-            && t[i] < min
-        {
-            // A little over the limit so float summation can never land just below it.
-            t[i] = t[i].max(cap(i, min + 2_000));
-        }
-    }
-    let groups = match_groups(board);
+/// Raises, until stable, every member of a `by` group whose spread exceeds its skew and
+/// that is below `max − skew` to `max − skew/2` (capped per net by `cap`). `t` is in the
+/// groups' unit.
+fn raise_groups(board: &Board, t: &mut [i64], by: MatchBy, cap: &dyn Fn(usize, i64) -> i64) {
+    let groups: Vec<MatchGroup> = match_groups(board).into_iter().filter(|g| g.by == by).collect();
     for _ in 0..64 * groups.len().max(1) {
         let mut changed = false;
         for g in &groups {
@@ -131,7 +150,90 @@ pub fn match_targets(board: &Board, lengths: &[Coord]) -> Vec<Coord> {
             break;
         }
     }
+}
+
+/// Per-net target lengths (index = net id), never below the current `lengths`. Nets below
+/// `length_min` rise to `length_min + 2 µm`; then, until stable, every *length* group whose
+/// spread exceeds its skew raises members below `max − skew` to `max − skew/2`. A target
+/// never exceeds the net's `length_max` (the rule then stays unmet and is reported by the
+/// DRC). Delay groups are handled by [`match_delay_targets`].
+#[must_use]
+pub fn match_targets(board: &Board, lengths: &[Coord]) -> Vec<Coord> {
+    let mut t = lengths.to_vec();
+    let cap = |i: usize, v: Coord| board.nets[i].constraints.length_max.map_or(v, |m| v.min(m));
+    for i in 1..t.len().min(board.nets.len()) {
+        if let Some(min) = board.nets[i].constraints.length_min
+            && t[i] < min
+        {
+            // A little over the limit so float summation can never land just below it.
+            t[i] = t[i].max(cap(i, min + 2_000));
+        }
+    }
+    raise_groups(board, &mut t, MatchBy::Length, &cap);
     t
+}
+
+/// Per-net target delays (fs, index = net id), never below the current `delays_fs`: the
+/// same raising rule as [`match_targets`], applied to the board's delay groups in delay
+/// space. The tuner converts the extra delay to length per run (`layer_delay_ps_per_mm` of
+/// the run's layer and width).
+#[must_use]
+pub fn match_delay_targets(board: &Board, delays_fs: &[i64]) -> Vec<i64> {
+    let mut t = delays_fs.to_vec();
+    raise_groups(board, &mut t, MatchBy::Delay, &|_, v| v);
+    t
+}
+
+/// Delay (ps/mm) of a trace of `width` on copper layer `layer`: outer layers are
+/// microstrip over the outer dielectric, inner layers stripline in `εr`. Falls back to
+/// `√εr / c` if the microstrip model is out of range.
+#[must_use]
+pub fn layer_delay_ps_per_mm(board: &Board, layer: LayerId, width: Coord) -> f64 {
+    let s = &board.stackup;
+    let er = f64::from(s.epsilon_r_milli) / 1000.0;
+    let last = board.layer_count().saturating_sub(1);
+    let inner = layer.0 != 0 && layer.0 < last;
+    let kind = if inner { LineKind::Stripline } else { LineKind::Microstrip };
+    let t = s.copper_thickness.get(usize::from(layer.0)).copied().unwrap_or(35_000);
+    delay_ps_per_mm(kind, width, s.outer_dielectric, t, er)
+        .unwrap_or_else(|| er.sqrt() / C_MM_PER_PS)
+}
+
+/// Routed propagation delay of every net in femtoseconds (index = net id): the sum over
+/// tracks and arcs of length × [`layer_delay_ps_per_mm`], plus each via's barrel
+/// (`board_thickness × spanned-layer fraction × √εr / c`). Rounded once per net;
+/// IEEE-only maths (INV-DET-3).
+#[must_use]
+pub fn net_delays_fs(board: &Board) -> Vec<i64> {
+    let mut d = vec![0.0f64; board.nets.len()];
+    #[allow(clippy::cast_precision_loss)]
+    let mm = |nm: f64| nm / 1_000_000.0;
+    for t in &board.tracks {
+        if let Some(e) = d.get_mut(t.net.idx()) {
+            *e += mm(t.start.dist(t.end)) * layer_delay_ps_per_mm(board, t.layer, t.width);
+        }
+    }
+    for a in &board.arcs {
+        if let Some(e) = d.get_mut(a.net.idx()) {
+            *e += mm(a.length()) * layer_delay_ps_per_mm(board, a.layer, a.width);
+        }
+    }
+    let er = f64::from(board.stackup.epsilon_r_milli) / 1000.0;
+    let n = board.layer_count();
+    #[allow(clippy::cast_precision_loss)]
+    let barrel_ps_per_full = mm(board.stackup.board_thickness as f64) * er.sqrt() / C_MM_PER_PS;
+    for v in &board.vias {
+        let lo = v.layers.iter().map(|l| l.0).min();
+        let hi = v.layers.iter().map(|l| l.0).max();
+        let (Some(lo), Some(hi)) = (lo, hi) else { continue };
+        if n >= 2
+            && let Some(e) = d.get_mut(v.net.idx())
+        {
+            *e += barrel_ps_per_full * f64::from(hi - lo) / f64::from(n - 1);
+        }
+    }
+    #[allow(clippy::cast_possible_truncation)]
+    d.into_iter().map(|ps| (ps * 1000.0).round() as i64).collect()
 }
 
 /// Physical stack-up facts used by the width formulas.
@@ -147,6 +249,13 @@ pub struct Stackup {
     /// has inner dielectrics; `None` disables the stripline width model.
     #[serde(default)]
     pub inner_dielectric: Option<Coord>,
+    /// Overall board thickness (nm); sets the barrel length of vias for delay matching.
+    #[serde(default = "default_board_thickness")]
+    pub board_thickness: Coord,
+}
+
+const fn default_board_thickness() -> Coord {
+    1_600_000
 }
 
 impl Default for Stackup {
@@ -157,6 +266,7 @@ impl Default for Stackup {
             outer_dielectric: 1_510_000,
             epsilon_r_milli: 4300,
             inner_dielectric: None,
+            board_thickness: default_board_thickness(),
         }
     }
 }
@@ -716,7 +826,7 @@ mod tests {
     }
 
     fn group(name: &str, skew: Coord, nets: &[NetId]) -> MatchGroup {
-        MatchGroup { name: name.into(), skew_max: skew, nets: nets.to_vec() }
+        MatchGroup { name: name.into(), skew_max: skew, by: MatchBy::Length, nets: nets.to_vec() }
     }
 
     fn spread(t: &[Coord], nets: &[NetId]) -> Coord {
@@ -966,5 +1076,92 @@ mod tests {
         let class4 = board4.rules.class_of(&board4, n4).track_width;
         assert_eq!(required_width(&board4, n4), hj.max(sl).max(class4));
         assert!(required_width(&board4, n4) >= class4, "never narrower than the class");
+    }
+    fn delay_board(layers: u8) -> (Board, NetId) {
+        let mut b = BoardBuilder::new(mm(60), mm(30), layers);
+        let n = b.net("S");
+        let mut board = b.build();
+        board.stackup.outer_dielectric = 200_000;
+        board.stackup.epsilon_r_milli = 4300;
+        (board, n)
+    }
+
+    fn run(board: &mut Board, n: NetId, layer: u8, len_mm: i64) {
+        board.tracks.push(crate::Track {
+            start: ferroute_geom::Point::new(0, 0),
+            end: ferroute_geom::Point::new(mm(len_mm), 0),
+            width: 300_000,
+            layer: LayerId(layer),
+            net: n,
+            locked: false,
+            origin: crate::Origin::Routed,
+        });
+    }
+
+    fn via(board: &mut Board, n: NetId, layers: crate::LayerSet) {
+        board.vias.push(crate::Via {
+            pos: ferroute_geom::Point::new(0, 0),
+            diameter: 600_000,
+            drill: 300_000,
+            layers,
+            net: n,
+            locked: false,
+            origin: crate::Origin::Routed,
+        });
+    }
+
+    #[test]
+    fn delay_depends_on_layer_kind_and_vias() {
+        let (mut b, n) = delay_board(4);
+        run(&mut b, n, 0, 10);
+        let outer = net_delays_fs(&b)[n.idx()];
+        assert!((57_000..=62_000).contains(&outer), "microstrip 10 mm ≈ 59 ps: {outer}");
+        let (mut b, n) = delay_board(4);
+        run(&mut b, n, 1, 10);
+        let inner = net_delays_fs(&b)[n.idx()];
+        assert!((inner - 69_170).abs() < 200, "stripline 10 mm εr 4.3 ≈ 69 ps: {inner}");
+        let (mut b, n) = delay_board(4);
+        run(&mut b, n, 1, 10);
+        let all = b.all_layers();
+        via(&mut b, n, all);
+        let through = net_delays_fs(&b)[n.idx()] - inner;
+        assert!((through - 11_070).abs() < 100, "1.6 mm barrel ≈ 11 ps: {through}");
+        let (mut b, n) = delay_board(4);
+        via(&mut b, n, crate::LayerSet(0b0011));
+        let blind = net_delays_fs(&b)[n.idx()];
+        assert!((blind - 11_070 / 3).abs() < 100, "L1–L2 spans a third of the stack: {blind}");
+        // Arcs count like tracks.
+        let (mut b, n) = delay_board(2);
+        b.arcs.push(crate::ArcTrack {
+            start: ferroute_geom::Point::new(0, 0),
+            mid: ferroute_geom::Point::new(mm(1), mm(1)),
+            end: ferroute_geom::Point::new(mm(2), 0),
+            width: 300_000,
+            layer: LayerId(0),
+            net: n,
+            locked: false,
+            origin: crate::Origin::Routed,
+        });
+        assert!(net_delays_fs(&b)[n.idx()] > 0);
+    }
+
+    #[test]
+    fn delay_groups_use_their_own_unit_and_leave_length_groups_alone() {
+        let (mut b, ids) = match_board(&["A", "B", "C"]);
+        b.match_groups = vec![
+            MatchGroup {
+                name: "t".into(),
+                skew_max: 10_000,
+                by: MatchBy::Delay,
+                nets: ids.clone(),
+            },
+            group("l", mm(1), &[ids[0], ids[1]]),
+        ];
+        let d = [0, 100_000, 60_000, 99_000];
+        assert_eq!(match_delay_targets(&b, &d), vec![0, 100_000, 95_000, 99_000]);
+        let l = [0, mm(5), mm(1), mm(5)];
+        assert_eq!(match_targets(&b, &l), vec![0, mm(5), mm(5) - mm(1) / 2, mm(5)]);
+        assert_eq!(b.match_groups[0].spread(&l, &d), 40_000, "delay unit");
+        assert_eq!(b.match_groups[1].spread(&l, &d), mm(4), "length unit");
     }
 }

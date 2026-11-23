@@ -427,6 +427,7 @@ mod bus_match_tests {
         let g = |name: &str, skew, nets: &[NetId]| MatchGroup {
             name: name.into(),
             skew_max: skew,
+            by: ferroute_board::constraints::MatchBy::Length,
             nets: nets.to_vec(),
         };
         board.match_groups = vec![
