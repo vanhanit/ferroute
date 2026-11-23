@@ -15,6 +15,7 @@ use serde::{Deserialize, Serialize};
 
 pub mod builder;
 pub mod constraints;
+pub mod custom;
 pub mod netrules;
 pub mod rules;
 pub mod text;

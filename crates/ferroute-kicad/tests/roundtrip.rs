@@ -10,7 +10,8 @@ use proptest::prelude::*;
 
 fn reread(board: &Board, seed: u64) -> Board {
     let text = write_new_board(board, seed);
-    let opts = ReadOptions { project_json: Some(write_project_json(board)) };
+    let opts =
+        ReadOptions { project_json: Some(write_project_json(board)), ..ReadOptions::default() };
     read_board(&text, &opts).unwrap_or_else(|e| panic!("{e}\n{text}")).board
 }
 

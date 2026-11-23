@@ -22,6 +22,9 @@ pub fn load(path: &Path) -> Result<KicadBoard> {
     for w in &kb.warnings {
         tracing::warn!("{}: {w}", path.display());
     }
+    for w in &kb.rules_warnings {
+        eprintln!("rules warning: {w}");
+    }
     Ok(kb)
 }
 

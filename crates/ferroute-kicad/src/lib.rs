@@ -25,6 +25,7 @@
 //!   all local coordinates unchanged. Footprint, pad and text angles are written normalised
 //!   to `(-180, 180]`; footprint and pad angles are omitted when zero.
 
+pub mod dru;
 pub mod project;
 pub mod sexpr;
 
@@ -50,6 +51,8 @@ pub struct ReadOptions {
     /// Contents of the sibling `.kicad_pro`, if any. Without it the board gets KiCad's
     /// default design rules.
     pub project_json: Option<String>,
+    /// Contents of the sibling `.kicad_dru` (custom design rules), if any.
+    pub dru: Option<String>,
 }
 
 /// A board read from a KiCad file.
@@ -61,6 +64,8 @@ pub struct KicadBoard {
     pub doc: KicadDocument,
     /// Things that were ignored or approximated (copper pours, per-layer padstacks, ...).
     pub warnings: Vec<String>,
+    /// Warnings of the custom-rules file (unsupported conditions / constraints).
+    pub rules_warnings: Vec<String>,
 }
 
 /// Parses `.kicad_pcb` text into a [`KicadBoard`].
@@ -78,8 +83,14 @@ pub fn read_board(src: &str, opts: &ReadOptions) -> Result<KicadBoard, KicadErro
         Some(json) => project::read_project_rules(json, &mut board)?,
         None => warnings.push("no .kicad_pro supplied: using KiCad default design rules".into()),
     }
+    let mut rules_warnings = Vec::new();
+    if let Some(dru) = &opts.dru {
+        let parsed = dru::parse_dru(dru)?;
+        board.rules.custom = parsed.rules;
+        rules_warnings = parsed.warnings;
+    }
     let doc = KicadDocument::new(root, parsed.version, parsed.dialect, parsed.fp_nodes);
-    Ok(KicadBoard { board, doc, warnings })
+    Ok(KicadBoard { board, doc, warnings, rules_warnings })
 }
 
 /// Reads a `.kicad_pcb` file and its sibling `.kicad_pro` (same stem) when present.
@@ -89,10 +100,12 @@ pub fn read_board(src: &str, opts: &ReadOptions) -> Result<KicadBoard, KicadErro
 pub fn read_board_file(path: &Path) -> Result<KicadBoard, KicadError> {
     let src = std::fs::read_to_string(path)?;
     let pro = path.with_extension("kicad_pro");
-    let project_json = match std::fs::read_to_string(&pro) {
-        Ok(s) => Some(s),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
-        Err(e) => return Err(e.into()),
+    let read_opt = |p: &Path| match std::fs::read_to_string(p) {
+        Ok(s) => Ok(Some(s)),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(KicadError::from(e)),
     };
-    read_board(&src, &ReadOptions { project_json })
+    let project_json = read_opt(&pro)?;
+    let dru = read_opt(&path.with_extension("kicad_dru"))?;
+    read_board(&src, &ReadOptions { project_json, dru })
 }

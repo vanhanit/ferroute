@@ -1,0 +1,13 @@
+(version 1)
+# 3V3 and GND keep a wide gap (net-name pair rule, order-insensitive).
+(rule "pwr"
+  (condition "A.NetName == '+3V3' && B.NetName == 'GND'")
+  (constraint clearance (min 0.5mm)))
+# Power copper keeps 0.4 mm from default-class signals.
+(rule "power_vs_signal"
+  (condition "A.NetClass == 'Power' && B.NetClass == 'Default'")
+  (constraint clearance (min 0.4mm)))
+# Signal traces are at least 0.3 mm wide.
+(rule "sig"
+  (condition "A.NetClass == 'Default'")
+  (constraint track_width (min 0.3mm)))

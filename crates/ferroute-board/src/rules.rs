@@ -43,6 +43,9 @@ pub struct DesignRules {
     pub min_track_width: Coord,
     pub min_via_diameter: Coord,
     pub min_via_drill: Coord,
+    /// KiCad custom rules (`.kicad_dru`), in file order (later rules win).
+    #[serde(default)]
+    pub custom: Vec<crate::custom::CustomRule>,
 }
 
 impl Default for DesignRules {
@@ -56,6 +59,7 @@ impl Default for DesignRules {
             min_track_width: 0,
             min_via_diameter: 500_000,
             min_via_drill: 300_000,
+            custom: Vec::new(),
         }
     }
 }

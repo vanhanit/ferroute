@@ -77,6 +77,7 @@ fn opts() -> ReadOptions {
         project_json: Some(
             std::fs::read_to_string(common::fixture("demo_2layer.kicad_pro")).unwrap(),
         ),
+        ..ReadOptions::default()
     }
 }
 

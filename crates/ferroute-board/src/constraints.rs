@@ -542,7 +542,7 @@ pub fn required_width(board: &Board, net: NetId) -> Coord {
         }
         _ => 0,
     };
-    class_w.max(current_w).max(micro_w).max(strip_w)
+    class_w.max(current_w).max(micro_w).max(strip_w).max(board.rules.min_width_for_net(board, net))
 }
 
 /// `true` when the net has an impedance target that no trace width can reach with this
@@ -567,28 +567,74 @@ pub fn impedance_unattainable(board: &Board, net: NetId) -> bool {
     outer || inner
 }
 
-/// Applies derived widths: every net whose required width exceeds its class width moves to
-/// a derived class (`<class>/<net>`) with that width — never narrower (INV-RULE-1).
-/// Returns human-readable notes describing each change.
+/// Applies derived widths and custom-rule bounds: every net whose required width,
+/// clearance, via diameter or drill (per-net electrical rules, KiCad custom rules) exceeds
+/// its class moves to a derived class (`<class>/<net>`) with those values — never narrower
+/// or looser (INV-RULE-1). Custom length limits are merged into the net constraints and
+/// custom edge/hole clearances raise the board-wide values. Returns notes per change.
 pub fn resolve(board: &mut Board) -> Vec<String> {
     let mut notes = Vec::new();
+    if board.rules.has_custom(crate::custom::ConstraintKind::EdgeClearance) {
+        let v = board.rules.max_custom_min(crate::custom::ConstraintKind::EdgeClearance);
+        board.rules.edge_clearance = board.rules.edge_clearance.max(v);
+    }
+    if board.rules.has_custom(crate::custom::ConstraintKind::HoleClearance) {
+        let v = board.rules.max_custom_min(crate::custom::ConstraintKind::HoleClearance);
+        board.rules.hole_clearance = board.rules.hole_clearance.max(v);
+    }
     for i in 1..board.nets.len() {
         let net = NetId(u32::try_from(i).unwrap_or(u32::MAX));
-        let need = required_width(board, net);
+        if !board.rules.custom.is_empty() {
+            let (lo, hi) = board.rules.length_limits_for_net(board, net);
+            let c = &mut board.nets[i].constraints;
+            c.length_min = lo.map_or(c.length_min, |m| Some(c.length_min.map_or(m, |o| o.max(m))));
+            c.length_max = hi.map_or(c.length_max, |m| Some(c.length_max.map_or(m, |o| o.min(m))));
+        }
         let base = board.rules.class_of(board, net).clone();
-        if need <= base.track_width {
+        let need_w = required_width(board, net).max(board.rules.min_width_for_net(board, net));
+        let need_c = board.rules.max_clearance_for_net(board, net);
+        let need_drill = base.via_drill.max(board.rules.min_hole_for_net(board, net));
+        let need_via =
+            base.via_diameter.max(board.rules.min_via_diameter_for_net(board, net, need_drill));
+        if need_w <= base.track_width
+            && need_c <= base.clearance
+            && need_via <= base.via_diameter
+            && need_drill <= base.via_drill
+        {
             continue;
         }
-        let old = base.track_width;
         let name = format!("{}/{}", base.name, board.nets[i].name);
-        board.rules.classes.push(NetClass { name, track_width: need, ..base });
+        let derived = NetClass {
+            name,
+            track_width: need_w.max(base.track_width),
+            clearance: need_c.max(base.clearance),
+            via_diameter: need_via.max(base.via_diameter),
+            via_drill: need_drill.max(base.via_drill),
+        };
+        let old_w = base.track_width;
+        if derived.track_width > old_w {
+            notes.push(format!(
+                "net {}: width {} mm → {} mm ({})",
+                board.nets[i].name,
+                format_mm(old_w),
+                format_mm(derived.track_width),
+                if board.rules.custom.is_empty() {
+                    "current/impedance rules"
+                } else {
+                    "current/impedance/custom rules"
+                }
+            ));
+        }
+        if derived.clearance > base.clearance {
+            notes.push(format!(
+                "net {}: clearance {} mm → {} mm (custom rules)",
+                board.nets[i].name,
+                format_mm(base.clearance),
+                format_mm(derived.clearance)
+            ));
+        }
+        board.rules.classes.push(derived);
         board.nets[i].class = u16::try_from(board.rules.classes.len() - 1).unwrap_or(u16::MAX);
-        notes.push(format!(
-            "net {}: width {} mm → {} mm (current/impedance rules)",
-            board.nets[i].name,
-            format_mm(old),
-            format_mm(need)
-        ));
     }
     notes
 }
