@@ -99,6 +99,16 @@ impedance_ohm = 45
 match_group = "usb"
 skew_max_mm = 0.15
 max_vias = 2
+
+[[match]]                     # nested length matching: each pair, then all pairs + CLK
+name = "pair0"                # (pair1 defined alike; `groups` globs reference other matches)
+nets = ["D0_P", "D0_N"]
+skew_mm = 0.1
+[[match]]
+name = "bus"
+groups = ["pair*"]
+nets = ["CLK"]
+skew_mm = 0.5
 ```
 
 Selectors are `nets` / `classes` globs. Later rules override only the fields they set.

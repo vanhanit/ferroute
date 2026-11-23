@@ -284,6 +284,10 @@ edge.
 * **Checks (ferroute_drc::rules):** width vs. requirement, routed length window,
   length-matching skew within a group, and via count. Unmet rules are reported in the
   CLI/JSON report and fail with `--strict-rules`. They are never hidden.
+* **Match groups (nesting):** `ferroute_board::constraints::match_groups` yields explicit
+  `[[match]]` groups (members = net/class globs ∪ members of referenced groups, resolved to a
+  fixpoint) plus legacy per-net `match_group`s; `match_targets` raises short members
+  monotonically until every group, inner pairs and outer buses alike, meets its skew.
 * **Length tuning (router::tune, router::meander):** after routing, nets below
   `length_min`, and nets more than `skew_max` shorter than their group's longest member,
   are lengthened towards `length_min` or `longest − skew_max/2`, capped by `length_max`.

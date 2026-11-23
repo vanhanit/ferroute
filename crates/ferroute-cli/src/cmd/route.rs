@@ -265,11 +265,26 @@ mod tests {
             impedance_ohm = 45
             match_group = "usb"
             skew_max_mm = 0.15
+
+            [[match]]
+            name = "pair0"
+            nets = ["D0_P", "D0_N"]
+            skew_mm = 0.1
+
+            [[match]]
+            name = "bus"
+            groups = ["pair*"]
+            nets = ["CLK"]
+            skew_mm = 0.5
             "#,
         )
         .expect("valid");
         assert_eq!(rs.rules.len(), 2);
         assert_eq!(rs.rules[1].impedance_ohm, Some(45.0));
+        assert_eq!(rs.matches.len(), 2);
+        assert_eq!(rs.matches[1].groups, vec!["pair*".to_owned()]);
+        assert_eq!(rs.matches[1].skew_mm, 0.5);
+        assert!(parse_rules("[[match]]\nname=\"x\"\nskew_mm=0.1\nbogus=1").is_err());
         assert_eq!(rs.stackup.and_then(|s| s.outer_dielectric_mm), Some(0.2));
     }
 
