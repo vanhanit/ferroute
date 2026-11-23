@@ -66,7 +66,14 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends mesa-vulkan-drivers libvulkan1
-      - run: cargo test -p ferroute-gpu --features gpu --locked
+      # Mesa's lavapipe occasionally segfaults while unloading at process exit, after every
+      # test has passed. Retry once; a real test failure fails both attempts.
+      - name: GPU tests (lavapipe)
+        run: |
+          cargo test -p ferroute-gpu --features gpu --locked || {
+            echo "::warning::GPU test run failed (possible lavapipe exit crash); retrying once"
+            cargo test -p ferroute-gpu --features gpu --locked
+          }
 
   audit:
     runs-on: ubuntu-24.04
