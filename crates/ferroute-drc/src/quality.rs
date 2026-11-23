@@ -316,6 +316,122 @@ pub fn right_angles(board: &Board) -> Vec<RightAngle> {
     out
 }
 
+/// A via that sits where its traces jog: a bend right next to it, or a layer change whose
+/// two traces do not continue in one straight line.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ViaJog {
+    pub at: Point,
+    pub net: NetId,
+}
+
+/// Bends within this distance of a via centre count as "at the via": the via diameter plus
+/// two track widths.
+#[must_use]
+pub const fn via_jog_reach(via_diameter: Coord, track_width: Coord) -> Coord {
+    via_diameter + 2 * track_width
+}
+
+fn within(a: Point, b: Point, reach: Coord) -> bool {
+    let r = u128::try_from(reach.max(0)).unwrap_or(0);
+    (a - b).norm2() <= r * r
+}
+
+/// Do the directions `u` and `v` leaving a point continue one straight line?
+fn straight_through(u: Point, v: Point) -> bool {
+    u.cross(v) == 0 && u.dot(v) < 0
+}
+
+/// One via trace for [`polylines_jog`]: its polyline ends at the via centre.
+#[derive(Clone, Copy, Debug)]
+pub struct ViaTrace<'a> {
+    pub layer: LayerId,
+    pub width: Coord,
+    pub pts: &'a [Point],
+}
+
+/// How badly a via at `at` jogs, given the polylines of its same-net traces (each ending at
+/// `at`): one per bend within [`via_jog_reach`] plus two for a layer change whose traces
+/// do not continue in one straight line. Zero means no jog. Shared by [`via_jogs`] and the
+/// router's via relocation.
+#[must_use]
+pub fn polylines_jog_weight(at: Point, via_diameter: Coord, traces: &[ViaTrace<'_>]) -> u32 {
+    let mut weight = 0;
+    for t in traces {
+        let reach = via_jog_reach(via_diameter, t.width);
+        weight += t
+            .pts
+            .windows(3)
+            .filter(|w| within(w[1], at, reach) && !straight_through(w[0] - w[1], w[2] - w[1]))
+            .count() as u32;
+    }
+    if let [a, b] = traces
+        && a.layer != b.layer
+        && a.pts.len() >= 2
+        && b.pts.len() >= 2
+        && !straight_through(a.pts[a.pts.len() - 2] - at, b.pts[b.pts.len() - 2] - at)
+    {
+        weight += 2;
+    }
+    weight
+}
+
+/// Does a via at `at` jog? See [`polylines_jog_weight`].
+#[must_use]
+pub fn polylines_jog(at: Point, via_diameter: Coord, traces: &[ViaTrace<'_>]) -> bool {
+    polylines_jog_weight(at, via_diameter, traces) > 0
+}
+
+/// Every via at which same-net traces jog. A via counts when (a) a same-net bend (a point
+/// where exactly two tracks meet and turn) lies within [`via_jog_reach`] of its centre on
+/// any layer, or (b) it is a pure layer change (exactly one same-net track on each of two
+/// layers ends there) whose tracks are not collinear. Exact integer arithmetic,
+/// deterministic order (board via order).
+#[must_use]
+pub fn via_jogs(board: &Board) -> Vec<ViaJog> {
+    let groups = groups(board);
+    let mut bends: BTreeMap<u32, Vec<(Point, Coord)>> = BTreeMap::new();
+    for (&(_, net), pieces) in &groups {
+        for (p, dirs, width) in junctions(pieces) {
+            if let [(u, false), (v, false)] = dirs[..]
+                && !straight_through(u, v)
+            {
+                bends.entry(net).or_default().push((p, width));
+            }
+        }
+    }
+    let mut out = Vec::new();
+    for via in &board.vias {
+        if via.net == NetId::NONE {
+            continue;
+        }
+        let near_bend = via.layers.iter().any(|l| {
+            groups.contains_key(&(l.0, via.net.0))
+                && bends.get(&via.net.0).is_some_and(|bs| {
+                    bs.iter().any(|&(p, w)| within(p, via.pos, via_jog_reach(via.diameter, w)))
+                })
+        });
+        // Tracks of the net ending exactly at the via, per layer.
+        let mut ends: Vec<(LayerId, Point)> = Vec::new();
+        for t in &board.tracks {
+            if t.net == via.net && via.layers.contains(t.layer) && t.start != t.end {
+                if t.start == via.pos {
+                    ends.push((t.layer, t.end - via.pos));
+                } else if t.end == via.pos {
+                    ends.push((t.layer, t.start - via.pos));
+                }
+            }
+        }
+        let bent_change = matches!(
+            ends[..],
+            [(la, u), (lb, v)] if la != lb && !straight_through(u, v)
+        );
+        if near_bend || bent_change {
+            out.push(ViaJog { at: via.pos, net: via.net });
+        }
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -505,5 +621,68 @@ mod tests {
         bb.track(pt10(150, 100), pt10(200, 50), 250_000, 0, c, Origin::Routed);
         bb.track(pt10(150, 100), pt10(200, 150), 250_000, 1, a, Origin::Routed);
         assert!(acute_angles(&bb.build()).is_empty());
+    }
+
+    fn via_board(tracks: &[(u8, Seg)], via: (i64, i64)) -> ferroute_board::Board {
+        let mut b = BoardBuilder::new(mm(30), mm(20), 2);
+        let n = b.net("N");
+        for &(l, (a, c)) in tracks {
+            b.track(pt10(a.0, a.1), pt10(c.0, c.1), 250_000, l, n, Origin::Routed);
+        }
+        b.via(pt10(via.0, via.1), 600_000, 300_000, n, Origin::Routed);
+        b.build()
+    }
+
+    #[test]
+    fn straight_layer_change_is_not_a_jog() {
+        let b =
+            via_board(&[(0, ((50, 100), (150, 100))), (1, ((150, 100), (250, 100)))], (150, 100));
+        assert!(via_jogs(&b).is_empty());
+        // Perpendicular continuation on the other layer is a pure layer change that bends.
+        let b =
+            via_board(&[(0, ((50, 100), (150, 100))), (1, ((150, 100), (150, 160)))], (150, 100));
+        assert_eq!(via_jogs(&b).len(), 1);
+        // So is a 45° turn across the via.
+        let b =
+            via_board(&[(0, ((50, 100), (150, 100))), (1, ((150, 100), (210, 160)))], (150, 100));
+        assert_eq!(via_jogs(&b).len(), 1);
+    }
+
+    #[test]
+    fn bend_next_to_the_via_is_a_jog_but_a_far_one_is_not() {
+        // Bend 0.6 mm before the via (reach = 0.6 + 2 * 0.25 = 1.1 mm).
+        let near = via_board(
+            &[
+                (0, ((50, 100), (90, 100))),
+                (0, ((90, 100), (96, 106))),
+                (0, ((96, 106), (150, 106))),
+                (1, ((150, 106), (250, 106))),
+            ],
+            (150, 106),
+        );
+        assert!(via_jogs(&near).is_empty(), "bend 5.4 mm away");
+        let near = via_board(
+            &[
+                (0, ((50, 100), (144, 100))),
+                (0, ((144, 100), (150, 106))),
+                (1, ((150, 106), (250, 106))),
+            ],
+            (150, 106),
+        );
+        assert_eq!(via_jogs(&near).len(), 1, "bend 0.85 mm away");
+    }
+
+    #[test]
+    fn t_junction_via_is_not_a_pure_layer_change() {
+        let b = via_board(
+            &[
+                (0, ((50, 100), (150, 100))),
+                (1, ((150, 100), (250, 100))),
+                (1, ((150, 100), (150, 160))),
+                (1, ((150, 100), (150, 40))),
+            ],
+            (150, 100),
+        );
+        assert!(via_jogs(&b).is_empty());
     }
 }
