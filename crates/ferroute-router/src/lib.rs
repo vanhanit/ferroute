@@ -481,6 +481,7 @@ type NetCopper = (NetId, Vec<ferroute_board::Track>, Vec<ferroute_board::Via>, b
 
 fn assemble(per_net: &[NetCopper], links: &[direct::Link]) -> BoardEdit {
     BoardEdit {
+        new_arcs: Vec::new(),
         moves: Vec::new(),
         new_tracks: links
             .iter()

@@ -105,3 +105,34 @@ fn outline_admits_with_edge_clearance() {
     assert!(b.outline.admits(&h, 200_000));
     assert!(!b.outline.admits(&h, 200_001));
 }
+
+#[test]
+fn arcs_are_applied_covered_and_measured() {
+    let mut b = tiny_board();
+    let arc = ArcTrack {
+        start: Point::new(6_000_000, 5_000_000),
+        mid: Point::new(6_707_107, 5_292_893),
+        end: Point::new(7_000_000, 6_000_000),
+        width: 250_000,
+        layer: LayerId(0),
+        net: NetId(1),
+        locked: false,
+        origin: Origin::Routed,
+    };
+    let edit = BoardEdit { new_arcs: vec![arc.clone()], ..BoardEdit::default() };
+    edit.check_invariants(&b).expect("routed arcs are additive");
+    b.apply(&edit);
+    assert_eq!(b.arcs, vec![arc.clone()]);
+    // Quarter circle of radius 1 mm.
+    assert!((arc.length() - 1e6 * std::f64::consts::FRAC_PI_2).abs() < 10.0);
+    let hulls = arc.hulls();
+    assert!(hulls.len() >= 2);
+    for p in [arc.start, arc.mid, arc.end] {
+        assert!(hulls.iter().any(|h| h.clearance_violated(&ferroute_geom::Hull::disk(p, 0), 1)));
+    }
+    let bad = BoardEdit {
+        new_arcs: vec![ArcTrack { origin: Origin::Existing, ..arc }],
+        ..BoardEdit::default()
+    };
+    assert!(bad.check_invariants(&b).is_err());
+}

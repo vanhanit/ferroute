@@ -181,6 +181,7 @@ pub fn run(board: &Board, cfg: &PipelineConfig) -> Result<PipelineResult, RouteE
         }
     }
     let mut edit = BoardEdit {
+        new_arcs: Vec::new(),
         moves: best.moves.clone(),
         new_tracks: best.out.edit.new_tracks.clone(),
         new_vias: best.out.edit.new_vias.clone(),

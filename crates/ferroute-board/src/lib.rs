@@ -358,6 +358,42 @@ impl Track {
     }
 }
 
+/// Maximum chord sagitta (nm) used when covering arc copper with capsules.
+pub const ARC_MAX_SAG: f64 = 2_000.0;
+
+/// A circular-arc track (KiCad `(arc (start) (mid) (end))`). Its copper is covered by
+/// [`ArcTrack::hulls`], a convex superset (INV-DRC-1).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ArcTrack {
+    pub start: Point,
+    pub mid: Point,
+    pub end: Point,
+    pub width: Coord,
+    pub layer: LayerId,
+    pub net: NetId,
+    pub locked: bool,
+    pub origin: Origin,
+}
+
+impl ArcTrack {
+    #[must_use]
+    pub const fn geom(&self) -> ferroute_geom::arc::Arc {
+        ferroute_geom::arc::Arc::new(self.start, self.mid, self.end)
+    }
+
+    /// Capsules whose union covers the arc's copper.
+    #[must_use]
+    pub fn hulls(&self) -> Vec<Hull> {
+        self.geom().cover(self.width, ARC_MAX_SAG)
+    }
+
+    /// Centre-line length (nm).
+    #[must_use]
+    pub fn length(&self) -> f64 {
+        self.geom().length()
+    }
+}
+
 /// A via (through, blind or buried: spans `layers`).
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Via {
@@ -417,6 +453,9 @@ pub struct Board {
     pub footprints: Vec<Footprint>,
     pub pads: Vec<Pad>,
     pub tracks: Vec<Track>,
+    /// Arc tracks created by ferroute (input arcs are read as conservative chord tracks).
+    #[serde(default)]
+    pub arcs: Vec<ArcTrack>,
     pub vias: Vec<Via>,
     pub keepouts: Vec<Keepout>,
     pub outline: Outline,
@@ -575,6 +614,7 @@ impl Board {
             self.footprints[m.footprint.idx()].placement = m.to;
         }
         self.tracks.extend(edit.new_tracks.iter().cloned());
+        self.arcs.extend(edit.new_arcs.iter().cloned());
         self.vias.extend(edit.new_vias.iter().cloned());
     }
 }
@@ -594,6 +634,8 @@ pub struct FootprintMove {
 pub struct BoardEdit {
     pub moves: Vec<FootprintMove>,
     pub new_tracks: Vec<Track>,
+    #[serde(default)]
+    pub new_arcs: Vec<ArcTrack>,
     pub new_vias: Vec<Via>,
 }
 
@@ -624,6 +666,7 @@ impl BoardEdit {
             }
         }
         if self.new_tracks.iter().any(|t| t.origin != Origin::Routed)
+            || self.new_arcs.iter().any(|a| a.origin != Origin::Routed)
             || self.new_vias.iter().any(|v| v.origin != Origin::Routed)
         {
             return Err("new copper must be tagged Origin::Routed".into());

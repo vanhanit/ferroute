@@ -24,6 +24,11 @@ written in Rust. Priorities, in order:
   routing/placement algorithms, GPU/parallel architecture, review, architectural decisions.
 * **Workers (Sonnet/Haiku-class):** well-scoped deterministic tasks — parsers, IPC glue,
   CLI plumbing, test suites, generators, Docker/Makefile/CI, docs.
+* **Default to delegation:** implementation goes to the cheapest capable worker model
+  (Haiku for mechanical edits, Sonnet for crate-level features). The lead keeps maths,
+  invariants and core data structures, writes the contract and acceptance tests, and
+  *verifies the output* (diff review, tests, oracle/KiCad DRC, rendered result) instead of
+  writing the code itself. Workers on disjoint crates run in parallel.
 * **Delegation rules:** the lead writes the interface contract (types + signatures), the
   acceptance tests or criteria, and the list of files the worker may touch. Workers never
   edit crates they do not own, never edit the root `Cargo.toml` (add crate-local deps and
@@ -104,6 +109,8 @@ Completion and DRC come first; within that, every result must look hand-tuned:
   vias and holes — and end exactly at the centre. Only this final approach may leave the
   lattice. Nearby same-net pads facing each other get one straight direct link.
 * **Vias** sit in line with straight traces (no bend right at a via); minimise via count.
+* **Meanders** (length tuning) always have **rounded corners** (true KiCad arcs), uniform
+  amplitude and constant leg spacing — never square or mitred bumps.
 * **No acid traps** (acute same-net junctions) and no overlapping copper — branches leave
   existing copper at ≥ 90°.
 * **Never narrow a trace** or change any per-net rule ad hoc. Widths/clearances/vias come
