@@ -1,5 +1,5 @@
 {
-  "ferroute_version": "0.1.0",
+  "ferroute_version": "0.3.0",
   "records": [
     {
       "board": "ci-s2-small",
@@ -11,10 +11,11 @@
         "completion": 1.0,
         "connections_total": 20,
         "connections_missing": 0,
-        "wirelength_mm": 166.29451003749554,
+        "wirelength_mm": 164.04850931962048,
         "vias": 3,
         "moved_footprints": 9,
         "displacement_mm": 15.06796220338052,
+        "constraint_issues": 0,
         "runtime_ms": 100.0
       }
     },
@@ -28,10 +29,11 @@
         "completion": 1.0,
         "connections_total": 43,
         "connections_missing": 0,
-        "wirelength_mm": 350.24950990995075,
+        "wirelength_mm": 343.3576809136278,
         "vias": 16,
         "moved_footprints": 22,
         "displacement_mm": 41.728505252050056,
+        "constraint_issues": 0,
         "runtime_ms": 200.0
       }
     },
@@ -45,10 +47,11 @@
         "completion": 1.0,
         "connections_total": 50,
         "connections_missing": 0,
-        "wirelength_mm": 420.1904644542457,
+        "wirelength_mm": 413.1676809136279,
         "vias": 15,
         "moved_footprints": 30,
         "displacement_mm": 51.83156486704026,
+        "constraint_issues": 0,
         "runtime_ms": 200.0
       }
     },
@@ -62,10 +65,11 @@
         "completion": 1.0,
         "connections_total": 18,
         "connections_missing": 0,
-        "wirelength_mm": 339.4336151533519,
+        "wirelength_mm": 334.9732136407127,
         "vias": 10,
         "moved_footprints": 0,
         "displacement_mm": 0.0,
+        "constraint_issues": 0,
         "runtime_ms": 200.0
       }
     },
@@ -79,11 +83,12 @@
         "completion": 1.0,
         "connections_total": 18,
         "connections_missing": 0,
-        "wirelength_mm": 324.8771404447847,
+        "wirelength_mm": 320.1522457902213,
         "vias": 9,
         "moved_footprints": 6,
         "displacement_mm": 11.921978840013155,
-        "runtime_ms": 100.0
+        "constraint_issues": 0,
+        "runtime_ms": 200.0
       }
     },
     {
@@ -100,6 +105,7 @@
         "vias": 0,
         "moved_footprints": 0,
         "displacement_mm": 0.0,
+        "constraint_issues": 1,
         "runtime_ms": 100.0
       }
     },
@@ -117,6 +123,7 @@
         "vias": 0,
         "moved_footprints": 0,
         "displacement_mm": 0.0,
+        "constraint_issues": 1,
         "runtime_ms": 100.0
       }
     }
