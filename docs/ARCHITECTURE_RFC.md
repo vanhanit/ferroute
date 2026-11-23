@@ -284,8 +284,18 @@ edge.
 * **Checks (ferroute_drc::rules):** width vs. requirement, routed length window,
   length-matching skew within a group, and via count. Unmet rules are reported in the
   CLI/JSON report and fail with `--strict-rules`. They are never hidden.
-* Next (M2): length tuning (serpentines) and differential pairs, so matching rules are
-  *met*, not only checked.
+* **Length tuning (router::tune, router::meander):** after routing, nets below
+  `length_min`, and nets more than `skew_max` shorter than their group's longest member,
+  are lengthened towards `length_min` or `longest − skew_max/2`, capped by `length_max`.
+  The tuner replaces a routed axis-aligned or 45° run (longest first) by a centred
+  accordion with uniform bumps and 45° mitred corners. Parallel legs are one spacing
+  apart (`w + max(clearance, 2w)`). It prefers the *lowest* amplitude that meets the
+  whole need on the run (1–3 spacings), and uses taller bumps only for partial gains on
+  short runs. Each candidate is accepted only if the exact oracle reports no new
+  violation, connectivity and acid-trap counts do not get worse, and the bumps keep the
+  net's clearance to its own other copper. Widths never change. Whatever cannot be
+  tuned stays reported.
+* Next (M2): differential pairs (coupled routing, constant gap, symmetric tuning).
 
 ---
 

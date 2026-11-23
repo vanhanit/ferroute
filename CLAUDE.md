@@ -38,7 +38,7 @@ written in Rust. Priorities, in order:
 | `crates/ferroute-geom` | i64-nanometre geometry, **exact** i128 predicates, `units` (exact mm↔nm), `rng` (frozen xoshiro256\*\*), `detmath` (IEEE-only exp/hypot) |
 | `crates/ferroute-board` | Board model (`Board`, `BoardEdit`, `Mobility`, rules), `constraints` (per-net electrical rules → widths), `netrules` (rules file), `text::glob`, `builder` for tests/synthetic boards |
 | `crates/ferroute-drc` | DRC oracle: clearance/short, edge, holes, keep-outs, courtyards, sizes, connectivity; `quality` (acid traps), `rules` (width/length/skew/via constraints) |
-| `crates/ferroute-router` | Lattice PathFinder: `legality`, `plan` (separation theorem), `access`, `search` (A\*), `negotiate`, `emit` |
+| `crates/ferroute-router` | Lattice PathFinder: `legality`, `plan` (separation theorem), `access`, `search` (A\*), `negotiate`, `emit`; `meander` + `tune` (length tuning) |
 | `crates/ferroute-place` | Movability policy + multi-start annealing nudger |
 | `crates/ferroute-engine` | Pipeline (nudge → route → LNS → gate), `synth` boards, `score` baselines, criterion bench |
 | `crates/ferroute-kicad` | Lossless `.kicad_pcb` S-expr reader/writer (KiCad 6–10 dialects), `.kicad_pro` rules |
@@ -170,7 +170,7 @@ Completion and DRC come first; within that, every result must look hand-tuned:
 |---|---|---|---|
 | 1 | Gridless post-optimiser: any-angle shortcutting (Theta\*-style) + 45° smoothing, verified by oracle | Lead | M2 |
 | 2 | Per-layer preferred directions + via minimisation pass | Lead | M2 |
-| 3 | Differential pairs (Dubins-aware) and length *tuning* (serpentines) so `match_group`/`skew_max`/`length_min` rules are met, not only reported | Lead | M2; rules model + checks exist (`board::constraints`, `drc::rules`) |
+| 3 | Differential pairs (Dubins-aware): coupled routing with constant gap, symmetric tuning | Lead | M2; length tuning exists (`router::tune`, `router::meander`) |
 | 4 | Region-window LNS (rip-up + nudge around failures) | Lead | M2 |
 | 5 | Specctra DSN/SES import/export (Freerouting comparisons) | Worker | contract: `Board` ↔ DSN |
 | 6 | Native IPC commits (`BeginCommit`/`CreateItems`/`EndCommit`) for live mode | Worker | needs KiCad 10 GUI test rig |

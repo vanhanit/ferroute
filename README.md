@@ -102,7 +102,9 @@ max_vias = 2
 ```
 
 Selectors are `nets` / `classes` globs. Later rules override only the fields they set.
-Rules that are not met are reported, and `--strict-rules` turns them into exit code 2.
+Nets below `length_min_mm` or outside their group's skew are length-tuned with accordion
+meanders (45° mitred, uniform, verified by the DRC oracle). Rules that are still not met
+are reported, and `--strict-rules` turns them into exit code 2.
 See [`testdata/rules/`](testdata/rules) and RFC §4.7.
 
 ### Command overview
@@ -152,9 +154,9 @@ boards are modest; dense BGA and 4–8-layer suites are on the roadmap.
 v0.1 is a **vertical slice**: KiCad 10 files in/out, two- and multi-layer through-via
 routing, nudging, IPC probe/live bridge, KiCad 11 headless/export client, CI lanes.
 Per-net rules (current, impedance, frequency, length, skew, via count) widen traces and steer
-costs, and anything still unmet is reported. Not yet: differential pairs, length *tuning*,
-BGA escape, blind/buried vias, copper-pour
-awareness, gridless smoothing. See the roadmap in the RFC and the task board in
+costs, and length rules are met with meanders. Anything still unmet is reported.
+Not yet: differential pairs, BGA escape, blind/buried vias, copper-pour awareness,
+gridless smoothing. See the roadmap in the RFC and the task board in
 [`CLAUDE.md`](CLAUDE.md).
 
 ## Contributing
