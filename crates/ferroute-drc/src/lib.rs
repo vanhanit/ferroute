@@ -28,6 +28,7 @@ use serde::{Deserialize, Serialize};
 pub mod connectivity;
 pub mod quality;
 pub mod rules;
+pub mod zones;
 pub use connectivity::{Connectivity, Unconnected};
 
 /// What the oracle checks.
@@ -90,6 +91,8 @@ pub enum ItemRef {
     Via(u32),
     Footprint(FootprintId),
     Keepout(u32),
+    /// Index into `board.zones` (copper pour).
+    Zone(u32),
     BoardEdge,
 }
 
@@ -353,9 +356,11 @@ fn item_ctx(item: ItemRef, net: NetId) -> ItemCtx {
         ItemRef::Pad(_) => ItemType::Pad,
         ItemRef::Via(_) => ItemType::Via,
         ItemRef::Footprint(_) => ItemType::Footprint,
-        ItemRef::Track(_) | ItemRef::Arc(_) | ItemRef::Keepout(_) | ItemRef::BoardEdge => {
-            ItemType::Track
-        }
+        ItemRef::Track(_)
+        | ItemRef::Arc(_)
+        | ItemRef::Keepout(_)
+        | ItemRef::Zone(_)
+        | ItemRef::BoardEdge => ItemType::Track,
     };
     ItemCtx::new(net, kind)
 }
@@ -388,6 +393,9 @@ pub fn check(board: &Board, cfg: &DrcConfig) -> DrcReport {
     }
     if cfg.holes {
         violations.extend(check_holes(board, &items));
+    }
+    if cfg.copper {
+        violations.extend(zones::check_fills(board, &items));
     }
     if cfg.keepouts {
         violations.extend(check_keepouts(board, &items));

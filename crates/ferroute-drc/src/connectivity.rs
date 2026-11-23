@@ -91,7 +91,7 @@ impl UnionFind {
 pub fn analyse(board: &Board, items: &[CopperItem]) -> Connectivity {
     let boxes: Vec<Rect> = items.iter().map(|it| it.bbox.inflate(CONTACT_TOLERANCE)).collect();
     let grid = BucketGrid::new(&boxes, 2_000_000);
-    let mut uf = UnionFind::new(items.len());
+    let mut uf = UnionFind::new(items.len() + crate::zones::fill_count(board));
     for (i, j) in grid.pairs(&boxes) {
         let (a, b) = (&items[i as usize], &items[j as usize]);
         if a.net != b.net || a.net == NetId::NONE || !a.layers.intersects(b.layers) {
@@ -100,6 +100,9 @@ pub fn analyse(board: &Board, items: &[CopperItem]) -> Connectivity {
         if a.hull.clearance_violated(&b.hull, CONTACT_TOLERANCE) {
             uf.union(i, j);
         }
+    }
+    for (a, b) in crate::zones::fill_links(board, items) {
+        uf.union(a, b);
     }
     // Pads of the same footprint with the same number are internally connected in
     // KiCad (e.g. thermal pads split into several pads). Join them.

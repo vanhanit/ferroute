@@ -208,7 +208,7 @@ pub fn pad_islands(board: &Board) -> Vec<Vec<Vec<PadId>>> {
     let items = copper_items(board);
     let boxes: Vec<Rect> = items.iter().map(|it| it.bbox.inflate(1)).collect();
     let grid = BucketGrid::new(&boxes, 2_000_000);
-    let mut uf = UnionFind::new(items.len());
+    let mut uf = UnionFind::new(items.len() + ferroute_drc::zones::fill_count(board));
     for (i, j) in grid.pairs(&boxes) {
         let (a, b) = (&items[i as usize], &items[j as usize]);
         if a.net == b.net
@@ -218,6 +218,10 @@ pub fn pad_islands(board: &Board) -> Vec<Vec<Vec<PadId>>> {
         {
             uf.union(i, j);
         }
+    }
+    // Pads (and copper) of a net joined through its stored pour need no route.
+    for (a, b) in ferroute_drc::zones::fill_links(board, &items) {
+        uf.union(a, b);
     }
     let mut out: Vec<Vec<Vec<PadId>>> = vec![Vec::new(); board.nets.len()];
     let mut root_of: Vec<Vec<u32>> = vec![Vec::new(); board.nets.len()];

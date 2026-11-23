@@ -33,6 +33,8 @@ pub fn direct_links(
     layers: &[LayerId],
 ) -> Vec<Link> {
     let pads_by_net = board.pads_by_net();
+    // Pads already joined through a stored copper pour need no link.
+    let joined = if board.zones.is_empty() { Vec::new() } else { crate::pad_islands(board) };
     let mut out = Vec::new();
     for (n, pads) in pads_by_net.iter().enumerate().skip(1) {
         if pads.len() < 2 {
@@ -69,6 +71,15 @@ pub fn direct_links(
         }
         cands.sort_unstable_by_key(|c| (c.0, c.1, c.2));
         let mut uf = UnionFind::new(pads.len());
+        for island in joined.get(n).into_iter().flatten() {
+            let idx = |p: &PadId| pads.iter().position(|q| q == p);
+            let mut members = island.iter().filter_map(idx);
+            if let Some(first) = members.next() {
+                for m in members {
+                    uf.union(u32::try_from(first).unwrap_or(0), u32::try_from(m).unwrap_or(0));
+                }
+            }
+        }
         for (_, ia, ib, layer, d) in cands {
             if !uf.union(u32::try_from(ia).unwrap_or(0), u32::try_from(ib).unwrap_or(0)) {
                 continue;

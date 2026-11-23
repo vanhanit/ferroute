@@ -425,6 +425,67 @@ pub struct Keepout {
     pub no_footprints: bool,
 }
 
+/// How a copper zone joins pads of its own net.
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum PadConnection {
+    /// Pads are fused with the fill.
+    Solid,
+    /// Thermal reliefs (KiCad default): pads stay electrically connected.
+    #[default]
+    ThermalRelief,
+    /// Thermal reliefs on through-hole pads only; SMD pads are not connected.
+    ThruHoleOnly,
+    /// Pads are isolated from the fill.
+    None,
+}
+
+impl PadConnection {
+    /// `true` when a pad (through-hole or not) of the zone's net joins the fill.
+    #[must_use]
+    pub fn joins(self, through_hole: bool) -> bool {
+        match self {
+            Self::Solid | Self::ThermalRelief => true,
+            Self::ThruHoleOnly => through_hole,
+            Self::None => false,
+        }
+    }
+}
+
+/// The copper KiCad stored for one zone on one layer (possibly non-convex polygons;
+/// holes are encoded KiCad-style as bridged outlines).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ZoneFill {
+    pub layer: LayerId,
+    pub polys: Vec<Polygon>,
+}
+
+/// A copper pour. Only the stored fill is treated as copper (never refilled here).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Zone {
+    pub net: NetId,
+    pub layers: LayerSet,
+    pub outline: Polygon,
+    pub fills: Vec<ZoneFill>,
+    /// Zone clearance to other-net copper.
+    pub clearance: Coord,
+    pub min_thickness: Coord,
+    pub priority: u32,
+    pub pad_connection: PadConnection,
+}
+
+impl Zone {
+    /// `true` when the zone carries no stored copper (never filled).
+    #[must_use]
+    pub fn is_unfilled(&self) -> bool {
+        self.fills.iter().all(|f| f.polys.is_empty())
+    }
+
+    /// Stored fill polygons as `(layer, polygon)`.
+    pub fn fill_polys(&self) -> impl Iterator<Item = (LayerId, &Polygon)> {
+        self.fills.iter().flat_map(|f| f.polys.iter().map(move |p| (f.layer, p)))
+    }
+}
+
 /// Board outline: outer boundary plus optional cut-outs (all simple polygons).
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Outline {
@@ -459,6 +520,9 @@ pub struct Board {
     pub arcs: Vec<ArcTrack>,
     pub vias: Vec<Via>,
     pub keepouts: Vec<Keepout>,
+    /// Copper pours (stored fills only).
+    #[serde(default)]
+    pub zones: Vec<Zone>,
     pub outline: Outline,
     pub rules: DesignRules,
     #[serde(default)]

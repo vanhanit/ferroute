@@ -129,6 +129,9 @@ fn via_legal(
     {
         return false;
     }
+    if ferroute_drc::zones::conflicts(base, &st.fills, &hull, via.layers, via.net) {
+        return false;
+    }
     let same = |n: NetId| n == via.net && n != NetId::NONE;
     let clr_same = base.clearance_between(via.net, via.net);
     let reach = st.reach.max(rules.hole_to_hole).max(clr_same) + 1;

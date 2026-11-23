@@ -204,12 +204,15 @@ fn legacy_numeric_dialect() {
     assert_eq!(v.layers, LayerSet::span(LayerId(0), LayerId(1)));
     assert_eq!(net_name(b, v.net), "VCC");
 
-    // copper pour is reported, not modelled
-    assert!(
-        kb.warnings.iter().any(|w| w.contains("copper zone") && w.contains("GND")),
-        "{:?}",
-        kb.warnings
-    );
+    // copper pour is modelled (this fixture's zone was never filled)
+    assert!(!kb.warnings.iter().any(|w| w.contains("ignored")), "{:?}", kb.warnings);
+    assert_eq!(b.zones.len(), 1);
+    let z = &b.zones[0];
+    assert_eq!(net_name(b, z.net), "GND");
+    assert_eq!(z.layers, LayerSet::single(LayerId(1)));
+    assert_eq!((z.clearance, z.min_thickness), (mm(0.2), mm(0.25)));
+    assert_eq!(z.outline.pts.len(), 4);
+    assert!(z.is_unfilled());
     assert!(b.keepouts.is_empty());
 
     // outline: 30x20 with one r=3 rounded corner => chained from 4 lines + 1 arc

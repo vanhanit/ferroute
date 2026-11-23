@@ -9,7 +9,7 @@ use crate::sexpr::SExpr;
 use crate::util::{circumscribed_polygon, float, mm, same_angle};
 use ferroute_board::{
     Board, Drill, Footprint, FootprintId, Keepout, LayerId, LayerSet, Mobility, Net, NetId, Origin,
-    Pad, PadId, Placement, Side, Track, Via,
+    Pad, PadConnection, PadId, Placement, Side, Track, Via, Zone, ZoneFill,
 };
 use ferroute_geom::{Angle, Coord, Point, Polygon, Rect, convex_hull, units::mm_to_nm};
 use std::collections::{BTreeMap, HashMap};
@@ -156,16 +156,7 @@ impl Reader {
     ) -> Result<(), KicadError> {
         let layers = self.layers.mask_of(node);
         let Some(ko) = node.child("keepout") else {
-            let net = node
-                .child("net_name")
-                .or_else(|| node.child("net"))
-                .and_then(|n| n.atom(1))
-                .unwrap_or("");
-            self.warnings.push(format!(
-                "copper zone (net {net:?}{}) ignored for routing; copper pours are not modelled",
-                if owner.is_empty() { String::new() } else { format!(", in {owner}") }
-            ));
-            return Ok(());
+            return self.read_copper_zone(node, pl.is_some(), owner, layers);
         };
         let denied = |k: &str| ko.child(k).and_then(|c| c.atom(1)) == Some("not_allowed");
         let (no_tracks, no_vias, no_pads, no_footprints) =
@@ -193,6 +184,74 @@ impl Reader {
                 no_footprints,
             });
         }
+        Ok(())
+    }
+
+    /// A copper pour: outline, rules and the stored `(filled_polygon ...)` copper.
+    fn read_copper_zone(
+        &mut self,
+        node: &SExpr,
+        in_footprint: bool,
+        owner: &str,
+        layers: LayerSet,
+    ) -> Result<(), KicadError> {
+        if in_footprint {
+            self.warnings.push(format!(
+                "copper zone inside {owner} ignored for routing; footprint-embedded pours are not modelled"
+            ));
+            return Ok(());
+        }
+        let Some(outline) = node.child("polygon").and_then(|p| p.child("pts")) else {
+            return Err(KicadError::Format("copper zone without (polygon (pts ...))".into()));
+        };
+        let outline = Polygon::new(poly_points(outline)?);
+        let net = self.net_of(node);
+        let connect = node.child("connect_pads");
+        let pad_connection = match connect.and_then(|c| c.atom(1)) {
+            Some("yes") => PadConnection::Solid,
+            Some("no") => PadConnection::None,
+            Some("thru_hole_only") => PadConnection::ThruHoleOnly,
+            _ => PadConnection::ThermalRelief,
+        };
+        let clearance = match connect.and_then(|c| c.child("clearance")) {
+            Some(c) => num_at(c, 1)?,
+            None => 0,
+        };
+        let min_thickness = match node.child("min_thickness") {
+            Some(c) => num_at(c, 1)?,
+            None => 0,
+        };
+        let priority =
+            node.child("priority").and_then(|c| c.atom(1)).map_or(0, |t| t.parse().unwrap_or(0));
+        let mut fills: Vec<ZoneFill> = Vec::new();
+        for f in node.children("filled_polygon") {
+            let Some(layer) = self.layers.mask_of(f).iter().next() else { continue };
+            let Some(pts) = f.child("pts") else { continue };
+            let poly = Polygon::new(poly_points(pts)?);
+            if poly.pts.len() < 3 {
+                continue;
+            }
+            match fills.iter_mut().find(|z| z.layer == layer) {
+                Some(z) => z.polys.push(poly),
+                None => fills.push(ZoneFill { layer, polys: vec![poly] }),
+            }
+        }
+        let zone = Zone {
+            net,
+            layers,
+            outline,
+            fills,
+            clearance,
+            min_thickness,
+            priority,
+            pad_connection,
+        };
+        if zone.is_unfilled() {
+            let name = self.nets.get(net.idx()).map_or("", |n| n.name.as_str());
+            self.warnings
+                .push(format!("zone {name:?} has no fill; refill in KiCad before routing"));
+        }
+        self.board.zones.push(zone);
         Ok(())
     }
 

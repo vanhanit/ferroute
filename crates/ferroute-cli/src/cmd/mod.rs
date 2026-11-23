@@ -47,6 +47,7 @@ pub fn item_label(board: &Board, it: ItemRef) -> String {
         ItemRef::Via(v) => format!("via#{v}"),
         ItemRef::Footprint(f) => board.footprint(f).reference.clone(),
         ItemRef::Keepout(k) => format!("keepout#{k}"),
+        ItemRef::Zone(z) => format!("zone#{z}"),
         ItemRef::BoardEdge => "board-edge".into(),
     }
 }

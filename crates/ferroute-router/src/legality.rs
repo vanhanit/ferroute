@@ -73,6 +73,16 @@ pub struct KeepArea {
     pub no_vias: bool,
 }
 
+/// One stored copper-pour fill polygon (non-convex, tested exactly).
+#[derive(Clone, Debug)]
+pub struct FillObs {
+    pub poly: Polygon,
+    pub layer: LayerId,
+    pub net: NetId,
+    /// Required gap to other-net copper: the zone clearance or the net class, the larger.
+    pub clearance: Coord,
+}
+
 /// Geometry of a net class as the router uses it.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub struct ClassGeom {
@@ -91,6 +101,10 @@ pub struct Obstacles {
     boxes: Vec<Rect>,
     index: BucketGrid,
     pub keep_areas: Vec<KeepArea>,
+    /// Stored zone fills (copper pours).
+    pub fills: Vec<FillObs>,
+    fill_boxes: Vec<Rect>,
+    fill_index: BucketGrid,
     pub outline_outer: Polygon,
     pub outline_holes: Vec<Polygon>,
     pub rules: DesignRules,
@@ -178,9 +192,25 @@ impl Obstacles {
                 no_vias: k.no_vias,
             });
         }
+        let fills: Vec<FillObs> = ferroute_drc::zones::fill_polys(board)
+            .iter()
+            .map(|f| FillObs {
+                poly: f.poly.clone(),
+                layer: f.layer,
+                net: f.net,
+                clearance: f.clearance.max(class_c(f.net)),
+            })
+            .collect();
+        let fill_boxes: Vec<Rect> = fills.iter().filter_map(|f| f.poly.bbox()).collect();
+        let fill_index = BucketGrid::new(&fill_boxes, 2_000_000);
         let r = &board.rules;
-        let reach =
-            r.max_clearance().max(r.hole_clearance).max(r.hole_to_hole).max(r.edge_clearance) + 1;
+        let reach = r
+            .max_clearance()
+            .max(r.hole_clearance)
+            .max(r.hole_to_hole)
+            .max(r.edge_clearance)
+            .max(fills.iter().map(|f| f.clearance).max().unwrap_or(0))
+            + 1;
         let boxes: Vec<Rect> = items.iter().map(|o| o.hull.bbox()).collect();
         let index = BucketGrid::new(&boxes, 2_000_000);
         Self {
@@ -188,6 +218,9 @@ impl Obstacles {
             boxes,
             index,
             keep_areas,
+            fills,
+            fill_boxes,
+            fill_index,
             outline_outer: board.outline.outer.clone(),
             outline_holes: board.outline.holes.clone(),
             rules: board.rules.clone(),
@@ -200,6 +233,23 @@ impl Obstacles {
             return Vec::new();
         }
         self.index.query(q.inflate(self.reach), &self.boxes)
+    }
+
+    /// Indices of fills whose box meets `q` inflated by the reach.
+    fn near_fills(&self, q: Rect) -> Vec<u32> {
+        if self.fills.is_empty() {
+            return Vec::new();
+        }
+        self.fill_index.query(q.inflate(self.reach), &self.fill_boxes)
+    }
+
+    /// `true` when `p` lies inside a stored fill on `layer` (any net).
+    #[must_use]
+    pub fn in_fill(&self, p: Point, layer: LayerId) -> bool {
+        self.near_fills(Rect::new(p, p)).into_iter().any(|i| {
+            let f = &self.fills[i as usize];
+            f.layer == layer && f.poly.contains(p)
+        })
     }
 
     fn inside_board(&self, p: Point) -> bool {
@@ -247,6 +297,15 @@ impl Obstacles {
             }
             if state == BLOCKED {
                 return BLOCKED;
+            }
+        }
+        for i in self.near_fills(h.bbox()) {
+            let f = &self.fills[i as usize];
+            if f.layer == layer && f.poly.hull_violates(h, cg.clearance.max(f.clearance)) {
+                state = merge(state, f.net);
+                if state == BLOCKED {
+                    return BLOCKED;
+                }
             }
         }
         state
@@ -301,20 +360,38 @@ impl Obstacles {
                 return BLOCKED;
             }
         }
+        for i in self.near_fills(copper.bbox()) {
+            let f = &self.fills[i as usize];
+            if f.poly.hull_violates(&copper, cg.clearance.max(f.clearance)) {
+                state = merge(state, f.net);
+                if state == BLOCKED {
+                    return BLOCKED;
+                }
+            }
+        }
         state
     }
 
     /// Conservative capsules (supersets) of the obstacles relevant on `layer`.
     #[must_use]
     pub fn capsules_on(&self, layer: LayerId) -> Vec<Capsule> {
-        self.items
+        let mut caps: Vec<Capsule> = self
+            .items
             .iter()
             .filter(|o| match o.kind {
                 ObsKind::Copper { .. } | ObsKind::KeepoutEdge { .. } => o.layers.contains(layer),
                 ObsKind::Hole | ObsKind::Edge => true,
             })
             .map(|o| bounding_capsule(&o.hull))
-            .collect()
+            .collect();
+        // Fill boundaries (the accelerator only skips sites far from all boundaries; sites
+        // *inside* a fill are never skipped, see `compute`).
+        for f in self.fills.iter().filter(|f| f.layer == layer) {
+            for e in f.poly.edges() {
+                caps.push(bounding_capsule(&Hull::capsule(e.a, e.b, 0)));
+            }
+        }
+        caps
     }
 }
 
@@ -438,6 +515,7 @@ pub fn compute(
             *s = if accel.is_some_and(|a| a.far(grid, n, node_thr)) {
                 // Provably far from all obstacle *boundaries*: only containment matters.
                 if obs.inside_board(p)
+                    && !obs.in_fill(p, layer)
                     && !obs
                         .keep_areas
                         .iter()
@@ -468,8 +546,9 @@ pub fn compute(
                 if sa == BLOCKED || sb == BLOCKED {
                     continue;
                 }
-                let st = if accel
-                    .is_some_and(|f| f.far(grid, a, edge_thr) && f.far(grid, b, edge_thr))
+                let st = if sa == FREE
+                    && sb == FREE
+                    && accel.is_some_and(|f| f.far(grid, a, edge_thr) && f.far(grid, b, edge_thr))
                 {
                     FREE
                 } else {

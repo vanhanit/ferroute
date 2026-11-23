@@ -194,6 +194,8 @@ pub(crate) struct Statics<'a> {
     pub(crate) hole_grid: BucketGrid,
     pub(crate) pads_at: BTreeMap<Point, Vec<PadId>>,
     pub(crate) reach: Coord,
+    /// Stored copper-pour fills (other-net fills are obstacles).
+    pub(crate) fills: Vec<ferroute_drc::zones::FillPoly<'a>>,
 }
 
 /// The segment window being replaced and what is exempt from the same-net checks.
@@ -295,7 +297,8 @@ impl<'a> Statics<'a> {
         let hole_boxes: Vec<Rect> = holes.iter().map(|h| h.hull.bbox()).collect();
         let hole_grid = BucketGrid::new(&hole_boxes, CELL);
         let reach = base.rules.max_clearance().max(base.rules.hole_clearance);
-        Self { base, items, boxes, grid, holes, hole_boxes, hole_grid, pads_at, reach }
+        let fills = ferroute_drc::zones::fill_polys(base);
+        Self { base, items, boxes, grid, holes, hole_boxes, hole_grid, pads_at, reach, fills }
     }
 
     pub(crate) fn static_near(&self, a: Point, b: Point, margin: Coord) -> Vec<u32> {
@@ -406,6 +409,15 @@ impl<'a> Statics<'a> {
                 .iter()
                 .any(|k| k.no_tracks && k.layers.contains(layer) && k.area.hull_violates(&hull, 0))
             {
+                return true;
+            }
+            if ferroute_drc::zones::conflicts(
+                base,
+                &self.fills,
+                &hull,
+                LayerSet::single(layer),
+                net,
+            ) {
                 return true;
             }
             let hc = base.rules.hole_clearance;
