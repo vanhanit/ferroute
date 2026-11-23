@@ -124,7 +124,7 @@
         "moved_footprints": 6,
         "displacement_mm": 11.921978840013155,
         "constraint_issues": 0,
-        "runtime_ms": 500.0
+        "runtime_ms": 400.0
       }
     },
     {
@@ -177,7 +177,7 @@
         "vias": 0,
         "moved_footprints": 0,
         "displacement_mm": 0.0,
-        "constraint_issues": 1,
+        "constraint_issues": 0,
         "runtime_ms": 100.0
       }
     },
@@ -195,7 +195,43 @@
         "vias": 0,
         "moved_footprints": 0,
         "displacement_mm": 0.0,
-        "constraint_issues": 1,
+        "constraint_issues": 0,
+        "runtime_ms": 100.0
+      }
+    },
+    {
+      "board": "pour_gnd-fixed",
+      "seed": 1,
+      "metrics": {
+        "drc_clean": true,
+        "introduced_violations": 0,
+        "total_violations": 0,
+        "completion": 1.0,
+        "connections_total": 1,
+        "connections_missing": 0,
+        "wirelength_mm": 18.24122112556947,
+        "vias": 0,
+        "moved_footprints": 0,
+        "displacement_mm": 0.0,
+        "constraint_issues": 0,
+        "runtime_ms": 100.0
+      }
+    },
+    {
+      "board": "pour_gnd",
+      "seed": 1,
+      "metrics": {
+        "drc_clean": true,
+        "introduced_violations": 0,
+        "total_violations": 0,
+        "completion": 1.0,
+        "connections_total": 1,
+        "connections_missing": 0,
+        "wirelength_mm": 18.24122112556947,
+        "vias": 0,
+        "moved_footprints": 0,
+        "displacement_mm": 0.0,
+        "constraint_issues": 0,
         "runtime_ms": 100.0
       }
     }
