@@ -14,6 +14,7 @@
 //!   would introduce a violation is never emitted.
 
 pub mod access;
+pub mod detour;
 pub mod direct;
 pub mod emit;
 pub mod grid;
@@ -75,6 +76,16 @@ pub struct RouterConfig {
     pub accel: Accel,
     /// Route only these nets (default: all).
     pub nets: Option<Vec<NetId>>,
+    /// Nets routed first, in this order, before the usual HPWL+seed order.
+    #[serde(default)]
+    pub first: Vec<NetId>,
+    /// Maximum number of detour-driven re-ordering rounds after the first pass.
+    #[serde(default = "default_order_rounds")]
+    pub order_rounds: u32,
+}
+
+const fn default_order_rounds() -> u32 {
+    3
 }
 
 impl Default for RouterConfig {
@@ -95,6 +106,8 @@ impl Default for RouterConfig {
             seed: 1,
             accel: Accel::Auto,
             nets: None,
+            first: Vec::new(),
+            order_rounds: default_order_rounds(),
         }
     }
 }
@@ -117,6 +130,10 @@ pub struct RouteStats {
     /// Nets removed by the final DRC gate (should always be 0; non-zero indicates a
     /// gap between the lattice theory and the oracle and is reported as a bug).
     pub drc_gate_rips: usize,
+    /// Detour-driven re-ordering rounds that were run (0 = first pass was kept as is).
+    pub order_rounds_run: u32,
+    /// Sum of detour excess (mm) of the returned outcome.
+    pub detour_excess_mm: f64,
 }
 
 /// Wall-clock timings (not deterministic; excluded from reproducibility checks).
@@ -201,6 +218,40 @@ pub fn pad_islands(board: &Board) -> Vec<Vec<Vec<PadId>>> {
 /// # Errors
 /// [`RouteError`] for invalid boards or impossible lattices.
 pub fn route(board: &Board, cfg: &RouterConfig) -> Result<RouteOutcome, RouteError> {
+    let mut best = route_once(board, cfg)?;
+    let mut best_q = detour::quality(board, &best);
+    let mut run = 0u32;
+    for _ in 0..cfg.order_rounds {
+        let d = detour::net_detours(board, &best.edit);
+        let mut first = detour::worst_nets(&d, &best.failed);
+        if first.is_empty() {
+            break;
+        }
+        run += 1;
+        let extra: Vec<NetId> = cfg.first.iter().copied().filter(|n| !first.contains(n)).collect();
+        first.extend(extra);
+        let cand = route_once(board, &RouterConfig { first, ..cfg.clone() })?;
+        let q = detour::quality(board, &cand);
+        if q.improves_on(&best_q) {
+            best = cand;
+            best_q = q;
+        } else {
+            break;
+        }
+    }
+    best.stats.order_rounds_run = run;
+    #[allow(clippy::cast_precision_loss)]
+    {
+        best.stats.detour_excess_mm = best_q.excess_um as f64 / 1000.0;
+    }
+    Ok(best)
+}
+
+/// One routing pass with the net order given by `cfg.first`, then HPWL and seed.
+///
+/// # Errors
+/// [`RouteError`] for invalid boards or impossible lattices.
+pub fn route_once(board: &Board, cfg: &RouterConfig) -> Result<RouteOutcome, RouteError> {
     board.validate().map_err(|e| RouteError::InvalidBoard(e.to_string()))?;
     let layers: Vec<_> = (0..board.layer_count())
         .map(ferroute_board::LayerId)
@@ -320,7 +371,8 @@ pub fn route(board: &Board, cfg: &RouterConfig) -> Result<RouteOutcome, RouteErr
     order.sort_by_key(|&j| {
         let b = jobs[j].tbox;
         let hpwl = (b.2 - b.0) + (b.3 - b.1);
-        (hpwl, splitmix64(cfg.seed ^ u64::from(jobs[j].net.0)))
+        let rank = cfg.first.iter().position(|&n| n == jobs[j].net).unwrap_or(usize::MAX);
+        (rank, hpwl, splitmix64(cfg.seed ^ u64::from(jobs[j].net.0)))
     });
     let ncfg = NegotiationConfig {
         max_iterations: cfg.max_iterations,
@@ -415,6 +467,8 @@ pub fn route(board: &Board, cfg: &RouterConfig) -> Result<RouteOutcome, RouteErr
         negotiation: nstats,
         accel_backend: accel_name,
         drc_gate_rips: gate_rips,
+        order_rounds_run: 0,
+        detour_excess_mm: 0.0,
     };
     Ok(RouteOutcome {
         edit,

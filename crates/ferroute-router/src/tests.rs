@@ -512,3 +512,77 @@ fn off_lattice_pads_get_a_single_straight_run() {
         out.edit.new_tracks
     );
 }
+
+// ---- detour-driven net order -------------------------------------------------------
+
+/// Two parallel nets must cross a wall whose near gap fits one trace; the far gap forces
+/// a long detour on the loser.
+fn corridor_board() -> (Board, NetId, NetId) {
+    use ferroute_geom::{Point, Rect};
+    let mut b = BoardBuilder::new(mm(30), mm(20), 1);
+    let a = b.net("A");
+    let n = b.net("B");
+    b.smd2("R1", pt10(40, 100), 90.0, a, n);
+    b.smd2("R2", pt10(260, 100), 90.0, a, n);
+    let r = |x0: i64, y0: i64, x1: i64, y1: i64| {
+        Rect::new(Point::new(x0 * 100_000, y0 * 100_000), Point::new(x1 * 100_000, y1 * 100_000))
+    };
+    b.keepout(r(145, 60, 155, 96), true, true);
+    b.keepout(r(145, 104, 155, 140), true, true);
+    (b.build(), a, n)
+}
+
+fn excess_of(board: &Board, out: &RouteOutcome, net: NetId) -> f64 {
+    detour::net_detours(board, &out.edit)
+        .iter()
+        .find(|d| d.net == net)
+        .map_or(f64::NAN, detour::NetDetour::excess_nm)
+}
+
+#[test]
+fn first_nets_get_the_direct_corridor() {
+    let (board, a, n) = corridor_board();
+    let cfg = RouterConfig { order_rounds: 0, ..exact_cfg() };
+    let by_default = route_once(&board, &cfg).expect("route");
+    let b_first =
+        route_once(&board, &RouterConfig { first: vec![n], ..cfg.clone() }).expect("route");
+    let a_first = route_once(&board, &RouterConfig { first: vec![a], ..cfg }).expect("route");
+    eprintln!(
+        "default A {:.2} B {:.2}; B first A {:.2} B {:.2}; A first A {:.2} B {:.2}",
+        excess_of(&board, &by_default, a) / 1e6,
+        excess_of(&board, &by_default, n) / 1e6,
+        excess_of(&board, &b_first, a) / 1e6,
+        excess_of(&board, &b_first, n) / 1e6,
+        excess_of(&board, &a_first, a) / 1e6,
+        excess_of(&board, &a_first, n) / 1e6,
+    );
+    assert!(b_first.failed.is_empty() && a_first.failed.is_empty());
+    assert!(excess_of(&board, &b_first, n) < 1e6, "B first must be direct");
+    assert!(excess_of(&board, &b_first, a) > 2e6, "A must detour when B is first");
+    assert!(excess_of(&board, &a_first, a) < 1e6, "A first must be direct");
+}
+
+#[test]
+fn first_is_deterministic_across_thread_counts() {
+    let (board, _, n) = corridor_board();
+    let cfg = RouterConfig { first: vec![n], ..exact_cfg() };
+    let run = |threads: usize| {
+        let pool = rayon::ThreadPoolBuilder::new().num_threads(threads).build().expect("pool");
+        pool.install(|| route(&board, &cfg).expect("route"))
+    };
+    assert_eq!(run(1).edit, run(4).edit);
+}
+
+#[test]
+fn order_refinement_never_worse() {
+    let (board, _, _) = corridor_board();
+    let once = route_once(&board, &exact_cfg()).expect("route");
+    let full = route(&board, &exact_cfg()).expect("route");
+    let (q0, q1) = (detour::quality(&board, &once), detour::quality(&board, &full));
+    eprintln!("once {q0:?} full {q1:?} rounds {}", full.stats.order_rounds_run);
+    assert!(q1 <= q0);
+    assert_clean_and_complete(&board, &full, true);
+    let off = route(&board, &RouterConfig { order_rounds: 0, ..exact_cfg() }).expect("route");
+    assert_eq!(off.edit, once.edit);
+    assert_eq!(off.stats.order_rounds_run, 0);
+}
