@@ -3,6 +3,14 @@ name: ci-release
 on:
   push:
     branches: [main]
+    # Docs- or CI-only pushes never version or release (code changes are verified by
+    # pr-verify on pull requests; the nightly workflow exercises the workflows too).
+    paths-ignore:
+      - "**/*.md"
+      - "docs/**"
+      - ".github/**"
+      - "LICENSE"
+      - "NOTICE"
 
 permissions:
   contents: read
@@ -85,8 +93,7 @@ jobs:
           TAG: ${{ steps.next.outputs.tag }}
         run: |
           set -euo pipefail
-          sed -i '/^\[workspace.package\]/,/^\[/ s/^version = ".*"/version = "'"$VERSION"'"/' Cargo.toml
-          cargo update --workspace
+          scripts/bump_version.sh "$VERSION"
           git cliff --config cliff.toml --unreleased --tag "$TAG" --strip header -o release-notes.md
           git cliff --config cliff.toml --tag "$TAG" -o CHANGELOG.md
           cat release-notes.md
