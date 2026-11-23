@@ -17,6 +17,7 @@ pub mod score;
 pub mod synth;
 
 use ferroute_board::{Board, BoardEdit, FootprintMove, NetId};
+use ferroute_drc::rules::ConstraintIssue;
 use ferroute_drc::{DrcConfig, DrcReport};
 use ferroute_place::{MovePolicy, PlaceConfig, PlaceResult};
 use ferroute_router::{RouteError, RouteOutcome, RouteStats, RouterConfig};
@@ -63,6 +64,9 @@ pub struct Metrics {
     pub vias: usize,
     pub moved_footprints: usize,
     pub displacement_mm: f64,
+    /// Per-net electrical rules the result does not meet (reported, never hidden).
+    #[serde(default)]
+    pub constraint_issues: usize,
     pub runtime_ms: f64,
 }
 
@@ -81,6 +85,10 @@ pub struct PipelineResult {
     pub metrics: Metrics,
     pub failed_nets: Vec<NetId>,
     pub rounds: u32,
+    /// How per-net rules changed derived widths before routing.
+    pub rule_notes: Vec<String>,
+    /// Per-net electrical constraints the routed board does not meet.
+    pub constraint_issues: Vec<ConstraintIssue>,
 }
 
 struct Candidate {
@@ -130,6 +138,8 @@ pub fn run(board: &Board, cfg: &PipelineConfig) -> Result<PipelineResult, RouteE
             };
         }
     }
+    // Per-net electrical rules → derived widths, before anything routes (INV-RULE-1).
+    let rule_notes = ferroute_board::constraints::resolve(&mut policy_board);
     let router = RouterConfig { seed: cfg.seed, ..cfg.router.clone() };
     let nudge =
         |from: &Board, weights: Vec<(NetId, f64)>, round: u32| -> (Board, Option<PlaceResult>) {
@@ -179,6 +189,7 @@ pub fn run(board: &Board, cfg: &PipelineConfig) -> Result<PipelineResult, RouteE
     board_after.apply(&edit);
     let drc = ferroute_drc::check(&board_after, &DrcConfig::default());
     let introduced = drc.introduced().count();
+    let constraint_issues = ferroute_drc::rules::check_constraints(&board_after);
     let metrics = Metrics {
         drc_clean: introduced == 0,
         introduced_violations: introduced,
@@ -196,6 +207,7 @@ pub fn run(board: &Board, cfg: &PipelineConfig) -> Result<PipelineResult, RouteE
             .sum::<f64>()
             / 1e6
             + 0.0, // normalise -0.0 (empty f64 sums are -0.0)
+        constraint_issues: constraint_issues.len(),
         runtime_ms: t0.elapsed().as_secs_f64() * 1e3,
     };
     Ok(PipelineResult {
@@ -208,6 +220,8 @@ pub fn run(board: &Board, cfg: &PipelineConfig) -> Result<PipelineResult, RouteE
         metrics,
         failed_nets: best.out.failed,
         rounds,
+        rule_notes,
+        constraint_issues,
     })
 }
 
@@ -241,6 +255,110 @@ mod tests {
             a.edit.check_invariants(&a.policy_board).expect("INV-EDIT-1");
             let b = run(&board, &cfg).expect("run");
             assert_eq!(a.edit, b.edit, "non-deterministic pipeline on {}", spec.name);
+        }
+    }
+}
+
+#[cfg(test)]
+mod rule_tests {
+    use super::*;
+    use ferroute_board::builder::{BoardBuilder, mm, pt10};
+    use ferroute_board::constraints::{required_width, width_for_current};
+    use ferroute_drc::rules::IssueKind;
+
+    fn two_parts() -> (Board, NetId) {
+        let mut b = BoardBuilder::new(mm(30), mm(20), 2);
+        let p = b.net("VBUS");
+        let g = b.net("GND");
+        b.smd2("R1", pt10(80, 100), 0.0, p, g);
+        b.smd2("R2", pt10(220, 100), 0.0, p, g);
+        (b.build(), p)
+    }
+
+    fn cfg() -> PipelineConfig {
+        PipelineConfig {
+            router: RouterConfig { accel: ferroute_router::Accel::Cpu, ..RouterConfig::default() },
+            ..PipelineConfig::default()
+        }
+    }
+
+    #[test]
+    fn current_rules_widen_routed_traces_never_narrow() {
+        let (mut board, p) = two_parts();
+        board.nets[p.idx()].constraints.max_current_ma = Some(2000);
+        let r = run(&board, &cfg()).expect("run");
+        assert!(r.metrics.drc_clean);
+        assert_eq!(r.metrics.completion, 1.0);
+        let need = width_for_current(2000, 35_000, true, 10.0);
+        assert_eq!(required_width(&r.board_after, p), need);
+        let vbus: Vec<_> = r.edit.new_tracks.iter().filter(|t| t.net == p).collect();
+        assert!(!vbus.is_empty());
+        assert!(vbus.iter().all(|t| t.width >= need), "INV-RULE-1");
+        assert_eq!(r.rule_notes.len(), 1, "{:?}", r.rule_notes);
+        assert!(r.constraint_issues.is_empty(), "{:?}", r.constraint_issues);
+    }
+
+    #[test]
+    fn unmet_rules_are_reported_not_silently_violated() {
+        let (mut board, p) = two_parts();
+        board.nets[p.idx()].constraints.length_max = Some(mm(1));
+        let r = run(&board, &cfg()).expect("run");
+        assert_eq!(r.metrics.constraint_issues, 1);
+        assert!(matches!(
+            r.constraint_issues[0].kind,
+            IssueKind::Length { max: Some(m), .. } if m == mm(1)
+        ));
+    }
+}
+
+#[cfg(test)]
+mod nudge_tests {
+    use super::*;
+    use ferroute_board::Mobility;
+    use ferroute_board::builder::{BoardBuilder, mm, pt10};
+    use ferroute_geom::{Point, Rect};
+
+    /// R1's net-A pad sits inside a no-track keep-out: unroutable where it is, routable
+    /// once the unlocked passive is nudged (≤ 2 mm) out of it. J1 is locked.
+    fn must_move_board() -> Board {
+        let mut b = BoardBuilder::new(mm(30), mm(20), 2);
+        let a = b.net("A");
+        let j1 = b.header("J1", pt10(50, 100), 0.0, &[a]);
+        b.mobility(j1, Mobility::Locked);
+        b.smd2("R1", pt10(200, 100), 0.0, a, NetId::NONE);
+        b.keepout(
+            Rect::new(Point::new(mm(18) + 500_000, 0), Point::new(mm(30), mm(20))),
+            true,
+            true,
+        );
+        b.build()
+    }
+
+    fn cfg(nudge: bool) -> PipelineConfig {
+        PipelineConfig {
+            router: RouterConfig { accel: ferroute_router::Accel::Cpu, ..RouterConfig::default() },
+            nudge: nudge.then(|| (MovePolicy::default(), PlaceConfig::default())),
+            ..PipelineConfig::default()
+        }
+    }
+
+    #[test]
+    fn connection_routes_only_after_nudging_an_unlocked_passive() {
+        let board = must_move_board();
+        board.validate().expect("valid");
+        let fixed = run(&board, &cfg(false)).expect("run");
+        assert!(fixed.metrics.drc_clean);
+        assert_eq!(fixed.metrics.connections_missing, 1, "blocked without moving");
+        let moved = run(&board, &cfg(true)).expect("run");
+        assert!(moved.metrics.drc_clean, "{:?}", moved.drc.introduced().collect::<Vec<_>>());
+        assert_eq!(moved.metrics.connections_missing, 0, "routes once R1 moves");
+        moved.edit.check_invariants(&moved.policy_board).expect("INV-EDIT-1");
+        assert!(moved.edit.moves.iter().all(|m| m.footprint.idx() == 1), "J1 locked");
+        assert!(!moved.edit.moves.is_empty());
+        let grid = PlaceConfig::default().grid;
+        for m in &moved.edit.moves {
+            assert_eq!(m.to.pos.x % grid, 0, "INV-PLACE-3");
+            assert_eq!(m.to.pos.y % grid, 0, "INV-PLACE-3");
         }
     }
 }
