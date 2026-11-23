@@ -46,6 +46,14 @@ pub fn acute_angles(board: &Board) -> Vec<AcidTrap> {
             groups.entry((t.layer.0, t.net.0)).or_default().push(Segment::new(t.start, t.end));
         }
     }
+    for a in &board.arcs {
+        if a.net == NetId::NONE {
+            continue;
+        }
+        let pts = a.geom().flatten(ferroute_board::ARC_MAX_SAG).0;
+        let entry = groups.entry((a.layer.0, a.net.0)).or_default();
+        entry.extend(pts.windows(2).filter(|w| w[0] != w[1]).map(|w| Segment::new(w[0], w[1])));
+    }
     let mut out = Vec::new();
     for (&(layer, net), segs) in &groups {
         let (layer, net) = (LayerId(layer), NetId(net));

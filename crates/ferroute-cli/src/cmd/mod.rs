@@ -40,6 +40,7 @@ pub fn item_label(board: &Board, it: ItemRef) -> String {
             format!("{}.{}", board.footprint(pad.footprint).reference, pad.number)
         }
         ItemRef::Track(t) => format!("track#{t}"),
+        ItemRef::Arc(a) => format!("arc#{a}"),
         ItemRef::Via(v) => format!("via#{v}"),
         ItemRef::Footprint(f) => board.footprint(f).reference.clone(),
         ItemRef::Keepout(k) => format!("keepout#{k}"),

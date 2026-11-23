@@ -80,6 +80,11 @@ pub fn net_lengths(board: &Board) -> Vec<Coord> {
             *l += t.start.dist(t.end);
         }
     }
+    for a in &board.arcs {
+        if let Some(l) = len.get_mut(a.net.idx()) {
+            *l += a.length();
+        }
+    }
     #[allow(clippy::cast_possible_truncation)]
     len.into_iter().map(|l| l.round() as Coord).collect()
 }
@@ -101,12 +106,17 @@ pub fn check_constraints(board: &Board) -> Vec<ConstraintIssue> {
         let id = NetId(u32::try_from(i).unwrap_or(u32::MAX));
         let c = &net.constraints;
         let need = required_width(board, id);
-        if let Some(t) =
-            board.tracks.iter().filter(|t| t.net == id && t.width < need).min_by_key(|t| t.width)
-        {
+        let narrowest = board
+            .tracks
+            .iter()
+            .filter(|t| t.net == id)
+            .map(|t| t.width)
+            .chain(board.arcs.iter().filter(|a| a.net == id).map(|a| a.width))
+            .min();
+        if let Some(w) = narrowest.filter(|&w| w < need) {
             out.push(ConstraintIssue {
                 net: id,
-                kind: IssueKind::Width { actual: t.width, required: need },
+                kind: IssueKind::Width { actual: w, required: need },
             });
         }
         let l = lengths[i];

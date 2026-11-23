@@ -369,6 +369,9 @@ pub fn route(board: &Board, cfg: &RouterConfig) -> Result<RouteOutcome, RouteErr
                     ItemRef::Track(t) if t as usize >= original.tracks.len() => {
                         bad.push(after.tracks[t as usize].net);
                     }
+                    ItemRef::Arc(a) if a as usize >= original.arcs.len() => {
+                        bad.push(after.arcs[a as usize].net);
+                    }
                     ItemRef::Via(t) if t as usize >= original.vias.len() => {
                         bad.push(after.vias[t as usize].net);
                     }

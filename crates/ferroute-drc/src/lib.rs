@@ -82,6 +82,8 @@ pub enum ViolationKind {
 pub enum ItemRef {
     Pad(PadId),
     Track(u32),
+    /// Index into `board.arcs`.
+    Arc(u32),
     Via(u32),
     Footprint(FootprintId),
     Keepout(u32),
@@ -148,7 +150,9 @@ pub struct CopperItem {
 #[must_use]
 pub fn copper_items(board: &Board) -> Vec<CopperItem> {
     let moved: Vec<bool> = board.footprints.iter().map(|f| f.placement != f.original).collect();
-    let mut v = Vec::with_capacity(board.pads.len() + board.tracks.len() + board.vias.len());
+    let mut v = Vec::with_capacity(
+        board.pads.len() + board.tracks.len() + board.arcs.len() + board.vias.len(),
+    );
     for id in board.pad_ids() {
         let pad = board.pad(id);
         if pad.layers.is_empty() {
@@ -176,6 +180,20 @@ pub fn copper_items(board: &Board) -> Vec<CopperItem> {
             footprint: None,
             introduced: t.origin == Origin::Routed,
         });
+    }
+    // Arcs: one item per covering capsule (a convex superset of the arc copper, INV-DRC-1).
+    for (i, arc) in board.arcs.iter().enumerate() {
+        for hull in arc.hulls() {
+            v.push(CopperItem {
+                item: ItemRef::Arc(idx(i)),
+                bbox: hull.bbox(),
+                hull,
+                layers: LayerSet::single(arc.layer),
+                net: arc.net,
+                footprint: None,
+                introduced: arc.origin == Origin::Routed,
+            });
+        }
     }
     for (i, via) in board.vias.iter().enumerate() {
         let hull = via.hull();
@@ -304,6 +322,28 @@ fn mid(a: Rect, b: Rect) -> Point {
     Point::new(lo.x / 2 + hi.x / 2, lo.y / 2 + hi.y / 2)
 }
 
+/// An arc is covered by several capsules; collapse the violations of its pieces that share
+/// (kind, items, layer) into the worst one. Input must be sorted; violations without an
+/// arc are never touched.
+fn dedup_arc_pieces(violations: &mut Vec<Violation>) {
+    let involves_arc =
+        |v: &Violation| matches!(v.a, ItemRef::Arc(_)) || matches!(v.b, Some(ItemRef::Arc(_)));
+    let mut out: Vec<Violation> = Vec::with_capacity(violations.len());
+    for v in violations.drain(..) {
+        if involves_arc(&v)
+            && let Some(last) = out.last_mut()
+            && (last.kind, last.a, last.b, last.layer) == (v.kind, v.a, v.b, v.layer)
+        {
+            if v.actual < last.actual {
+                *last = v;
+            }
+            continue;
+        }
+        out.push(v);
+    }
+    *violations = out;
+}
+
 fn first_common_layer(a: LayerSet, b: LayerSet) -> Option<LayerId> {
     LayerSet(a.0 & b.0).iter().next()
 }
@@ -340,6 +380,7 @@ pub fn check(board: &Board, cfg: &DrcConfig) -> DrcReport {
     violations.sort_by(|a, b| {
         (a.kind, a.a, a.b, a.layer).cmp(&(b.kind, b.a, b.b, b.layer)).then(a.at.cmp(&b.at))
     });
+    dedup_arc_pieces(&mut violations);
     let connectivity = if cfg.connectivity {
         connectivity::analyse(board, &items)
     } else {
@@ -359,7 +400,7 @@ fn check_copper(
         .into_par_iter()
         .filter_map(|(i, j)| {
             let (a, b) = (&items[i as usize], &items[j as usize]);
-            if a.net == b.net && a.net != NetId::NONE {
+            if (a.net == b.net && a.net != NetId::NONE) || a.item == b.item {
                 return None;
             }
             if !a.layers.intersects(b.layers) {
@@ -499,7 +540,7 @@ fn check_keepouts(board: &Board, items: &[CopperItem]) -> Vec<Violation> {
         let kref = ItemRef::Keepout(u32::try_from(ki).unwrap_or(u32::MAX));
         for it in items {
             let forbidden = match it.item {
-                ItemRef::Track(_) => k.no_tracks,
+                ItemRef::Track(_) | ItemRef::Arc(_) => k.no_tracks,
                 ItemRef::Via(_) => k.no_vias,
                 ItemRef::Pad(_) => k.no_pads,
                 _ => false,
@@ -577,6 +618,18 @@ fn check_sizes(board: &Board) -> Vec<Violation> {
             out.push(size_violation(
                 ViolationKind::TrackWidth,
                 ItemRef::Track(idx(i)),
+                t.start,
+                t.width,
+                r.min_track_width,
+                t.origin,
+            ));
+        }
+    }
+    for (i, t) in board.arcs.iter().enumerate() {
+        if t.width < r.min_track_width {
+            out.push(size_violation(
+                ViolationKind::TrackWidth,
+                ItemRef::Arc(idx(i)),
                 t.start,
                 t.width,
                 r.min_track_width,
