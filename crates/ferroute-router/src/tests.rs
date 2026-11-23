@@ -448,3 +448,67 @@ fn lattice_aligns_pad_rows_and_columns() {
         450_000
     );
 }
+
+/// Direction changes at vertices where exactly two same-net tracks of one layer meet.
+fn count_bends(tracks: &[ferroute_board::Track]) -> usize {
+    use std::collections::BTreeMap;
+    let mut at: BTreeMap<(u32, u8, ferroute_geom::Point), Vec<ferroute_geom::Point>> =
+        BTreeMap::new();
+    for t in tracks.iter().filter(|t| t.start != t.end) {
+        at.entry((t.net.0, t.layer.0, t.start)).or_default().push(t.end - t.start);
+        at.entry((t.net.0, t.layer.0, t.end)).or_default().push(t.start - t.end);
+    }
+    at.values()
+        .filter(|v| v.len() == 2)
+        .filter(|v| (v[0].x.signum(), v[0].y.signum()) != (-v[1].x.signum(), -v[1].y.signum()))
+        .count()
+}
+
+#[test]
+fn straightening_is_safe_idempotent_and_never_adds_bends() {
+    for seed in 0..16 {
+        let board = random_board(seed, 14);
+        let out = route(&board, &exact_cfg()).expect("route");
+        assert_clean_and_complete(&board, &out, false);
+        let mut after = board.clone();
+        after.apply(&out.edit);
+        assert!(ferroute_drc::quality::acute_angles(&after).is_empty(), "seed {seed}");
+        // A second pass may only improve further, and must stay legal.
+        let again = straighten::straighten(&board, &out.edit);
+        assert!(
+            count_bends(&again.new_tracks) <= count_bends(&out.edit.new_tracks),
+            "seed {seed}: second pass added bends"
+        );
+        let second = RouteOutcome { edit: again, ..out.clone() };
+        assert_clean_and_complete(&board, &second, false);
+        // Pad ends stay on their entry axes and every segment stays octilinear.
+        for pid in board.pad_ids() {
+            let c = board.pad_position(pid);
+            let dirs = access::entry_dirs(&board, pid);
+            for t in out.edit.new_tracks.iter().filter(|t| t.start == c || t.end == c) {
+                let o = if t.start == c { t.end } else { t.start } - c;
+                assert!(dirs.contains(&(o.x.signum(), o.y.signum())), "seed {seed}: {o:?}");
+            }
+        }
+        assert!(out.edit.new_tracks.iter().all(|t| (t.end - t.start).is_octilinear()));
+    }
+}
+
+#[test]
+fn off_lattice_pads_get_a_single_straight_run() {
+    // Pad rows that match no lattice row: the lattice route needs a break-out dog-leg, the
+    // straightened one leaves each pad straight and turns at most twice.
+    let mut b = BoardBuilder::new(mm(30), mm(20), 2);
+    let n = b.net("N");
+    b.smd2("R1", ferroute_geom::Point::new(4_200_000, 5_130_000), 180.0, n, NetId::NONE);
+    b.smd2("R2", ferroute_geom::Point::new(20_800_000, 7_730_000), 0.0, n, NetId::NONE);
+    let board = b.build();
+    let out = route(&board, &exact_cfg()).expect("route");
+    assert_clean_and_complete(&board, &out, true);
+    assert!(
+        count_bends(&out.edit.new_tracks) <= 2,
+        "{} bends: {:#?}",
+        count_bends(&out.edit.new_tracks),
+        out.edit.new_tracks
+    );
+}

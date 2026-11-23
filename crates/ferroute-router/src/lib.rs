@@ -24,6 +24,7 @@ pub mod negotiate;
 pub mod plan;
 pub mod search;
 pub mod smooth;
+pub mod straighten;
 pub mod tune;
 
 use access::{Stub, Terminal, pad_terminals};
@@ -394,8 +395,9 @@ pub fn route(board: &Board, cfg: &RouterConfig) -> Result<RouteOutcome, RouteErr
             }
         }
     }
+    // Gridless clean-up of the emitted copper (guarded by the oracle inside).
+    let edit = straighten::straighten(original, &assemble(&per_net, &links));
     let gate_ms = t2.elapsed().as_secs_f64() * 1e3;
-    let edit = assemble(&per_net, &links);
     failed.extend(per_net.iter().filter(|e| !e.3).map(|e| e.0));
     failed.sort_unstable();
     failed.dedup();
