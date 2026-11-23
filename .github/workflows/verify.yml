@@ -188,11 +188,22 @@ jobs:
           name: ferroute-linux-x86_64-musl
           path: bin
       - name: Install KiCad nightly
+        id: install
+        # The Launchpad PPA is often slow or unavailable: retry with short timeouts, pull only
+        # the core package (no footprint/3D libraries), and skip the lane with a warning
+        # rather than fail when it stays unavailable.
         run: |
-          sudo add-apt-repository -y ppa:kicad/kicad-dev-nightly
-          sudo apt-get update
-          sudo apt-get install -y kicad-nightly xvfb
+          APT=(-o Acquire::Retries=5 -o Acquire::http::Timeout=30 -o Acquire::https::Timeout=30)
+          if sudo add-apt-repository -y ppa:kicad/kicad-dev-nightly \
+            && sudo apt-get "${APT[@]}" update \
+            && sudo apt-get "${APT[@]}" install -y --no-install-recommends kicad-nightly xvfb; then
+            echo "ok=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "::warning::KiCad nightly PPA unavailable; skipping the KiCad 11 preview lane"
+            echo "ok=false" >> "$GITHUB_OUTPUT"
+          fi
       - name: Probe KiCad 11 API + DRC
+        if: steps.install.outputs.ok == 'true'
         shell: bash
         run: |
           set -uo pipefail
