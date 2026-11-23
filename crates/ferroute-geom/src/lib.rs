@@ -18,6 +18,7 @@
 //! Floating point is used only for *reporting* (e.g. [`Hull::distance`]) and for
 //! cost heuristics, never for legality decisions.
 
+pub mod arc;
 pub mod detmath;
 pub mod rng;
 pub mod units;

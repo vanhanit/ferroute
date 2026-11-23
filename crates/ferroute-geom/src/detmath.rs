@@ -109,9 +109,78 @@ pub fn hypot(dx: f64, dy: f64) -> f64 {
     (dx * dx + dy * dy).sqrt()
 }
 
+/// `atan(x)` with only IEEE `+ − × ÷ sqrt`: reflect to `[0, 1]`, halve the angle three
+/// times (`atan x = 2·atan(x / (1 + √(1 + x²)))`), then a 13-term odd Taylor series.
+#[must_use]
+pub fn atan(x: f64) -> f64 {
+    use std::f64::consts::FRAC_PI_2;
+    if x.is_nan() {
+        return x;
+    }
+    if x < 0.0 {
+        return -atan(-x);
+    }
+    if x > 1.0 {
+        return FRAC_PI_2 - atan(1.0 / x);
+    }
+    let mut t = x;
+    for _ in 0..3 {
+        t /= 1.0 + (1.0 + t * t).sqrt();
+    }
+    let t2 = t * t;
+    let mut sum = 0.0;
+    for k in (0..13).rev() {
+        let sign = if k % 2 == 0 { 1.0 } else { -1.0 };
+        sum = sum * t2 + sign / f64::from(2 * k + 1);
+    }
+    8.0 * t * sum
+}
+
+/// `atan2(y, x)` in `(−π, π]` built on [`atan`] (IEEE-only).
+#[must_use]
+pub fn atan2(y: f64, x: f64) -> f64 {
+    use std::f64::consts::{FRAC_PI_2, PI};
+    if x > 0.0 {
+        atan(y / x)
+    } else if x < 0.0 {
+        if y >= 0.0 { atan(y / x) + PI } else { atan(y / x) - PI }
+    } else if y > 0.0 {
+        FRAC_PI_2
+    } else if y < 0.0 {
+        -FRAC_PI_2
+    } else {
+        0.0
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn atan_family_matches_std() {
+        let mut x = -40.0;
+        while x <= 40.0 {
+            assert!((atan(x) - x.atan()).abs() < 4e-16 * 8.0, "atan({x})");
+            x += 0.0137;
+        }
+        for &(y, x) in &[
+            (1.0, 1.0),
+            (1.0, -1.0),
+            (-1.0, -1.0),
+            (-1.0, 1.0),
+            (0.0, -1.0),
+            (3.0, 0.0),
+            (-3.0, 0.0),
+            (0.0, 0.0),
+            (1e-9, 1e9),
+            (5.5, -0.25),
+        ] {
+            assert!((atan2(y, x) - f64::atan2(y, x)).abs() < 4e-15, "atan2({y}, {x})");
+        }
+        assert!(atan(f64::NAN).is_nan());
+        assert_eq!(atan(f64::INFINITY), std::f64::consts::FRAC_PI_2);
+    }
 
     #[test]
     fn ln_matches_std_and_inverts_exp() {
