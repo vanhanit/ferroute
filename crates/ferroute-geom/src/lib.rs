@@ -25,7 +25,7 @@ pub mod units;
 use serde::{Deserialize, Serialize};
 use smallvec::SmallVec;
 use std::cmp::Ordering;
-use std::ops::{Add, Neg, Sub};
+use std::ops::{Add, Mul, Neg, Sub};
 
 /// A coordinate in nanometres.
 pub type Coord = i64;
@@ -134,6 +134,14 @@ impl Sub for Point {
     type Output = Self;
     fn sub(self, o: Self) -> Self {
         Self::new(self.x - o.x, self.y - o.y)
+    }
+}
+
+/// Scales a vector by an integer factor (exact).
+impl Mul<Coord> for Point {
+    type Output = Self;
+    fn mul(self, k: Coord) -> Self {
+        Self::new(self.x * k, self.y * k)
     }
 }
 

@@ -201,3 +201,9 @@ fn octilinear_vectors_and_their_direction() {
     assert_eq!(Dir8::from_vector(p(3, 2)), None);
     assert_eq!(Dir8::from_vector(p(0, 0)), None);
 }
+
+#[test]
+fn point_scales_exactly() {
+    assert_eq!(Point::new(3, -4) * 5, Point::new(15, -20));
+    assert_eq!(Point::new(2, 7) * -1, -Point::new(2, 7));
+}
