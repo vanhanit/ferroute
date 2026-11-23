@@ -4,7 +4,7 @@
 //! and via-count limits. Unmet constraints are *reported*, never hidden.
 
 use ferroute_board::constraints::{MatchBy, match_groups, net_delays_fs, required_width};
-use ferroute_board::{Board, NetId};
+use ferroute_board::{Board, NetId, Origin};
 use ferroute_geom::Coord;
 use ferroute_geom::units::format_mm;
 use serde::{Deserialize, Serialize};
@@ -123,12 +123,14 @@ pub fn check_constraints(board: &Board) -> Vec<ConstraintIssue> {
         let id = NetId(u32::try_from(i).unwrap_or(u32::MAX));
         let c = &net.constraints;
         let need = required_width(board, id);
+        // INV-RULE-1 governs copper ferroute creates; the designer's own tracks are theirs.
+        let routed = Origin::Routed;
         let narrowest = board
             .tracks
             .iter()
-            .filter(|t| t.net == id)
+            .filter(|t| t.net == id && t.origin == routed)
             .map(|t| t.width)
-            .chain(board.arcs.iter().filter(|a| a.net == id).map(|a| a.width))
+            .chain(board.arcs.iter().filter(|a| a.net == id && a.origin == routed).map(|a| a.width))
             .min();
         if let Some(w) = narrowest.filter(|&w| w < need) {
             out.push(ConstraintIssue {
@@ -176,9 +178,9 @@ pub fn check_constraints(board: &Board) -> Vec<ConstraintIssue> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use ferroute_board::Via;
     use ferroute_board::builder::{BoardBuilder, mm, pt10};
     use ferroute_board::constraints::MatchGroup;
-    use ferroute_board::{Origin, Via};
 
     fn two_nets() -> (ferroute_board::Board, ferroute_board::NetId, ferroute_board::NetId) {
         let mut b = BoardBuilder::new(mm(40), mm(30), 2);
@@ -188,6 +190,17 @@ mod tests {
         b.track(pt10(10, 20), pt10(130, 20), 250_000, 0, c, Origin::Routed); // 12 mm
         let board = b.build();
         (board, a, c)
+    }
+
+    #[test]
+    fn only_routed_copper_can_violate_the_width_rule() {
+        let mut b = BoardBuilder::new(mm(40), mm(30), 2);
+        let n = b.net("SIG");
+        b.track(pt10(10, 10), pt10(110, 10), 200_000, 0, n, Origin::Existing);
+        let mut board = b.build();
+        assert!(check_constraints(&board).is_empty(), "designer's 0.2 mm track is not ours");
+        board.tracks[0].origin = Origin::Routed;
+        assert!(matches!(check_constraints(&board)[0].kind, IssueKind::Width { .. }));
     }
 
     #[test]
