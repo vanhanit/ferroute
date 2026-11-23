@@ -16,7 +16,7 @@
         "moved_footprints": 9,
         "displacement_mm": 15.06796220338052,
         "constraint_issues": 0,
-        "runtime_ms": 200.0
+        "runtime_ms": 100.0
       }
     },
     {
@@ -106,7 +106,7 @@
         "moved_footprints": 0,
         "displacement_mm": 0.0,
         "constraint_issues": 0,
-        "runtime_ms": 200.0
+        "runtime_ms": 300.0
       }
     },
     {
@@ -124,7 +124,43 @@
         "moved_footprints": 6,
         "displacement_mm": 11.921978840013155,
         "constraint_issues": 0,
+        "runtime_ms": 200.0
+      }
+    },
+    {
+      "board": "demo_dru-fixed",
+      "seed": 1,
+      "metrics": {
+        "drc_clean": true,
+        "introduced_violations": 0,
+        "total_violations": 0,
+        "completion": 1.0,
+        "connections_total": 18,
+        "connections_missing": 0,
+        "wirelength_mm": 354.8303359582473,
+        "vias": 7,
+        "moved_footprints": 0,
+        "displacement_mm": 0.0,
+        "constraint_issues": 0,
         "runtime_ms": 300.0
+      }
+    },
+    {
+      "board": "demo_dru",
+      "seed": 1,
+      "metrics": {
+        "drc_clean": true,
+        "introduced_violations": 0,
+        "total_violations": 0,
+        "completion": 1.0,
+        "connections_total": 18,
+        "connections_missing": 0,
+        "wirelength_mm": 318.7713965913627,
+        "vias": 6,
+        "moved_footprints": 6,
+        "displacement_mm": 11.921978840013155,
+        "constraint_issues": 0,
+        "runtime_ms": 200.0
       }
     },
     {
