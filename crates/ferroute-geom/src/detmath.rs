@@ -55,6 +55,54 @@ pub fn exp(x: f64) -> f64 {
     v
 }
 
+/// Natural logarithm for `x > 0` (`-∞` at 0, NaN below), IEEE-only: `x = m·2^k` with
+/// `m ∈ [√½, √2)` taken from the bit pattern, then `ln m = 2·atanh(s)`, `s = (m−1)/(m+1)`,
+/// summed to 24 odd terms (|s| ≤ 0.172, so the tail is far below f64 precision).
+#[must_use]
+pub fn ln(x: f64) -> f64 {
+    if x.is_nan() || x < 0.0 {
+        return f64::NAN;
+    }
+    if x == 0.0 {
+        return f64::NEG_INFINITY;
+    }
+    if x.is_infinite() {
+        return x;
+    }
+    // Normalise subnormals first.
+    let (mut x, mut k) = (x, 0i32);
+    if x < f64::MIN_POSITIVE {
+        x *= 2f64.powi(64);
+        k -= 64;
+    }
+    let bits = x.to_bits();
+    #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
+    let e = ((bits >> 52) & 0x7ff) as i32 - 1023;
+    let mut m = f64::from_bits((bits & !(0x7ff << 52)) | (1023u64 << 52)); // m ∈ [1, 2)
+    k += e;
+    if m > std::f64::consts::SQRT_2 {
+        m /= 2.0;
+        k += 1;
+    }
+    let s = (m - 1.0) / (m + 1.0);
+    let s2 = s * s;
+    let mut term = s;
+    let mut sum = 0.0;
+    let mut n = 1.0;
+    for _ in 0..24 {
+        sum += term / n;
+        term *= s2;
+        n += 2.0;
+    }
+    f64::from(k) * std::f64::consts::LN_2 + 2.0 * sum
+}
+
+/// `x^y` for `x > 0` via [`exp`]/[`ln`] (IEEE-only).
+#[must_use]
+pub fn pow(x: f64, y: f64) -> f64 {
+    exp(y * ln(x))
+}
+
 /// `sqrt(dx² + dy²)` with only correctly-rounded IEEE operations.
 #[must_use]
 pub fn hypot(dx: f64, dy: f64) -> f64 {
@@ -64,6 +112,22 @@ pub fn hypot(dx: f64, dy: f64) -> f64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn ln_matches_std_and_inverts_exp() {
+        for &x in &[1e-9, 0.001, 0.5, 1.0, 2.0, std::f64::consts::E, 10.0, 7.565, 1e6, 1e12] {
+            let (a, b) = (ln(x), x.ln());
+            assert!((a - b).abs() <= 1e-13 * b.abs().max(1.0), "x={x} {a} vs {b}");
+            assert!((exp(ln(x)) - x).abs() <= 1e-12 * x, "x={x}");
+        }
+        assert!(ln(0.0).is_infinite() && ln(-1.0).is_nan());
+    }
+
+    #[test]
+    fn pow_matches_std() {
+        assert!((pow(7.565, 1.0 / 0.725) - 7.565f64.powf(1.0 / 0.725)).abs() < 1e-11);
+        assert!((pow(10.0, 0.44) - 10f64.powf(0.44)).abs() < 1e-12);
+    }
 
     #[test]
     fn exp_matches_std_closely() {
