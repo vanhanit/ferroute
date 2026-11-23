@@ -11,7 +11,7 @@
         "completion": 1.0,
         "connections_total": 20,
         "connections_missing": 0,
-        "wirelength_mm": 164.04850931962048,
+        "wirelength_mm": 163.36064135397646,
         "vias": 3,
         "moved_footprints": 9,
         "displacement_mm": 15.06796220338052,
@@ -29,7 +29,7 @@
         "completion": 1.0,
         "connections_total": 43,
         "connections_missing": 0,
-        "wirelength_mm": 343.3576809136278,
+        "wirelength_mm": 342.2103869000503,
         "vias": 16,
         "moved_footprints": 22,
         "displacement_mm": 41.728505252050056,
@@ -47,7 +47,7 @@
         "completion": 1.0,
         "connections_total": 50,
         "connections_missing": 0,
-        "wirelength_mm": 413.1676809136279,
+        "wirelength_mm": 412.2723416365685,
         "vias": 15,
         "moved_footprints": 30,
         "displacement_mm": 51.83156486704026,
@@ -65,7 +65,7 @@
         "completion": 1.0,
         "connections_total": 10,
         "connections_missing": 0,
-        "wirelength_mm": 195.49940828143397,
+        "wirelength_mm": 195.9680374315355,
         "vias": 3,
         "moved_footprints": 0,
         "displacement_mm": 0.0,
@@ -83,7 +83,7 @@
         "completion": 1.0,
         "connections_total": 10,
         "connections_missing": 0,
-        "wirelength_mm": 184.01538807889838,
+        "wirelength_mm": 184.17632170278293,
         "vias": 3,
         "moved_footprints": 5,
         "displacement_mm": 9.881737861543039,
@@ -101,12 +101,12 @@
         "completion": 1.0,
         "connections_total": 18,
         "connections_missing": 0,
-        "wirelength_mm": 334.9732136407127,
-        "vias": 10,
+        "wirelength_mm": 339.6294387911213,
+        "vias": 8,
         "moved_footprints": 0,
         "displacement_mm": 0.0,
         "constraint_issues": 0,
-        "runtime_ms": 300.0
+        "runtime_ms": 200.0
       }
     },
     {
@@ -119,12 +119,12 @@
         "completion": 1.0,
         "connections_total": 18,
         "connections_missing": 0,
-        "wirelength_mm": 320.1522457902213,
-        "vias": 9,
+        "wirelength_mm": 323.98221515298934,
+        "vias": 7,
         "moved_footprints": 6,
         "displacement_mm": 11.921978840013155,
         "constraint_issues": 0,
-        "runtime_ms": 200.0
+        "runtime_ms": 300.0
       }
     },
     {
