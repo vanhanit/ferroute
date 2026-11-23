@@ -36,8 +36,8 @@ written in Rust. Priorities, in order:
 | Path | What |
 |---|---|
 | `crates/ferroute-geom` | i64-nanometre geometry, **exact** i128 predicates, `units` (exact mm↔nm), `rng` (frozen xoshiro256\*\*), `detmath` (IEEE-only exp/hypot) |
-| `crates/ferroute-board` | Board model (`Board`, `BoardEdit`, `Mobility`, rules), `builder` for tests/synthetic boards |
-| `crates/ferroute-drc` | DRC oracle: clearance/short, edge, holes, keep-outs, courtyards, sizes, connectivity |
+| `crates/ferroute-board` | Board model (`Board`, `BoardEdit`, `Mobility`, rules), `constraints` (per-net electrical rules → widths), `netrules` (rules file), `text::glob`, `builder` for tests/synthetic boards |
+| `crates/ferroute-drc` | DRC oracle: clearance/short, edge, holes, keep-outs, courtyards, sizes, connectivity; `quality` (acid traps), `rules` (width/length/skew/via constraints) |
 | `crates/ferroute-router` | Lattice PathFinder: `legality`, `plan` (separation theorem), `access`, `search` (A\*), `negotiate`, `emit` |
 | `crates/ferroute-place` | Movability policy + multi-start annealing nudger |
 | `crates/ferroute-engine` | Pipeline (nudge → route → LNS → gate), `synth` boards, `score` baselines, criterion bench |
@@ -47,6 +47,7 @@ written in Rust. Priorities, in order:
 | `crates/ferroute-render` | Deterministic SVG renderer (visual diffs) |
 | `crates/ferroute-cli` | `ferroute` binary: `route`, `drc`, `render`, `gen`, `bench`, `ipc {probe,route,export-svg}`, `info` |
 | `testdata/boards` | KiCad 10 and KiCad 9 fixtures (+ `.kicad_pro`) |
+| `testdata/rules` | Per-net electrical rules for fixtures (`<board>.toml`, used by e2e/CI with `--strict-rules`) |
 | `bench/baseline.json` | Committed benchmark baseline (regression gate) |
 | `docs/` | RFC, images |
 
@@ -83,11 +84,75 @@ Update the benchmark baseline only on purpose:
 - [ ] **INV-PLACE-1** locked/fixed parts never move; nudged parts satisfy every hard constraint.
 - [ ] **INV-PLACE-3** translated footprints land on the absolute placement grid (`PlaceConfig::grid`, `--move-grid`).
 - [ ] **INV-ROUTE-2** every routed connection ends exactly at the pad centre, crosses the pad edge on an axis through the centre (side midpoint for rectangular pads, any 0/45/90° line for circular pads), and every segment is 0°/45°/90°.
+- [ ] **INV-ROUTE-3** no acid traps: same-net copper never meets at < 90° outside pad/via copper (`ferroute_drc::quality::acute_angles` is empty), and no overlapping same-net copper.
+- [ ] **INV-RULE-1** traces are never narrower than their net's rule width (net class, current-derived or impedance-derived, whichever is widest); per-net clearance, via size and via limits are always honoured.
 - [ ] **INV-CONN-1** connectivity never decreases.
 - [ ] **INV-COST-1** PathFinder costs non-negative; present factor and history monotone.
 - [ ] **INV-ACCEL-1** accelerators never change results (legality tables equal with/without).
 - [ ] **INV-DET-1/2/3** parallel == sequential; PRNG stream frozen; no host-libm transcendental in decisions (use `ferroute_geom::detmath`).
 - [ ] **INV-IO-1** KiCad writer touches only edited nodes; same input ⇒ byte-identical output.
+
+## Routing quality standard ("as if a professional spent hours on it")
+
+Completion and DRC come first; within that, every result must look hand-tuned:
+
+* **Straight traces, 0°/45°/90° only.** Prefer long straight runs; avoid stair-steps and
+  small kinks (outward break-out legs shorter than one lattice pitch are penalised and
+  used only where space forces them).
+* **Pads:** enter and leave along an axis through the pad centre — perpendicular to a side
+  through its midpoint for rectangular/oval pads, any 0/45/90° line for circular pads,
+  vias and holes — and end exactly at the centre. Only this final approach may leave the
+  lattice. Nearby same-net pads facing each other get one straight direct link.
+* **Vias** sit in line with straight traces (no bend right at a via); minimise via count.
+* **No acid traps** (acute same-net junctions) and no overlapping copper — branches leave
+  existing copper at ≥ 90°.
+* **Never narrow a trace** or change any per-net rule ad hoc. Widths/clearances/vias come
+  from the net's rules only.
+* **Electrical best practice:** honour per-net constraints — maximum current (derive the
+  minimum width, IPC-2152), frequency / high-speed (fewer vias, 45° not 90° bends, short
+  stubs, continuous reference plane), controlled impedance (width from the stack-up),
+  length limits and length/skew matching groups (diff pairs: equal length, constant gap,
+  symmetric routing), maximum via count. Where a rule cannot be met, report it — never
+  silently violate it.
+* Lock semantics: locked footprints never move; nudged parts land on the placement grid.
+
+## Engineering practices (mandatory)
+
+* **Test first.** For every feature or bug fix write the failing unit/property test
+  first (red), implement the minimum to pass (green), then refactor. Bugs found by
+  property tests keep their seed in the committed `proptest-regressions/` files.
+* **Coverage:** aim for ≥ 85 % line coverage per crate (`make coverage`,
+  `cargo llvm-cov --workspace --summary-only`); every public function and every
+  invariant has a behaviour-focused test. Stress the router proptests before pushing
+  router changes: `FERROUTE_PROP_CASES=1000 cargo test -p ferroute-router --release routing_never`.
+* **Dependency injection:** inject I/O sinks (`&mut dyn Write`), transports (`Transport`),
+  accelerators (`ClearanceBackend`), seeds/RNGs and environment lookups instead of
+  reaching for globals, stdout, the filesystem or the clock inside logic. Keep side
+  effects at the edges (CLI `main`, transports).
+* **DRY & cohesion:** shared math lives in `ferroute-geom` (e.g. `Dir8::from_vector`,
+  `Point::is_octilinear`), board semantics in `ferroute-board`; never copy a helper —
+  move it to the right crate. Keep related code together (one module per concept, e.g.
+  `router::junction`, `router::direct`).
+* **Separation of concerns:** geometry facts (e.g. a stub's shape) are computed where the
+  geometry lives (`router::access`); cost policy lives in `router::search`; negotiation
+  orchestrates. Domain crates never depend on transports.
+* Small, pure, deterministic functions; explicit types over tuples (clippy
+  `type_complexity` is an error); no hidden global state.
+* **Verify before pushing:** `cargo fmt --all -- --check`, clippy `-D warnings`, the
+  workspace tests, `ferroute bench --suite ci --baseline bench/baseline.json` (fixtures run
+  in nudging *and* fixed-placement mode), and KiCad 10 DRC on routed fixtures
+  (`make e2e kicad10-drc`). Never claim CI is green without reading the check results.
+
+## Release & build policy
+
+* Only `feat`, `fix`, `perf` (or breaking) commits cut a release (SemVer via
+  `scripts/bump_version.sh` + git-cliff). `docs`, `ci`, `test`, `build`, `chore`,
+  `refactor`, `style` never version anything, and pushes that only touch docs, Markdown
+  or CI files do not run the release workflow at all.
+* **Cross-compile in a Linux container:** all release binaries are built by
+  `scripts/dist.sh` inside the Docker `cross` stage (`make dist`, cargo-zigbuild; Windows
+  via the GNU target). Native macOS/Windows runners are used only to *run* tests. Locally,
+  check other targets with `cargo check --workspace --lib --bins --target <triple>`.
 
 ## Conventions
 
@@ -105,7 +170,7 @@ Update the benchmark baseline only on purpose:
 |---|---|---|---|
 | 1 | Gridless post-optimiser: any-angle shortcutting (Theta\*-style) + 45° smoothing, verified by oracle | Lead | M2 |
 | 2 | Per-layer preferred directions + via minimisation pass | Lead | M2 |
-| 3 | Differential pairs (Dubins-aware) and length matching | Lead | M2 |
+| 3 | Differential pairs (Dubins-aware) and length *tuning* (serpentines) so `match_group`/`skew_max`/`length_min` rules are met, not only reported | Lead | M2; rules model + checks exist (`board::constraints`, `drc::rules`) |
 | 4 | Region-window LNS (rip-up + nudge around failures) | Lead | M2 |
 | 5 | Specctra DSN/SES import/export (Freerouting comparisons) | Worker | contract: `Board` ↔ DSN |
 | 6 | Native IPC commits (`BeginCommit`/`CreateItems`/`EndCommit`) for live mode | Worker | needs KiCad 10 GUI test rig |
@@ -113,6 +178,9 @@ Update the benchmark baseline only on purpose:
 | 8 | Dense BGA / 4–8-layer benchmark suites | Worker | extend `synth` |
 | 9 | Proto drift check against upstream KiCad `api/proto` in nightly lane | Worker | |
 | 10 | Copper pour awareness, blind/buried/micro vias | Lead | M4 |
+| 11 | Stack-up from `.kicad_pcb` `(setup (stackup …))` → `Board::stackup` (today: defaults or `--rules [stackup]`) | Worker | contract: `ferroute_board::constraints::Stackup` |
+| 12 | Fine-pitch escape: congestion-aware pin-access ordering for QFN/QFP/BGA | Lead | M2 |
+| 13 | Coverage ≥ 85 % per crate: CLI output via injected `&mut dyn Write`, ipc/render/kicad gaps | Worker | `make coverage` |
 
 ## Environment notes for cloud sessions
 
@@ -120,3 +188,7 @@ Update the benchmark baseline only on purpose:
   npm, PyPI, Docker Hub (rate-limited) and gitlab.com usually work. KiCad sources/protos:
   `https://gitlab.com/api/v4/projects/kicad%2Fcode%2Fkicad/repository/files/<path>/raw?ref=10.0`.
 * The KiCad 10 container `kicad/kicad:10.0.8` provides `kicad-cli` for DRC/export checks.
+* KiCad 10 live mode is a *file bridge* (save → route → reload): it loses undo history and
+  GUI edits made during routing. Keep the warning (`FILE_BRIDGE_WARNING`) until task #6 lands.
+* Toolchain pins must agree (`scripts/check_toolchain.sh`): bump `rust-toolchain.toml`, the
+  Dockerfile `FROM rust:` tag (with digest) and `rust-version` together.

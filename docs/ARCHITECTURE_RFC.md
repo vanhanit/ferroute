@@ -179,6 +179,10 @@ seeds replay across dependency upgrades and platforms.
   hole-to-hole), board edge (edge clearance, containment), keep-outs (containment and
   boundary contact). Policy: no via-in-pad.
 * Optional accelerator field (§6) prunes sites provably far from all obstacles.
+* **Lattice choice** (`choose_lattice`): the origin is aligned *per axis* so the most pad
+  centres share a lattice row/column, which gives straight on-axis approaches. The pitch
+  is then grown automatically (+15 % in 0.05 mm steps) whenever that removes break-out
+  kinks without losing completion. The pitch never drops below `w₀ + c₀`.
 
 ### 4.2 Pin access — on-axis pad entry, ending at the pad centre
 Every connection ends exactly at the pad centre and crosses the pad edge on an axis
@@ -198,7 +202,14 @@ through the centre:
   negotiated like any other resource (present cost, history, rip-up).
 * **No pad crossing:** lattice nodes inside pad copper are blocked, so routes never cut
   across a pad.
-* The lattice origin is still aligned so the most pad centres sit on lattice nodes.
+* **No small kinks:** a break-out whose outward leg is shorter than one pitch pays a
+  `kink` penalty. The penalty is divided by `pres_fac`, so it shapes the first,
+  uncongested iterations and gives way when space really forces a short leg. A\*
+  endpoints carry their arrival heading, so turns into and out of a stub (and at vias:
+  `via_turn`) are priced like any other bend. Vias therefore sit in line with straight
+  runs.
+* **Direct links:** nearby same-net pads (≤ 2.54 mm) whose entry axes face each other get
+  one straight centre-to-centre track when it is exactly legal. The lattice is not used.
 
 ### 4.3 Negotiated congestion (PathFinder)
 * Nets are ordered by terminal HPWL (seeded SplitMix64 tie-break).
@@ -219,6 +230,16 @@ lattice connection (one 45° run + one 0°/90° run) when that connection is leg
 strictly cheaper (length + bend penalties). Endpoints, Steiner junctions and via sites
 stay pinned. The smoothed route is re-reserved and kept only if it creates no conflict,
 so INV-ROUTE-1 is preserved and every vertex stays on the lattice.
+
+### 4.3c Junctions without acid traps (INV-ROUTE-3)
+Same-net copper may only meet at ≥ 90° outside pad/via copper. For a Steiner attach
+point, `router::junction` computes the directions of the copper already incident there
+(`incident`). From that it derives the departures that would form an acute angle or run
+back over existing copper (`forbidden_departures`). The search's start endpoints carry
+that mask. Smoothing and stub selection reject candidates for which `has_acute_or_overlap`
+holds. A net's own *used* stubs become dynamic keep-outs for the rest of its tree, so a
+route never runs back along its own break-out. The oracle check
+`ferroute_drc::quality::acute_angles` must be empty on every proptest board.
 
 ### 4.4 Deterministic parallelism
 Consecutive nets (in priority order) whose *footprint regions* — search window ∪ old route,
@@ -245,6 +266,26 @@ Lattice paths become straight track runs (merged collinear steps), through vias 
 The edit is applied to a copy of the board and the full DRC oracle runs; any net involved
 in an introduced violation would be removed (`drc_gate_rips`, expected 0 and asserted 0
 in property tests over thousands of random boards).
+
+### 4.7 Electrical rules (INV-RULE-1)
+Per-net constraints (`ferroute_board::constraints::NetConstraints`) are stored in exact
+integer units (mA, Hz, mΩ, nm). They come from a TOML rules file (`--rules`, net/class
+globs, applied in order, unknown keys rejected). The values are converted once, at that
+edge.
+
+* **Width:** the required width is the widest of the net-class width, the IPC-2221
+  current width (`I = k·ΔT^0.44·A^0.725`, internal-layer `k` on multilayer boards) and the
+  IPC-2141 microstrip width for a target impedance over the stack-up. It is rounded *up*
+  to 10 µm, computed only with `detmath` (IEEE-portable `exp/ln/pow`). `resolve` moves a
+  wider-than-class net into a derived class before routing. Traces are never narrowed.
+* **Cost policy (router::search::net_costs):** high-speed nets (≥ 50 MHz or
+  impedance-controlled) pay vias ×3, 90° bends ×4 (two 45° bends are cheaper) and
+  via-turns ×2. Via-limited nets pay `1 + 4/(1 + max_vias)` more per via.
+* **Checks (ferroute_drc::rules):** width vs. requirement, routed length window,
+  length-matching skew within a group, and via count. Unmet rules are reported in the
+  CLI/JSON report and fail with `--strict-rules`. They are never hidden.
+* Next (M2): length tuning (serpentines) and differential pairs, so matching rules are
+  *met*, not only checked.
 
 ---
 
@@ -335,8 +376,10 @@ decides. Therefore results are bit-identical with and without acceleration.
   and `RunBoardJobExportSvg`; `AS_UNHANDLED`/`AS_UNIMPLEMENTED` ⇒ absent). Version alone
   is never trusted.
 * **KiCad 10 live mode (v0.1):** "file bridge" — `SaveDocument` → route file →
-  `RevertDocument` (reload). **M3:** native `BeginCommit` / `CreateItems` / `EndCommit` so
-  the result is a single undoable commit.
+  `RevertDocument` (reload). **Caveat:** the reload discards KiCad's undo history and any
+  edit made in the GUI while routing runs. `ferroute ipc route` prints this warning every
+  time, and the in-place write keeps a `*.ferroute-bak` backup. **M3:** native
+  `BeginCommit` / `CreateItems` / `EndCommit` so the result is a single undoable commit.
 * **KiCad 11 mode:** headless server for CI; IPC SVG/Gerber export for visual diffs.
 * **Batch / CI:** `.kicad_pcb` in, `.kicad_pcb` out, `kicad-cli pcb drc` as external
   oracle; Specctra DSN/SES interop planned (M3) for Freerouting comparisons.
@@ -362,6 +405,19 @@ v0.1 baseline (2-/4-layer synthetic boards up to 55×40 mm, plus fixtures): 100 
 completion and zero violations on every board; 3–210 ms per board on one CI-class core
 set. These boards are deliberately modest; the M2/M3 milestones add dense BGA and
 4–8-layer stress suites.
+
+### 8.1 Release & build policy
+* Releases are cut from `main` by git-cliff only for `feat`, `fix` and `perf` (or
+  breaking) commits. `scripts/bump_version.sh` updates the workspace and internal
+  dependency versions. Pushes that touch only docs, Markdown or CI files skip the release
+  workflow (`paths-ignore`).
+* Every release binary is cross-compiled in one Linux container (Docker `cross` stage,
+  cargo-zigbuild + zig; Windows via the GNU target) by `scripts/dist.sh`, also available
+  as `make dist`. Native macOS/Windows runners only *run* tests.
+* `scripts/check_toolchain.sh` keeps `rust-toolchain.toml`, the Docker base image and the
+  workspace `rust-version` aligned. It runs in `make lint` and the CI `fmt` job.
+* The KiCad 10 lane routes fixtures with `testdata/rules/<board>.toml` (if present) under
+  `--strict-rules`.
 
 ---
 

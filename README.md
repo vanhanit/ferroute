@@ -74,6 +74,37 @@ ferroute ipc probe --socket ipc:///tmp/k/api.sock --json
 ferroute ipc export-svg --socket ipc:///tmp/k/api.sock --out plots/
 ```
 
+> **KiCad 10 file bridge:** `ipc route` saves the open board, routes the file and reloads
+> it. KiCad's undo history is lost, and any edit you make in KiCad while routing runs is
+> discarded. A `*.ferroute-bak` backup is written next to the board. Native undoable IPC
+> commits are planned (M3).
+
+### Per-net electrical rules
+
+```toml
+# rules.toml — ferroute route board.kicad_pcb -o out.kicad_pcb --rules rules.toml
+[stackup]
+copper_um = 35
+outer_dielectric_mm = 0.2
+epsilon_r = 4.3
+
+[[net]]                       # IPC-2221: width derived from current (never narrower than class)
+nets = ["VBUS", "+5V"]
+max_current_a = 2.0
+
+[[net]]                       # impedance → IPC-2141 width; high-speed cost policy
+nets = ["USB_D?"]
+frequency_mhz = 480
+impedance_ohm = 45
+match_group = "usb"
+skew_max_mm = 0.15
+max_vias = 2
+```
+
+Selectors are `nets` / `classes` globs. Later rules override only the fields they set.
+Rules that are not met are reported, and `--strict-rules` turns them into exit code 2.
+See [`testdata/rules/`](testdata/rules) and RFC §4.7.
+
 ### Command overview
 
 | Command | Purpose |
@@ -88,7 +119,8 @@ ferroute ipc export-svg --socket ipc:///tmp/k/api.sock --out plots/
 
 Useful `route` flags: `--allow-move`, `--movable 'R*,C*,J5'`, `--exclude 'C1*'`,
 `--max-move 2mm`, `--move-grid 0.1mm`, `--no-rotate`, `--pitch 0.4mm`, `--layers F.Cu,B.Cu`,
-`--accel auto|cpu|gpu|none`, `--iterations 50`, `--lns-rounds 2`, `--seed N`.
+`--accel auto|cpu|gpu|none`, `--iterations 50`, `--lns-rounds 2`, `--seed N`,
+`--rules rules.toml`, `--strict-rules`.
 
 ## Benchmarks (v0.1 baseline)
 
@@ -119,7 +151,9 @@ boards are modest; dense BGA and 4–8-layer suites are on the roadmap.
 
 v0.1 is a **vertical slice**: KiCad 10 files in/out, two- and multi-layer through-via
 routing, nudging, IPC probe/live bridge, KiCad 11 headless/export client, CI lanes.
-Not yet: differential pairs, length matching, BGA escape, blind/buried vias, copper-pour
+Per-net rules (current, impedance, frequency, length, skew, via count) widen traces and steer
+costs, and anything still unmet is reported. Not yet: differential pairs, length *tuning*,
+BGA escape, blind/buried vias, copper-pour
 awareness, gridless smoothing. See the roadmap in the RFC and the task board in
 [`CLAUDE.md`](CLAUDE.md).
 
