@@ -44,3 +44,4 @@ ferroute-gpu.workspace = true
 ferroute-engine.workspace = true
 
 [dev-dependencies]
+tempfile.workspace = true
