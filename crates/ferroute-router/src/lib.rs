@@ -28,6 +28,7 @@ pub mod search;
 pub mod smooth;
 pub mod straighten;
 pub mod tune;
+pub mod vias;
 
 use access::{Stub, Terminal, pad_terminals};
 use ferroute_board::{Board, BoardEdit, LayerSet, NetId, PadId};
@@ -83,6 +84,10 @@ pub struct RouterConfig {
     /// Maximum number of detour-driven re-ordering rounds after the first pass.
     #[serde(default = "default_order_rounds")]
     pub order_rounds: u32,
+    /// Vias may be relocated into the centre of a same-net SMD pad that fully contains
+    /// them (the pad is then connected directly). Off by default.
+    #[serde(default)]
+    pub via_in_pad: bool,
 }
 
 const fn default_order_rounds() -> u32 {
@@ -109,6 +114,7 @@ impl Default for RouterConfig {
             nets: None,
             first: Vec::new(),
             order_rounds: default_order_rounds(),
+            via_in_pad: false,
         }
     }
 }
@@ -131,6 +137,8 @@ pub struct RouteStats {
     pub near_pad_bends: usize,
     /// Same-net copper pairs closer than the clearance without touching (slivers).
     pub slivers: usize,
+    /// Vias at which traces jog (bend next to the via or a bent layer change).
+    pub via_jogs: usize,
     pub wirelength_nm: f64,
     pub negotiation: NegotiationStats,
     pub accel_backend: String,
@@ -456,19 +464,23 @@ pub fn route_once(board: &Board, cfg: &RouterConfig) -> Result<RouteOutcome, Rou
     }
     // Gridless clean-up of the emitted copper (guarded by the oracle inside).
     let edit = straighten::straighten(original, &assemble(&per_net, &links));
+    // Vias move onto the lines of their traces, then the traces are straightened again.
+    let edit = vias::relocate_vias(original, &edit, cfg.via_in_pad);
+    let edit = straighten::straighten(original, &edit);
     // No trace bends 90°: every right angle becomes two 45° bends where exactly legal.
     let edit = chamfer::chamfer(original, &edit);
     let gate_ms = t2.elapsed().as_secs_f64() * 1e3;
     failed.extend(per_net.iter().filter(|e| !e.3).map(|e| e.0));
     failed.sort_unstable();
     failed.dedup();
-    let (right_angle_bends, near_pad_bends, slivers) = {
+    let (right_angle_bends, near_pad_bends, slivers, via_jogs) = {
         let mut after = original.clone();
         after.apply(&edit);
         (
             ferroute_drc::quality::right_angles(&after).len(),
             ferroute_drc::quality::near_pad_bends(&after).len(),
             ferroute_drc::quality::slivers(&after).len(),
+            ferroute_drc::quality::via_jogs(&after).len(),
         )
     };
     let stats = RouteStats {
@@ -484,6 +496,7 @@ pub fn route_once(board: &Board, cfg: &RouterConfig) -> Result<RouteOutcome, Rou
         right_angle_bends,
         near_pad_bends,
         slivers,
+        via_jogs,
         wirelength_nm: edit.new_tracks.iter().map(|t| t.start.dist(t.end)).sum::<f64>() + 0.0,
         negotiation: nstats,
         accel_backend: accel_name,

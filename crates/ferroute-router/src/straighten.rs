@@ -49,7 +49,7 @@ pub(crate) fn covers(h: &Hull, p: Point) -> bool {
 }
 
 /// Is `q` strictly inside the segment `a`–`b` (collinear, not an endpoint)?
-fn on_interior(a: Point, b: Point, q: Point) -> bool {
+pub(crate) fn on_interior(a: Point, b: Point, q: Point) -> bool {
     q != a && q != b && orient(a, b, q) == 0 && Rect::new(a, b).contains(q)
 }
 
@@ -153,7 +153,7 @@ impl Dynamic {
         self.segs[id as usize].alive = false;
     }
 
-    fn query(&self, r: Rect, out: &mut Vec<u32>) {
+    pub(crate) fn query(&self, r: Rect, out: &mut Vec<u32>) {
         for cy in r.min.y.div_euclid(CELL)..=r.max.y.div_euclid(CELL) {
             for cx in r.min.x.div_euclid(CELL)..=r.max.x.div_euclid(CELL) {
                 for &id in self.cells.get(&(cx, cy)).into_iter().flatten() {
@@ -179,8 +179,8 @@ impl Dynamic {
 }
 
 pub(crate) struct Hole {
-    hull: Hull,
-    net: NetId,
+    pub(crate) hull: Hull,
+    pub(crate) net: NetId,
 }
 
 /// Static obstacles: everything of the board plus the edit's vias and arcs.
@@ -298,7 +298,7 @@ impl<'a> Statics<'a> {
         Self { base, items, boxes, grid, holes, hole_boxes, hole_grid, pads_at, reach }
     }
 
-    fn static_near(&self, a: Point, b: Point, margin: Coord) -> Vec<u32> {
+    pub(crate) fn static_near(&self, a: Point, b: Point, margin: Coord) -> Vec<u32> {
         let mut v = Vec::new();
         for r in pieces(a, b, margin) {
             v.extend(self.grid.query(r, &self.boxes));
@@ -469,8 +469,10 @@ impl<'a> Statics<'a> {
     ) -> bool {
         let n = ch.pts.len() - 1;
         let width = ch.template.width;
-        let (vi, vj) = (ch.pts[i], ch.pts[j]);
+        // The window ends are the candidate's ends (`vj` may differ from `ch.pts[j]` when
+        // the far end is a via being relocated).
         let last = cand.len() - 1;
+        let (vi, vj) = (cand[0], cand[last]);
         if cand.len() == 3 {
             let min2 = u128::try_from(4 * i128::from(width) * i128::from(width)).unwrap_or(0);
             if (cand[1] - cand[0]).norm2() < min2 || (cand[2] - cand[1]).norm2() < min2 {
@@ -607,6 +609,11 @@ impl<'a> Statics<'a> {
 
     /// Extracts every optimisable chain of the edit's tracks, in a deterministic order.
     pub(crate) fn chains(&self, tracks: &[Track]) -> Vec<Chain> {
+        self.chains_min(tracks, 2)
+    }
+
+    /// Like [`Self::chains`] but keeps chains of at least `min_segments` tracks.
+    pub(crate) fn chains_min(&self, tracks: &[Track], min_segments: usize) -> Vec<Chain> {
         let mut groups: BTreeMap<(u32, u8), Vec<usize>> = BTreeMap::new();
         for (k, t) in tracks.iter().enumerate() {
             if t.net != NetId::NONE && t.start != t.end {
@@ -683,7 +690,7 @@ impl<'a> Statics<'a> {
                         k = if inc2[0] == k { inc2[1] } else { inc2[0] };
                         cur = nxt;
                     };
-                    if !complete || orig.len() < 2 {
+                    if !complete || orig.len() < min_segments {
                         continue;
                     }
                     if pts[0] > pts[pts.len() - 1] {
