@@ -18,6 +18,10 @@ written in Rust. Priorities, in order:
 5. Clean KiCad integration via files and the IPC API. **Never use the SWIG `pcbnew`
    bindings.**
 
+**North star:** route a board as well as — or better than — an expert human, fast and
+provably correct. Every design or review decision is judged against "would an expert
+layout engineer accept this result without touching it?"
+
 ## Operating model (tiered sub-agents)
 
 * **Lead (Opus-class):** research synthesis, maths, core data structures, invariants, DRC,
@@ -130,7 +134,7 @@ Completion and DRC come first; within that, every result must look hand-tuned:
 * **Never narrow a trace** or change any per-net rule ad hoc. Widths/clearances/vias come
   from the net's rules only.
 * **Electrical best practice:** honour per-net constraints — maximum current (derive the
-  minimum width, IPC-2152), frequency / high-speed (fewer vias, 45° not 90° bends, short
+  minimum width; IPC-2221 today, IPC-2152 curve fits planned — task #20), frequency / high-speed (fewer vias, 45° not 90° bends, short
   stubs, continuous reference plane), controlled impedance (width from the stack-up),
   length limits and length/skew matching groups (diff pairs: equal length, constant gap,
   symmetric routing), maximum via count. Where a rule cannot be met, report it — never
@@ -201,6 +205,17 @@ Completion and DRC come first; within that, every result must look hand-tuned:
 | 10 | Copper pour awareness, blind/buried/micro vias | Lead | M4 |
 | 11 | Stack-up from `.kicad_pcb` `(setup (stackup …))` → `Board::stackup` (today: defaults or `--rules [stackup]`) | Worker | contract: `ferroute_board::constraints::Stackup` |
 | 12 | Fine-pitch escape: congestion-aware pin-access ordering for QFN/QFP/BGA | Lead | M2 |
+| 15 | `.kicad_dru` custom rules: parse the KiCad DRC rule language (clearance, track_width, via_diameter, hole_size, hole_clearance, edge_clearance, annular_width, diff_pair_gap, length, skew; NetClass/NetName/Type/layer conditions); unsupported conditions apply conservatively and are reported, never ignored | Worker | P1 — correctness gap |
+| 16 | Copper-pour awareness: read zones, keep other-net clearance to fills, prefer not to split reference planes for high-speed nets, thermal reliefs untouched | Lead + worker | P1 — correctness gap (zones are ignored today) |
+| 17 | MAPF-style local rip-up & re-route (Priority-Based Search / MAPF-LNS2 neighbourhoods: conflicting, detoured, same-region nets) replacing the simple detour-order pass | Lead + worker | P2 |
+| 18 | Via-in-pad opt-in: `--allow-via-in-pad` / `[routing] via_in_pad`; pin access via a via at an SMD pad centre; writer marks filled+capped (IPC-4761) if the KiCad 10 format supports it; CLI cost warning | Worker | after via relocation lands |
+| 19 | Delay-based matching: match propagation delay (microstrip vs stripline velocity from the stack-up, via barrel length) instead of physical length | Lead | P2, with #3 |
+| 20 | Electrical models: IPC-2152 current curve fits, Hammerstad–Jensen microstrip (+ solder mask), stripline offset, edge-coupled differential and coplanar impedance; validate against published tables | Lead | P2 |
+| 21 | Crosstalk rules: parallel-run-length limits and 3W spacing for sensitive/high-speed nets, reported and enforced by the router cost policy | Lead + worker | P3 |
+| 22 | Teardrops at pad/via joins (KiCad-compatible), DFM checks: annular ring, drill aspect ratio, solder-mask slivers | Worker | P3 |
+| 23 | Exact window optimisation: small congested regions solved exactly (ILP via HiGHS / `good_lp`, MIT) and spliced back under oracle verification | Lead | P3 |
+| 24 | Push-and-shove local moves (KiCad PNS-style walkaround/shove) as LNS operator | Lead + worker | P3 |
+| 25 | Next-generation core: topological (rubber-band) routing on an octilinear visibility/escape graph — topology first, then tight geometry; removes lattice artefacts at the source | Lead | M3 |
 | 14 | Routing-quality residuals: demo has ≤ 1 sliver and ≤ 1 right angle per mode (diagonal–diagonal corner next to a T junction near (108.5, 126.5) with nudging); ci-s2-medium has 3 right angles and ci-s4-medium 2 slivers, where chamfers are illegal and need a local re-route; near-pad bends > 0 on synth boards; tighten the `fixture_quality` bounds to 0 | Lead + worker | commits a8e4162/5244ce8 landed with swapped scopes (a8e4162 also holds the router chamfer, stub and straighten work) |
 | 13 | Coverage ≥ 85 % per crate: CLI output via injected `&mut dyn Write`, ipc/render/kicad gaps | Worker | `make coverage` |
 

@@ -442,7 +442,22 @@ set. These boards are deliberately modest; the M2/M3 milestones add dense BGA an
 | **M1 (this)** | Exact geometry + DRC oracle, lattice PathFinder with separation theorem, deterministic batches, nudger + LNS, KiCad 10 file I/O, IPC probe/live bridge, KiCad 11 headless/export client, accelerated fields, CI lanes, benchmarks |
 | **M2** | Gridless post-optimisation (Theta\*-style any-angle shortcutting, 45° smoothing, track hugging) verified by the oracle; per-layer preferred directions; diff pairs (Dubins-aware) and length matching; fine-pitch/BGA escape; region-based LNS windows |
 | **M3** | GPU A\* batches (GAMER-style sweeps) and multi-start routing rollouts; pattern-routing pre-pass (CUGR-style); native IPC commits; DSN/SES interop; parallel tempering / tabu in the nudger |
-| **M4** | ePlace-style electrostatic analytic nudging for large boards; congestion-driven inflation (RippleFPGA-style); copper pour awareness; blind/buried/micro vias |
+| **M4** | ePlace-style electrostatic analytic nudging for large boards; congestion-driven inflation (RippleFPGA-style); blind/buried/micro vias |
+
+**Goal:** route as well as (or better than) an expert human. Priorities after the M1/M2
+work done so far (task numbers refer to the CLAUDE.md task board):
+1. *Correctness gaps*: KiCad custom rules (`.kicad_dru`, #15) and copper-pour awareness
+   (#16) — a router that misses a rule the designer set is not expert-grade.
+2. *Search quality*: multi-agent path finding ideas — Priority-Based Search and
+   MAPF-LNS2 neighbourhoods for coordinated rip-up and re-route (#17); push-and-shove
+   moves (#24); exact ILP solutions in small congested windows (#23).
+3. *Electrical fidelity*: differential pairs (#3); delay- rather than length-based matching
+   (#19); IPC-2152 and better impedance models (#20); crosstalk and 3W rules (#21);
+   teardrops and DFM checks (#22); opt-in via-in-pad (#18).
+4. *Next core* (M3): topological, rubber-band routing on an octilinear visibility/escape
+   graph (#25). Topology (which side of each obstacle) is decided first and geometry
+   second, which removes lattice artefacts at the source instead of repairing them
+   afterwards.
 
 ---
 
