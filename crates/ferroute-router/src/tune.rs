@@ -2,9 +2,10 @@
 //! Length tuning: lengthens routed nets with accordion meanders ([`crate::meander`]) so
 //! `length_min` and length-matching (`match_group` + `skew_max`) rules are *met*.
 //!
-//! Targets: a net below `length_min` is raised to it; within a matching group, every net
-//! shorter than `longest − skew_max` is raised to `longest − skew_max / 2`. No target ever
-//! exceeds the net's `length_max`. Only copper ferroute routed in this run is touched,
+//! Targets ([`match_targets`]): a net below `length_min` is raised to it; within a matching
+//! group (explicit, nested or legacy per-net), every net shorter than `longest − skew` is
+//! raised to `longest − skew / 2`, iterated so inner pairs and outer buses all hold. No
+//! target ever exceeds the net's `length_max`. Only copper ferroute routed in this run is touched,
 //! widths never change (INV-RULE-1), and every meander is accepted only if the exact oracle
 //! finds no introduced violation, connectivity does not drop (INV-CONN-1), no acid trap
 //! appears (INV-ROUTE-3) and the bumps keep the net's clearance to its own other copper. Every
@@ -12,50 +13,25 @@
 //! Rules still unmet afterwards are reported by `ferroute_drc::rules`.
 
 use crate::meander::{MeanderSpec, Piece, pieces_length, run_frame};
+use ferroute_board::constraints::{MatchGroup, match_groups, match_targets};
 use ferroute_board::{ArcTrack, Board, BoardEdit, NetId, Origin, Track};
 use ferroute_drc::rules::net_lengths;
 use ferroute_drc::{DrcConfig, quality};
 use ferroute_geom::{Coord, Hull, units::nm_to_mm};
 use std::collections::BTreeMap;
 
-/// Length targets (nm) of nets that must grow, in net order.
+/// Length targets (nm) of nets that must grow, in net order: the board's
+/// [`match_targets`] that exceed the current length by more than 1 µm.
 #[must_use]
 pub fn length_targets(board: &Board) -> BTreeMap<NetId, Coord> {
     let lengths = net_lengths(board);
-    let mut want: BTreeMap<NetId, Coord> = BTreeMap::new();
-    let mut groups: BTreeMap<&str, (Coord, Vec<usize>)> = BTreeMap::new();
-    for (i, net) in board.nets.iter().enumerate().skip(1) {
-        let id = NetId(u32::try_from(i).unwrap_or(u32::MAX));
-        let c = &net.constraints;
-        if let Some(min) = c.length_min
-            && lengths[i] < min
-        {
-            // A little over the limit so float summation can never land just below it.
-            want.insert(id, min + 2_000);
-        }
-        if let (Some(g), Some(skew)) = (c.match_group.as_deref(), c.skew_max) {
-            let e = groups.entry(g).or_insert((skew, Vec::new()));
-            e.0 = e.0.min(skew);
-            e.1.push(i);
-        }
-    }
-    for (skew, nets) in groups.into_values() {
-        let longest = nets.iter().map(|&i| lengths[i]).max().unwrap_or(0);
-        for i in nets {
-            if lengths[i] < longest - skew {
-                let id = NetId(u32::try_from(i).unwrap_or(u32::MAX));
-                let t = want.entry(id).or_insert(0);
-                *t = (*t).max(longest - skew / 2);
-            }
-        }
-    }
-    want.retain(|&id, t| {
-        if let Some(max) = board.nets[id.idx()].constraints.length_max {
-            *t = (*t).min(max);
-        }
-        *t > lengths[id.idx()] + 1_000
-    });
-    want
+    match_targets(board, &lengths)
+        .into_iter()
+        .enumerate()
+        .skip(1)
+        .filter(|&(i, t)| t > lengths[i] + 1_000)
+        .map(|(i, t)| (NetId(u32::try_from(i).unwrap_or(u32::MAX)), t))
+        .collect()
 }
 
 fn after(base: &Board, edit: &BoardEdit) -> Board {
@@ -221,8 +197,10 @@ pub fn tune_lengths(base: &Board, edit: &mut BoardEdit) -> Vec<String> {
     let mut notes = Vec::new();
     let mut gained: BTreeMap<NetId, (f64, u32)> = BTreeMap::new();
     let start = net_lengths(&after(base, edit));
-    // Two rounds: raising a net to its `length_min` can lengthen a group's longest member.
-    for _ in 0..2 {
+    let original = edit.clone();
+    // Several rounds: lengthening a net can raise the longest member of an enclosing group.
+    for _ in 0..6 {
+        let before = edit.clone();
         let targets = length_targets(&after(base, edit));
         if targets.is_empty() {
             break;
@@ -254,7 +232,11 @@ pub fn tune_lengths(base: &Board, edit: &mut BoardEdit) -> Vec<String> {
                 }
             }
         }
+        if *edit == before {
+            break;
+        }
     }
+    notes.extend(revert_futile(base, edit, &original, &mut gained));
     let end = net_lengths(&after(base, edit));
     for (net, (_, meanders)) in gained {
         notes.push(format!(
@@ -263,6 +245,54 @@ pub fn tune_lengths(base: &Board, edit: &mut BoardEdit) -> Vec<String> {
             nm_to_mm(start[net.idx()]),
             nm_to_mm(end[net.idx()])
         ));
+    }
+    notes
+}
+
+/// Removes the meanders of every tuned net whose match groups are *all* still unmet (and
+/// that has no `length_min` it now satisfies): such copper meets no rule. Reverting a net
+/// cannot break a satisfied group (it belongs to none); each revert is still gated.
+fn revert_futile(
+    base: &Board,
+    edit: &mut BoardEdit,
+    original: &BoardEdit,
+    gained: &mut BTreeMap<NetId, (f64, u32)>,
+) -> Vec<String> {
+    let board = after(base, edit);
+    let lengths = net_lengths(&board);
+    let groups = match_groups(&board);
+    let unmet: Vec<&MatchGroup> = groups
+        .iter()
+        .filter(|g| {
+            let ls = g.nets.iter().map(|n| lengths[n.idx()]);
+            ls.clone().max().unwrap_or(0) - ls.min().unwrap_or(0) > g.skew_max
+        })
+        .collect();
+    let gate = Gate::of(&board);
+    let mut notes = Vec::new();
+    let nets: Vec<NetId> = gained.keys().copied().collect();
+    for net in nets {
+        let mine: Vec<&MatchGroup> = groups.iter().filter(|g| g.nets.contains(&net)).collect();
+        let min_met =
+            base.nets[net.idx()].constraints.length_min.is_some_and(|m| lengths[net.idx()] >= m);
+        if mine.is_empty() || min_met || !mine.iter().all(|g| unmet.contains(g)) {
+            continue;
+        }
+        let mut cand = edit.clone();
+        cand.new_tracks.retain(|t| t.net != net);
+        cand.new_tracks.extend(original.new_tracks.iter().filter(|t| t.net == net).cloned());
+        cand.new_arcs.retain(|a| a.net != net);
+        cand.new_arcs.extend(original.new_arcs.iter().filter(|a| a.net == net).cloned());
+        if gate.admits(&after(base, &cand)) {
+            *edit = cand;
+            gained.remove(&net);
+            let names: Vec<&str> = mine.iter().map(|g| g.name.as_str()).collect();
+            notes.push(format!(
+                "net {}: meanders removed — match group(s) {} cannot be met",
+                base.nets[net.idx()].name,
+                names.join(", ")
+            ));
+        }
     }
     notes
 }
@@ -430,5 +460,69 @@ mod tests {
         let issues = check_constraints(&after(&board, &edit));
         assert!(issues.iter().any(|i| matches!(i.kind, IssueKind::Skew { .. })), "{issues:?}");
         let _ = n;
+    }
+
+    #[test]
+    fn meanders_that_cannot_meet_any_group_are_removed() {
+        let (mut board, mut edit, _, n) = pair(mm(1) / 2);
+        // N may grow only to 20 mm, far short of P's 28.4 mm: the pair can never match.
+        board.nets[n.idx()].constraints.length_max = Some(mm(20));
+        let original = edit.clone();
+        let notes = tune_lengths(&board, &mut edit);
+        assert_eq!(edit, original, "no pointless copper: {notes:?}");
+        assert!(notes.iter().any(|n| n.contains("meanders removed")), "{notes:?}");
+        let issues = check_constraints(&after(&board, &edit));
+        assert!(issues.iter().any(|i| matches!(i.kind, IssueKind::Skew { .. })), "still reported");
+    }
+
+    #[test]
+    fn two_pairs_inside_a_bus_are_all_matched() {
+        let mut b = BoardBuilder::new(mm(40), mm(44), 2);
+        let ids: Vec<NetId> = ["A_P", "A_N", "B_P", "B_N"].iter().map(|n| b.net(n)).collect();
+        // (net, y mm, right pad x mm): routed run from 5.8 mm to right − 0.8 mm.
+        let lines = [(ids[0], 5, 35), (ids[1], 12, 25), (ids[2], 25, 31), (ids[3], 32, 27)];
+        for (k, &(net, y, x)) in lines.iter().enumerate() {
+            b.smd2(&format!("L{k}"), pt10(50, y * 10), 0.0, NetId::NONE, net);
+            b.smd2(&format!("R{k}"), pt10(x * 10, y * 10), 0.0, net, NetId::NONE);
+        }
+        let mut board = b.build();
+        let g = |name: &str, skew, nets: &[NetId]| MatchGroup {
+            name: name.into(),
+            skew_max: skew,
+            nets: nets.to_vec(),
+        };
+        board.match_groups = vec![
+            g("a", mm(1) / 2, &ids[..2]),
+            g("b", mm(1) / 2, &ids[2..]),
+            g("bus", mm(3) / 2, &ids),
+        ];
+        let track = |&(net, y, x): &(NetId, i64, i64)| Track {
+            start: pt10(58, y * 10),
+            end: pt10(x * 10 - 8, y * 10),
+            width: 250_000,
+            layer: LayerId(0),
+            net,
+            locked: false,
+            origin: Origin::Routed,
+        };
+        let mut edit =
+            BoardEdit { new_tracks: lines.iter().map(track).collect(), ..BoardEdit::default() };
+        let notes = tune_lengths(&board, &mut edit);
+        assert!(!notes.is_empty());
+        let out = after(&board, &edit);
+        assert!(check_constraints(&out).is_empty(), "{:?}", check_constraints(&out));
+        let l = net_lengths(&out);
+        for grp in &board.match_groups {
+            let v: Vec<Coord> = grp.nets.iter().map(|n| l[n.idx()]).collect();
+            assert!(v.iter().max().unwrap() - v.iter().min().unwrap() <= grp.skew_max);
+        }
+        let drc = ferroute_drc::check(&out, &DrcConfig::default());
+        assert_eq!(drc.introduced().count(), 0, "{:?}", drc.violations);
+        assert_eq!(drc.connectivity.connections_missing, 0);
+        assert!(quality::acute_angles(&out).is_empty());
+        assert!(!edit.new_arcs.is_empty(), "meander corners are true arcs");
+        for &(net, ..) in &lines {
+            assert_rounded_corners(&out, net, 250_000);
+        }
     }
 }
