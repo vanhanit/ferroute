@@ -13,7 +13,7 @@
 use std::fmt::Write as _;
 use std::path::Path;
 
-use ferroute_board::{Board, LayerId, LayerSet, NetId, Origin};
+use ferroute_board::{ArcTrack, Board, LayerId, LayerSet, NetId, Origin};
 use ferroute_geom::{Coord, Hull, Point, Rect};
 
 /// A DRC marker: a red ring with an X at `at`, carrying `label` as its `<title>`.
@@ -177,6 +177,11 @@ pub fn render_svg(board: &Board, opts: &RenderOptions) -> String {
             let attrs = net_attr(board, t.net);
             let op = copper_opacity(t.origin, opts.highlight_routed);
             emit(&mut s, hull_element(&t.hull(), colour, op, &attrs));
+        }
+        for a in board.arcs.iter().filter(|a| a.layer == layer) {
+            let attrs = net_attr(board, a.net);
+            let op = copper_opacity(a.origin, opts.highlight_routed);
+            emit(&mut s, Some(arc_element(a, colour, op, &attrs)));
         }
         for pid in board.pad_ids() {
             let pad = board.pad(pid);
@@ -406,6 +411,37 @@ fn hull_element(h: &Hull, colour: &str, opacity: &str, attrs: &str) -> Option<St
     }
 }
 
+/// Maximum sagitta (nm) when a degenerate arc falls back to a polyline.
+const ARC_FALLBACK_SAG: f64 = 10_000.0;
+
+/// An arc track as a stroked SVG path `M sx sy A r r 0 large sweep ex ey`. Board
+/// coordinates are y-down like SVG, so a positive geometric sweep is SVG's sweep flag 1.
+/// Degenerate (collinear) arcs are drawn as a polyline.
+fn arc_element(a: &ArcTrack, colour: &str, opacity: &str, attrs: &str) -> String {
+    let g = a.geom();
+    let mut d = String::new();
+    match (g.circle(), g.sweep()) {
+        (Some(c), Some(sweep)) if c.r.is_finite() && sweep != 0.0 => {
+            let large = u8::from(sweep.abs() > std::f64::consts::PI);
+            let sw = u8::from(sweep > 0.0);
+            let r = mm(c.r.round() as Coord);
+            let _ = write!(
+                d,
+                "M{} {} A{r} {r} 0 {large} {sw} {} {}",
+                mm(a.start.x),
+                mm(a.start.y),
+                mm(a.end.x),
+                mm(a.end.y)
+            );
+        }
+        _ => push_path(&mut d, &g.flatten(ARC_FALLBACK_SAG).0, false),
+    }
+    format!(
+        r#"<path d="{d}" fill="none" stroke="{colour}" stroke-width="{}" stroke-linecap="round" opacity="{opacity}"{attrs}/>"#,
+        mm(a.width)
+    )
+}
+
 fn emit(out: &mut String, el: Option<String>) {
     if let Some(el) = el {
         out.push_str(&el);
@@ -455,6 +491,11 @@ fn content_bbox(board: &Board, opts: &RenderOptions) -> Option<Rect> {
     }
     for t in &board.tracks {
         grow(&mut acc, t.hull().bbox());
+    }
+    for a in &board.arcs {
+        for h in a.hulls() {
+            grow(&mut acc, h.bbox());
+        }
     }
     for v in &board.vias {
         grow(&mut acc, v.hull().bbox());

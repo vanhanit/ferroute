@@ -247,3 +247,93 @@ fn write_svg_writes_the_same_bytes() {
     std::fs::remove_file(&path).ok();
     assert_eq!(written, render_svg(&test_board(), &opts));
 }
+
+fn quarter_arc(ccw_on_screen: bool, layer: LayerId) -> ferroute_board::ArcTrack {
+    // Quarter circle of radius 5 mm centred at (10, 5) mm, from (15,5) to (10,10) or (10,0).
+    let h = 5_000_000.0 * std::f64::consts::FRAC_1_SQRT_2;
+    let (sy, ey) = if ccw_on_screen { (-1, -1) } else { (1, 1) };
+    ferroute_board::ArcTrack {
+        start: Point::new(15_000_000, 5_000_000),
+        mid: Point::new(10_000_000 + h as i64, 5_000_000 + sy * h as i64),
+        end: Point::new(10_000_000, 5_000_000 + ey * 5_000_000),
+        width: 250_000,
+        layer,
+        net: NetId(1),
+        locked: false,
+        origin: Origin::Routed,
+    }
+}
+
+fn arc_paths(svg: &str) -> Vec<String> {
+    svg.lines().filter(|l| l.contains(" A")).map(str::to_owned).collect()
+}
+
+#[test]
+fn arc_emits_one_arc_command_with_flags() {
+    // Down on screen (y grows): sweep positive -> SVG sweep flag 1.
+    let mut b = test_board();
+    b.arcs.push(quarter_arc(false, LayerId(1)));
+    let svg = render_svg(&b, &RenderOptions::default());
+    let l = arc_paths(&svg);
+    assert_eq!(l.len(), 1, "{svg}");
+    assert!(
+        l[0].contains(r#"d="M15.0000 5.0000 A5.0000 5.0000 0 0 1 10.0000 10.0000""#),
+        "{}",
+        l[0]
+    );
+    assert!(l[0].contains(r#"fill="none""#) && l[0].contains(r#"stroke-width="0.2500""#));
+    assert!(l[0].contains(r#"data-net="SIG&amp;&lt;&gt;""#));
+    let doc = parse(&svg);
+    let g = doc
+        .descendants()
+        .find(|n| n.tag_name().name() == "g" && n.attribute("id") == Some("layer-B.Cu"))
+        .unwrap();
+    assert!(g.children().any(|c| c.attribute("d").is_some_and(|d| d.contains(" A5.0000"))));
+
+    // Opposite orientation: sweep flag 0.
+    let mut b = test_board();
+    b.arcs.push(quarter_arc(true, LayerId(0)));
+    let l = arc_paths(&render_svg(&b, &RenderOptions::default()));
+    assert_eq!(l.len(), 1);
+    assert!(
+        l[0].contains(r#"d="M15.0000 5.0000 A5.0000 5.0000 0 0 0 10.0000 0.0000""#),
+        "{}",
+        l[0]
+    );
+}
+
+#[test]
+fn arc_large_flag_and_degenerate_fallback() {
+    let mut b = test_board();
+    let mut a = quarter_arc(false, LayerId(0));
+    // Three-quarter arc: start (15,5), mid (5,5), end (10,0)... clockwise on screen via bottom.
+    a.mid = Point::new(5_000_000, 5_000_000);
+    a.end = Point::new(10_000_000, 0);
+    b.arcs.push(a);
+    let l = arc_paths(&render_svg(&b, &RenderOptions::default()));
+    assert!(l[0].contains("A5.0000 5.0000 0 1 1 10.0000 0.0000"), "{}", l[0]);
+
+    let mut b = test_board();
+    let mut a = quarter_arc(false, LayerId(0));
+    a.mid = Point::new(10_000_000, 5_000_000);
+    a.end = Point::new(5_000_000, 5_000_000);
+    b.arcs.push(a);
+    let svg = render_svg(&b, &RenderOptions::default());
+    assert!(arc_paths(&svg).is_empty());
+    assert!(svg.contains("M15.0000 5.0000 L"));
+}
+
+#[test]
+fn boards_without_arcs_have_no_arc_paths_and_arcs_extend_bbox() {
+    let svg = render_svg(&test_board(), &RenderOptions::default());
+    assert!(arc_paths(&svg).is_empty());
+    let mut b = Board {
+        copper_layers: test_board().copper_layers,
+        nets: test_board().nets,
+        ..Board::default()
+    };
+    b.arcs.push(quarter_arc(false, LayerId(0)));
+    let svg = render_svg(&b, &RenderOptions::default());
+    assert_eq!(arc_paths(&svg).len(), 1);
+    assert!(svg.contains("viewBox=\"7.8735 2.8735 "), "{svg}");
+}
