@@ -51,6 +51,7 @@ layout engineer accept this result without touching it?"
   decide, delegate, verify, merge, push — without waiting for approval between steps.
   Ask the user only for genuinely blocking decisions (credentials, irreversible external
   actions, conflicting requirements).
+* **Merging worker results:** apply the worktree diff with `git apply --3way`, resolve conflicts, verify, then commit each feature with an explicit pathspec (`git commit -m … -- <paths>`) so nothing else that is staged slips into the wrong commit.
 * **Delegation rules:** the lead writes the interface contract (types + signatures), the
   acceptance tests or criteria, and the list of files the worker may touch. Workers never
   edit crates they do not own, never edit the root `Cargo.toml` (add crate-local deps and
@@ -212,9 +213,9 @@ Completion and DRC come first; within that, every result must look hand-tuned:
 | 15 | `.kicad_dru` custom rules: parse the KiCad DRC rule language (clearance, track_width, via_diameter, hole_size, hole_clearance, edge_clearance, annular_width, diff_pair_gap, length, skew; NetClass/NetName/Type/layer conditions); unsupported conditions apply conservatively and are reported, never ignored | Worker | P1 — correctness gap |
 | 15b | `.kicad_dru` follow-ups: pair-specific clearance in the router plan (today a pair rule raises both nets' clearance against everything — conservative, may cost completion on dense boards); enforce `max`/`opt` limits; pad annular rings; `hole_to_hole`, `diff_pair_gap`, `skew` and time-unit length rules; non-error severities | Lead + worker | from #15 |
 | 16 | Copper-pour awareness: read zones, keep other-net clearance to fills, prefer not to split reference planes for high-speed nets, thermal reliefs untouched | Lead + worker | P1 — correctness gap (zones are ignored today) |
-| 17 | MAPF-style local rip-up & re-route (Priority-Based Search / MAPF-LNS2 neighbourhoods: conflicting, detoured, same-region nets) replacing the simple detour-order pass | Lead + worker | P2 |
+| 17 | ✅ `router::lns` (MAPF-LNS-style neighbourhoods, Pareto acceptance). Next: larger/second-order neighbourhoods for coupled cases like the demo U1 V-kink (#26) | Lead + worker | P2 |
 | 18 | Via-in-pad opt-in: `--allow-via-in-pad` / `[routing] via_in_pad`; pin access via a via at an SMD pad centre; writer marks filled+capped (IPC-4761) if the KiCad 10 format supports it; CLI cost warning | Worker | after via relocation lands |
-| 19 | Delay-based matching: match propagation delay (microstrip vs stripline velocity from the stack-up, via barrel length) instead of physical length | Lead | P2, with #3 |
+| 19 | ✅ delay matching (`[[match]] by = "delay"`, `skew_ps`, via barrels). Open: infeasible length+delay mixes ping-pong before being reverted — detect early | Lead | P2 |
 | 20 | Electrical models: IPC-2152 current curve fits, Hammerstad–Jensen microstrip (+ solder mask), stripline offset, edge-coupled differential and coplanar impedance; validate against published tables | Lead | P2 |
 | 20b | Electrical-model follow-ups: verified Kirschning–Jansen (or Wadell) coupled microstrip (today IPC-2141A coupling approximation), narrow-strip stripline (w/(b−t) < 0.35 returns None → reported as unattainable), offset stripline, solder-mask correction, thickness for coupled stripline | Lead | from #20 |
 | 21 | Crosstalk rules: parallel-run-length limits and 3W spacing for sensitive/high-speed nets, reported and enforced by the router cost policy | Lead + worker | P3 |

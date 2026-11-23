@@ -16,7 +16,7 @@
         "moved_footprints": 9,
         "displacement_mm": 15.06796220338052,
         "constraint_issues": 0,
-        "runtime_ms": 100.0
+        "runtime_ms": 200.0
       }
     },
     {
@@ -34,7 +34,7 @@
         "moved_footprints": 22,
         "displacement_mm": 41.728505252050056,
         "constraint_issues": 0,
-        "runtime_ms": 400.0
+        "runtime_ms": 500.0
       }
     },
     {
@@ -47,12 +47,12 @@
         "completion": 1.0,
         "connections_total": 50,
         "connections_missing": 0,
-        "wirelength_mm": 413.80899027133074,
+        "wirelength_mm": 411.9531398034362,
         "vias": 15,
         "moved_footprints": 30,
         "displacement_mm": 51.83156486704026,
         "constraint_issues": 0,
-        "runtime_ms": 500.0
+        "runtime_ms": 800.0
       }
     },
     {
@@ -65,8 +65,8 @@
         "completion": 1.0,
         "connections_total": 10,
         "connections_missing": 0,
-        "wirelength_mm": 195.5538238691624,
-        "vias": 3,
+        "wirelength_mm": 195.08519471906087,
+        "vias": 2,
         "moved_footprints": 0,
         "displacement_mm": 0.0,
         "constraint_issues": 0,
@@ -83,12 +83,12 @@
         "completion": 1.0,
         "connections_total": 10,
         "connections_missing": 0,
-        "wirelength_mm": 184.17632170278293,
+        "wirelength_mm": 183.26505186556207,
         "vias": 3,
         "moved_footprints": 5,
         "displacement_mm": 9.881737861543039,
         "constraint_issues": 0,
-        "runtime_ms": 100.0
+        "runtime_ms": 300.0
       }
     },
     {
@@ -106,7 +106,7 @@
         "moved_footprints": 0,
         "displacement_mm": 0.0,
         "constraint_issues": 0,
-        "runtime_ms": 300.0
+        "runtime_ms": 600.0
       }
     },
     {
@@ -124,7 +124,7 @@
         "moved_footprints": 6,
         "displacement_mm": 11.921978840013155,
         "constraint_issues": 0,
-        "runtime_ms": 200.0
+        "runtime_ms": 500.0
       }
     },
     {
@@ -137,12 +137,12 @@
         "completion": 1.0,
         "connections_total": 18,
         "connections_missing": 0,
-        "wirelength_mm": 354.8303359582473,
+        "wirelength_mm": 344.53878474678794,
         "vias": 7,
         "moved_footprints": 0,
         "displacement_mm": 0.0,
         "constraint_issues": 0,
-        "runtime_ms": 300.0
+        "runtime_ms": 1200.0
       }
     },
     {
@@ -160,7 +160,7 @@
         "moved_footprints": 6,
         "displacement_mm": 11.921978840013155,
         "constraint_issues": 0,
-        "runtime_ms": 200.0
+        "runtime_ms": 500.0
       }
     },
     {
