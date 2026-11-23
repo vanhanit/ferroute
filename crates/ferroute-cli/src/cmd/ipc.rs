@@ -50,6 +50,9 @@ pub enum IpcCommand {
         /// Per-net electrical rules (TOML), as for `ferroute route --rules`.
         #[arg(long)]
         rules: Option<PathBuf>,
+        /// Allow vias inside SMD pads (needs filled and capped vias: extra fabrication cost).
+        #[arg(long)]
+        allow_via_in_pad: bool,
     },
     /// KiCad 11+: export the open (or given) board to SVG via the IPC job API.
     ExportSvg {
@@ -109,7 +112,7 @@ pub fn run(c: &IpcCommand) -> Result<ExitCode> {
             }
             Ok(ExitCode::SUCCESS)
         }
-        IpcCommand::Route { socket, seed, allow_move, rules } => {
+        IpcCommand::Route { socket, seed, allow_move, rules, allow_via_in_pad } => {
             let mut client = connect(socket.as_ref(), Duration::from_secs(30))?;
             let caps = negotiate(&mut client)?;
             let docs = client.get_open_documents(DocumentType::Pcb)?;
@@ -138,6 +141,7 @@ pub fn run(c: &IpcCommand) -> Result<ExitCode> {
                 fail_on_incomplete: false,
                 rules: rules.clone(),
                 strict_rules: false,
+                allow_via_in_pad: *allow_via_in_pad,
             };
             let code = route_run(&args)?;
             client.revert_document(doc).context("RevertDocument (reload)")?;

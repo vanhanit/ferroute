@@ -67,18 +67,26 @@ pub fn emit(
         }
     }
     let layers = board.all_layers();
+    let via = |pos: Point| Via {
+        pos,
+        diameter: cg.via_diameter,
+        drill: cg.via_drill,
+        layers,
+        net,
+        locked: false,
+        origin: Origin::Routed,
+    };
+    // Lattice vias, then the vias of via-in-pad break-outs (at their pad centres).
     let vias = r
         .vias
         .iter()
-        .map(|&v| Via {
-            pos: grid.pos_ij(v % grid.nx, v / grid.nx),
-            diameter: cg.via_diameter,
-            drill: cg.via_drill,
-            layers,
-            net,
-            locked: false,
-            origin: Origin::Routed,
-        })
+        .map(|&v| via(grid.pos_ij(v % grid.nx, v / grid.nx)))
+        .chain(
+            r.stubs
+                .iter()
+                .filter(|&&s| stubs[s as usize].is_via())
+                .map(|&s| via(stubs[s as usize].path[0])),
+        )
         .collect();
     (tracks, vias)
 }

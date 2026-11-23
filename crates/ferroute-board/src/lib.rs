@@ -609,6 +609,21 @@ impl Board {
         pad.position(self.footprint(pad.footprint).placement)
     }
 
+    /// The SMD pad of `via`'s net that is centred on the via and whose copper fully
+    /// contains the via copper (a *via-in-pad*, which needs filled and capped vias).
+    /// Through-hole pads never qualify.
+    #[must_use]
+    pub fn via_in_pad(&self, via: &Via) -> Option<PadId> {
+        self.pad_ids().find(|&id| {
+            let pad = self.pad(id);
+            pad.net == via.net
+                && pad.drill.is_none()
+                && !pad.layers.is_empty()
+                && self.pad_position(id) == via.pos
+                && self.pad_hull(id).contains_disk(via.pos, via.diameter / 2)
+        })
+    }
+
     pub fn pad_ids(&self) -> impl Iterator<Item = PadId> {
         #[allow(clippy::cast_possible_truncation)]
         (0..self.pads.len() as u32).map(PadId)

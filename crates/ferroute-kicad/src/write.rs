@@ -356,7 +356,7 @@ fn build(board: &Board, seed: u64) -> SExpr {
         }
     }
     for (i, v) in board.vias.iter().enumerate() {
-        if let Ok(n) = via_node(&dialect, board, v, seed, i as u64) {
+        if let Ok(n) = via_node(&dialect, board, v, seed, i as u64, KICAD10_VERSION) {
             root.push(n);
         }
     }

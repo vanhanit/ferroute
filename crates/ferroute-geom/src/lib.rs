@@ -468,6 +468,30 @@ impl Hull {
         Self { pts: pts.iter().copied().collect(), radius }
     }
 
+    /// Exact: does the disk of radius `s` centred at `q` lie inside this hull
+    /// (i.e. is `q` inside the hull eroded by `s`)? Boundary cases count as outside
+    /// (conservative).
+    #[must_use]
+    pub fn contains_disk(&self, q: Point, s: Coord) -> bool {
+        let h = self;
+        if h.radius >= s {
+            let inner = Hull { pts: h.pts.clone(), radius: h.radius - s };
+            if inner.radius == 0 && inner.pts.len() < 3 {
+                return inner.pts.contains(&q)
+                    || (inner.pts.len() == 2
+                        && orient(inner.pts[0], inner.pts[1], q) == 0
+                        && Segment::new(inner.pts[0], inner.pts[1]).bbox().contains(q));
+            }
+            return inner.clearance_violated(&Hull::disk(q, 0), 0);
+        }
+        if h.pts.len() < 3 {
+            return false;
+        }
+        let poly = Polygon::new(h.pts.to_vec());
+        let need = s - h.radius;
+        poly.contains(q) && !poly.edges().any(|e| point_segment_dist_lt(q, e, need))
+    }
+
     /// Axis-aligned bounding box including the radius.
     #[must_use]
     pub fn bbox(&self) -> Rect {

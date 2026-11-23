@@ -431,7 +431,10 @@ fn route_one(
         let stub_costs = Costs { kink: job.costs.kink / pres_fac.max(1.0), ..job.costs };
         let penalty = |st: Option<u32>| {
             st.filter(|s| !used_stubs.contains(s)).map_or(0.0, |s| {
-                stub_penalty(&stub_costs, stubs[s as usize].bend, stubs[s as usize].kink)
+                let stub = &stubs[s as usize];
+                // A via-in-pad break-out is priced like any other via.
+                stub_penalty(&stub_costs, stub.bend, stub.kink)
+                    + if stub.is_via() { job.costs.via } else { 0.0 }
             })
         };
         let sources =

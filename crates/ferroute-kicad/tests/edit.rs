@@ -431,3 +431,78 @@ fn new_board_writes_arcs() {
     let text = ferroute_kicad::write_new_board(&b, 3);
     assert!(arc_flat(&text).starts_with("(arc (start 110 110) (mid 111 110.25) (end 112 111)"));
 }
+
+/// A via at the centre of the first connected SMD pad that fits it, and one far away.
+fn via_in_pad_edit(b: &Board) -> BoardEdit {
+    let via = |pos: Point, net: NetId| Via {
+        pos,
+        diameter: 600_000,
+        drill: 300_000,
+        layers: b.all_layers(),
+        net,
+        locked: false,
+        origin: Origin::Routed,
+    };
+    let pad = b
+        .pad_ids()
+        .find(|&id| {
+            let p = b.pad(id);
+            p.net != NetId(0)
+                && p.drill.is_none()
+                && b.pad_hull(id).contains_disk(b.pad_position(id), 300_000)
+        })
+        .expect("SMD pad");
+    let (pos, net) = (b.pad_position(pad), b.pad(pad).net);
+    assert!(b.via_in_pad(&via(pos, net)).is_some());
+    BoardEdit {
+        new_vias: vec![via(pos, net), via(Point::new(mm(1.0), mm(1.0)), net)],
+        ..BoardEdit::default()
+    }
+}
+
+#[test]
+fn via_in_pad_is_written_filled_and_capped_in_kicad10() {
+    let kb = load("demo_2layer.kicad_pcb");
+    let board = kb.board.clone();
+    let edit = via_in_pad_edit(&board);
+    let mut doc = kb.doc;
+    doc.apply_edit(&board, &edit, 7).unwrap();
+    let text = doc.to_kicad_string();
+    // Exactly one new via is in a pad (the board-level `(setup …)` defaults are `no`).
+    assert_eq!(text.matches("(capping yes)").count(), 1, "{text}");
+    assert_eq!(text.matches("(filling yes)").count(), 1);
+    let again = read_board(&text, &ReadOptions::default()).unwrap().board;
+    assert_eq!(again.vias.len(), board.vias.len() + 2);
+}
+
+#[test]
+fn via_in_pad_attributes_are_not_written_for_older_dialects() {
+    let kb = load("legacy_v9_numeric.kicad_pcb");
+    let board = kb.board.clone();
+    let edit = via_in_pad_edit(&board);
+    let mut doc = kb.doc;
+    doc.apply_edit(&board, &edit, 7).unwrap();
+    let text = doc.to_kicad_string();
+    assert_eq!(text.matches("(capping yes)").count(), 0);
+    assert_eq!(text.matches("(filling yes)").count(), 0);
+}
+
+#[test]
+fn via_in_pad_follows_moved_footprints() {
+    let kb = load("demo_2layer.kicad_pcb");
+    let mut board = kb.board.clone();
+    let mut edit = via_in_pad_edit(&board);
+    edit.new_vias.truncate(1);
+    // Move the part owning that pad; the via sits at the pad's *new* centre.
+    let pad = board.pad_ids().find(|&p| board.pad_position(p) == edit.new_vias[0].pos).unwrap();
+    let fp = board.pad(pad).footprint;
+    board.footprints[fp.idx()].mobility =
+        Mobility::Movable { max_displacement: mm(20.0), allow_rotation: true };
+    let from = board.footprint(fp).placement;
+    let to = Placement { pos: Point::new(from.pos.x + mm(1.0), from.pos.y), rot: from.rot };
+    edit.moves = vec![FootprintMove { footprint: fp, from, to }];
+    edit.new_vias[0].pos = Point::new(edit.new_vias[0].pos.x + mm(1.0), edit.new_vias[0].pos.y);
+    let mut doc = kb.doc;
+    doc.apply_edit(&board, &edit, 7).unwrap();
+    assert_eq!(doc.to_kicad_string().matches("(capping yes)").count(), 1);
+}

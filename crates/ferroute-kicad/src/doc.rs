@@ -6,6 +6,7 @@ use crate::KicadError;
 use crate::read::NetDialect;
 use crate::sexpr::SExpr;
 use crate::util::{float, format_angle, kq, kv, node, norm180, same_angle, uuid_for, xy_node};
+use crate::write::KICAD10_VERSION;
 use ferroute_board::{ArcTrack, Board, BoardEdit, Placement, Track, Via};
 use ferroute_geom::units::{format_mm, parse_mm};
 
@@ -207,6 +208,7 @@ pub(crate) fn via_node(
     v: &Via,
     seed: u64,
     index: u64,
+    version: u32,
 ) -> Result<SExpr, KicadError> {
     let ids: Vec<_> = v.layers.iter().collect();
     let (Some(&lo), Some(&hi)) = (ids.first(), ids.last()) else {
@@ -229,6 +231,13 @@ pub(crate) fn via_node(
     ));
     if v.locked {
         items.push(kv("locked", "yes"));
+    }
+    // A via inside an SMD pad must be filled and capped (IPC-4761 type VII). The per-via
+    // `(capping …)` / `(filling …)` attributes exist in the KiCad 10 format (the
+    // padstack drill flags `is_capped` / `is_filled`); older dialects have no such token.
+    if version >= KICAD10_VERSION && board.via_in_pad(v).is_some() {
+        items.push(kv("capping", "yes"));
+        items.push(kv("filling", "yes"));
     }
     items.push(net_node(dialect, board, v.net)?);
     items.push(kq("uuid", uuid_for(seed, KIND_VIA, index)));
@@ -328,9 +337,19 @@ impl KicadDocument {
             let idx = self.added_arcs + i as u64;
             new_nodes.push(arc_node(&self.dialect, board_before, a, seed, idx)?);
         }
+        // New vias are judged against the pads where the moved parts end up.
+        let placed;
+        let after = if edit.moves.is_empty() || edit.new_vias.is_empty() {
+            board_before
+        } else {
+            let mut b = board_before.clone();
+            b.apply(&BoardEdit { moves: edit.moves.clone(), ..BoardEdit::default() });
+            placed = b;
+            &placed
+        };
         for (i, v) in edit.new_vias.iter().enumerate() {
             let idx = self.added_vias + i as u64;
-            new_nodes.push(via_node(&self.dialect, board_before, v, seed, idx)?);
+            new_nodes.push(via_node(&self.dialect, after, v, seed, idx, self.version)?);
         }
         let mut edited = self.root.clone();
         for m in &edit.moves {

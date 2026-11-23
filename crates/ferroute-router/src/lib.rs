@@ -85,8 +85,10 @@ pub struct RouterConfig {
     /// Maximum number of detour-driven re-ordering rounds after the first pass.
     #[serde(default = "default_order_rounds")]
     pub order_rounds: u32,
-    /// Vias may be relocated into the centre of a same-net SMD pad that fully contains
-    /// them (the pad is then connected directly). Off by default.
+    /// Allow vias inside same-net SMD pads (opt-in: such vias must be filled and capped,
+    /// IPC-4761 type VII, an extra fabrication cost). Pins gain a via-in-pad break-out
+    /// (priced like any via) and routed vias may be relocated into the pad centre.
+    /// Off by default.
     #[serde(default)]
     pub via_in_pad: bool,
     /// Coordinated rip-up & re-route of small net neighbourhoods after the first passes.
@@ -136,6 +138,9 @@ pub struct RouteStats {
     pub nets_failed: usize,
     pub tracks: usize,
     pub vias: usize,
+    /// Of those vias, the ones inside an SMD pad (need filling and capping).
+    #[serde(default)]
+    pub via_in_pad: usize,
     /// 90° bends left in the emitted copper after the chamfer pass.
     pub right_angle_bends: usize,
     /// Avoidable bends next to same-net pads left in the emitted copper.
@@ -387,6 +392,19 @@ pub fn route_once(board: &Board, cfg: &RouterConfig) -> Result<RouteOutcome, Rou
                         (sid as usize) < first || !taken.contains(&(pad, stubs[sid as usize].dir))
                     })
                 });
+                if cfg.via_in_pad {
+                    ts.extend(access::via_terminals(
+                        board,
+                        &grid,
+                        &obs,
+                        &legal[class],
+                        cp,
+                        &plan,
+                        net,
+                        pad,
+                        &mut stubs,
+                    ));
+                }
             }
             term_groups.push(ts);
         }
@@ -497,7 +515,7 @@ pub fn route_once(board: &Board, cfg: &RouterConfig) -> Result<RouteOutcome, Rou
     failed.extend(per_net.iter().filter(|e| !e.3).map(|e| e.0));
     failed.sort_unstable();
     failed.dedup();
-    let (right_angle_bends, near_pad_bends, slivers, via_jogs) = {
+    let (right_angle_bends, near_pad_bends, slivers, via_jogs, via_in_pad) = {
         let mut after = original.clone();
         after.apply(&edit);
         (
@@ -505,6 +523,7 @@ pub fn route_once(board: &Board, cfg: &RouterConfig) -> Result<RouteOutcome, Rou
             ferroute_drc::quality::near_pad_bends(&after).len(),
             ferroute_drc::quality::slivers(&after).len(),
             ferroute_drc::quality::via_jogs(&after).len(),
+            edit.new_vias.iter().filter(|v| after.via_in_pad(v).is_some()).count(),
         )
     };
     let stats = RouteStats {
@@ -517,6 +536,7 @@ pub fn route_once(board: &Board, cfg: &RouterConfig) -> Result<RouteOutcome, Rou
         nets_failed: failed.len(),
         tracks: edit.new_tracks.len(),
         vias: edit.new_vias.len(),
+        via_in_pad,
         right_angle_bends,
         near_pad_bends,
         slivers,

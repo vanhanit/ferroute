@@ -43,6 +43,17 @@ pub struct Stub {
     /// `true` when the outward leg is shorter than one lattice pitch (a visible kink
     /// next to the pad). Such stubs are a last resort: the search charges a penalty.
     pub kink: bool,
+    /// Radius of the through via placed at the pad centre `path[0]` (via-in-pad stubs; the
+    /// stub track then runs on a layer the pad is not on); `0` for an ordinary stub.
+    pub via_radius: Coord,
+}
+
+impl Stub {
+    /// `true` for a via-in-pad break-out.
+    #[must_use]
+    pub const fn is_via(&self) -> bool {
+        self.via_radius > 0
+    }
 }
 
 /// A lattice entry point of a pad.
@@ -252,6 +263,7 @@ pub fn pad_terminals(
             keepout_edges,
             bend,
             kink,
+            via_radius: 0,
             node: n,
             net,
             radius: r,
@@ -265,6 +277,158 @@ pub fn pad_terminals(
         out.push(Terminal { node: n, stub: Some(id), heading });
     }
     out
+}
+
+/// Via-in-pad terminals of `pad` (opt-in, see [`crate::RouterConfig::via_in_pad`]).
+///
+/// Only an SMD pad whose copper fully contains a through via of the net's class centred on
+/// it qualifies (never a through-hole pad). The via sits exactly at the pad centre and
+/// reaches the pad's other layers directly: each terminal is a lattice node on such a
+/// layer, joined to the via by a 0°/45°/90° stub (empty when the centre is a node). The via
+/// copper is checked exactly against every obstacle except the pad itself, and it reserves
+/// lattice nodes on all layers so other nets keep clear of it.
+#[allow(clippy::too_many_arguments)]
+pub fn via_terminals(
+    board: &Board,
+    grid: &Grid,
+    obs: &Obstacles,
+    leg: &ClassLegality,
+    cp: &ClassPlan,
+    plan: &Plan,
+    net: NetId,
+    pad: PadId,
+    stubs: &mut Vec<Stub>,
+) -> Vec<Terminal> {
+    /// Best stubs kept per layer, and in total.
+    const PER_LAYER: usize = 3;
+    const MAX_VIA_STUBS: usize = 8;
+    let p = board.pad(pad);
+    let hull = board.pad_hull(pad);
+    let c = board.pad_position(pad);
+    let (rv, r) = (cp.geom.via_radius, cp.geom.track_radius);
+    if p.drill.is_some()
+        || p.layers.is_empty()
+        || !hull.contains_disk(c, rv)
+        || !allows(obs.classify_via_in_pad(c, &cp.geom, &hull, net), net)
+    {
+        return Vec::new();
+    }
+    let reach = via_reach(plan, cp, obs.rules.hole_clearance, obs.rules.hole_to_hole);
+    let Some((i0, j0, i1, j1)) = grid.index_range(hull.bbox().inflate(3 * grid.pitch)) else {
+        return Vec::new();
+    };
+    // (kink, length, bend, node, grid layer, polyline)
+    let mut cands: Vec<(bool, u64, u8, NodeIdx, u32, Vec<Point>)> = Vec::new();
+    for l in (0..grid.nl()).filter(|&g| !p.layers.contains(grid.layers[g as usize])) {
+        let layer = grid.layers[l as usize];
+        for j in j0..=j1 {
+            for i in i0..=i1 {
+                let n = grid.idx(i, j, l);
+                if !allows(leg.node[n as usize], net) {
+                    continue;
+                }
+                let q = grid.pos_ij(i, j);
+                let paths = if q == c { vec![vec![c, c]] } else { octilinear_paths(c, q) };
+                for path in paths {
+                    let ok = path.windows(2).all(|w| {
+                        allows(
+                            obs.classify_track(&Hull::capsule(w[0], w[1], r), layer, &cp.geom),
+                            net,
+                        )
+                    });
+                    if ok {
+                        let (bend, kink) = stub_shape(&path, grid.pitch);
+                        cands.push((kink, path_len(&path), bend, n, l, path));
+                    }
+                }
+            }
+        }
+    }
+    cands.sort_by_key(|x| (x.0, x.1, x.2, x.3, x.4));
+    let mut per_layer = vec![0usize; grid.nl() as usize];
+    let mut out: Vec<Terminal> = Vec::new();
+    for (kink, _, bend, n, l, path) in cands {
+        if out.len() >= MAX_VIA_STUBS
+            || per_layer[l as usize] >= PER_LAYER
+            || out.iter().any(|t| t.node == n)
+        {
+            continue;
+        }
+        per_layer[l as usize] += 1;
+        // Via copper is on every layer; the stub track only on layer `l`.
+        let mut reserved = Vec::new();
+        let via_spine = Segment::new(c, c);
+        if let Some((a0, b0, a1, b1)) = grid.index_range(via_spine.bbox().inflate(reach)) {
+            for lay in 0..grid.nl() {
+                for j in b0..=b1 {
+                    for i in a0..=a1 {
+                        if point_segment_dist_lt(grid.pos_ij(i, j), via_spine, reach) {
+                            reserved.push(grid.idx(i, j, lay));
+                        }
+                    }
+                }
+            }
+        }
+        let segs: Vec<Segment> = path.windows(2).map(|w| Segment::new(w[0], w[1])).collect();
+        let track_reach = stub_reach(plan, cp, obs.rules.hole_clearance);
+        for &spine in &segs {
+            if let Some((a0, b0, a1, b1)) = grid.index_range(spine.bbox().inflate(track_reach)) {
+                for j in b0..=b1 {
+                    for i in a0..=a1 {
+                        if point_segment_dist_lt(grid.pos_ij(i, j), spine, track_reach) {
+                            reserved.push(grid.idx(i, j, l));
+                        }
+                    }
+                }
+            }
+        }
+        reserved.sort_unstable();
+        reserved.dedup();
+        let (keepout_nodes, keepout_edges) = stub_keepout(grid, l, n, &segs, r);
+        let id = u32::try_from(stubs.len()).unwrap_or(u32::MAX);
+        let dir = Dir8::from_vector(path[1] - path[0]).unwrap_or(Dir8::E);
+        let heading = Dir8::from_vector(path[path.len() - 2] - grid.pos(n));
+        stubs.push(Stub {
+            path,
+            layer: grid.layers[l as usize],
+            reserved,
+            keepout_nodes,
+            keepout_edges,
+            bend,
+            kink,
+            via_radius: rv,
+            node: n,
+            net,
+            radius: r,
+            clearance: cp.geom.clearance,
+            pad,
+            dir,
+        });
+        out.push(Terminal { node: n, stub: Some(id), heading });
+    }
+    out
+}
+
+/// Radius around a via-in-pad centre inside which other nets' lattice nodes would be
+/// unsafe: the larger of its track-copper and via-copper / drill separation.
+fn via_reach(plan: &Plan, cp: &ClassPlan, hole_clearance: Coord, hole_to_hole: Coord) -> Coord {
+    let g = &cp.geom;
+    #[allow(clippy::cast_possible_truncation)]
+    let half_diag = (plan.pitch as f64 * std::f64::consts::FRAC_1_SQRT_2).ceil() as Coord;
+    plan.classes
+        .iter()
+        .map(|o| {
+            let c = o.geom.clearance.max(g.clearance);
+            let track = g.via_radius + o.geom.track_radius + c + half_diag;
+            let via = (g.via_radius + o.geom.via_radius + c)
+                .max(g.via_drill / 2 + o.geom.via_radius + hole_clearance)
+                .max(g.via_radius + o.geom.via_drill / 2 + hole_clearance)
+                .max(g.via_drill / 2 + o.geom.via_drill / 2 + hole_to_hole);
+            track.max(via)
+        })
+        .max()
+        .unwrap_or(0)
+        + 1
 }
 
 /// Shape facts of a stub polyline: bend between its legs in 45° steps, and whether the
@@ -379,12 +543,17 @@ pub fn stub_conflicts(stubs: &[Stub]) -> Vec<Vec<u32>> {
         .iter()
         .map(|s| s.path.windows(2).map(|w| Hull::capsule(w[0], w[1], s.radius)).collect())
         .collect();
+    // A via-in-pad stub also owns a through via at its first point (on every layer).
+    let vias: Vec<Option<Hull>> =
+        stubs.iter().map(|s| s.is_via().then(|| Hull::disk(s.path[0], s.via_radius))).collect();
     let reach = stubs.iter().map(|s| s.clearance).max().unwrap_or(0) + 1;
     let boxes: Vec<ferroute_geom::Rect> = hulls
         .iter()
-        .map(|hs| {
+        .zip(&vias)
+        .map(|(hs, v)| {
             hs.iter()
                 .map(Hull::bbox)
+                .chain(v.iter().map(Hull::bbox))
                 .reduce(ferroute_geom::Rect::union)
                 .unwrap_or(ferroute_geom::Rect::new(Point::ORIGIN, Point::ORIGIN))
                 .inflate(reach)
@@ -394,13 +563,21 @@ pub fn stub_conflicts(stubs: &[Stub]) -> Vec<Vec<u32>> {
     let mut out = vec![Vec::new(); stubs.len()];
     for (a, b) in index.pairs(&boxes) {
         let (sa, sb) = (&stubs[a as usize], &stubs[b as usize]);
-        if sa.net == sb.net || sa.layer != sb.layer {
+        if sa.net == sb.net {
             continue;
         }
         let c = sa.clearance.max(sb.clearance);
-        let hit = hulls[a as usize]
-            .iter()
-            .any(|x| hulls[b as usize].iter().any(|y| x.clearance_violated(y, c)));
+        let (ha, hb) = (&hulls[a as usize], &hulls[b as usize]);
+        let (va, vb) = (&vias[a as usize], &vias[b as usize]);
+        let same_layer = sa.layer == sb.layer
+            && ha.iter().any(|x| hb.iter().any(|y| x.clearance_violated(y, c)));
+        let via_hit = |v: &Option<Hull>, hs: &[Hull], w: &Option<Hull>| {
+            v.as_ref().is_some_and(|v| {
+                hs.iter().any(|y| v.clearance_violated(y, c))
+                    || w.as_ref().is_some_and(|w| v.clearance_violated(w, c))
+            })
+        };
+        let hit = same_layer || via_hit(va, hb, vb) || via_hit(vb, ha, &None);
         if hit {
             out[a as usize].push(b);
             out[b as usize].push(a);
@@ -409,26 +586,11 @@ pub fn stub_conflicts(stubs: &[Stub]) -> Vec<Vec<u32>> {
     out
 }
 
-/// Exact: does the disk of radius `s` centred at `q` lie inside the pad copper `h`
-/// (i.e. is `q` inside `h` eroded by `s`)? Boundary cases count as outside (conservative).
+/// Exact: does the disk of radius `s` centred at `q` lie inside the pad copper `h`?
+/// Boundary cases count as outside (conservative). See [`Hull::contains_disk`].
 #[must_use]
 pub fn contains_eroded(h: &Hull, q: Point, s: Coord) -> bool {
-    if h.radius >= s {
-        let inner = Hull { pts: h.pts.clone(), radius: h.radius - s };
-        if inner.radius == 0 && inner.pts.len() < 3 {
-            return inner.pts.contains(&q)
-                || (inner.pts.len() == 2
-                    && ferroute_geom::orient(inner.pts[0], inner.pts[1], q) == 0
-                    && Segment::new(inner.pts[0], inner.pts[1]).bbox().contains(q));
-        }
-        return inner.clearance_violated(&Hull::disk(q, 0), 0);
-    }
-    if h.pts.len() < 3 {
-        return false;
-    }
-    let poly = ferroute_geom::Polygon::new(h.pts.to_vec());
-    let need = s - h.radius;
-    poly.contains(q) && !poly.edges().any(|e| point_segment_dist_lt(q, e, need))
+    h.contains_disk(q, s)
 }
 
 /// Octilinear polylines from `c` to `q`: the direct segment if it is already 0°/45°/90°,

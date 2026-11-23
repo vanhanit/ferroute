@@ -4,7 +4,7 @@ use ferroute_board::NetId;
 use ferroute_board::builder::{BoardBuilder, mm, pt10};
 use ferroute_board::{Mobility, NetClass};
 use ferroute_drc::{DrcConfig, check};
-use ferroute_geom::Dir8;
+use ferroute_geom::{Dir8, Point};
 use proptest::prelude::*;
 
 fn exact_cfg() -> RouterConfig {
@@ -698,4 +698,60 @@ fn lns_is_deterministic_across_thread_counts() {
     let (a, b) = (run(1), run(4));
     assert_eq!(a.edit, b.edit, "thread count changed the LNS result");
     assert_eq!(a.stats.lns_accepted, b.stats.lns_accepted);
+}
+
+/// Part R1 pad 1 (net A) is boxed in on F.Cu by a fixed ring of foreign copper, so the
+/// only way out is a via in the pad; R2 (net A) sits clear elsewhere.
+fn walled_pad_board() -> Board {
+    let mut b = BoardBuilder::new(mm(30), mm(20), 2);
+    let a = b.net("A");
+    let g = b.net("G");
+    b.smd2("R1", pt10(100, 100), 0.0, a, NetId(0));
+    b.smd2("R2", pt10(200, 100), 0.0, a, NetId(0));
+    // Pad 1 of R1 is centred at (9.2, 10) mm.
+    let (x0, x1, y0, y1) = (8_300_000, 10_000_000, 9_200_000, 10_800_000);
+    let w = 200_000;
+    let o = ferroute_board::Origin::Existing;
+    b.track(Point::new(x0, y0), Point::new(x1, y0), w, 0, g, o);
+    b.track(Point::new(x1, y0), Point::new(x1, y1), w, 0, g, o);
+    b.track(Point::new(x1, y1), Point::new(x0, y1), w, 0, g, o);
+    b.track(Point::new(x0, y1), Point::new(x0, y0), w, 0, g, o);
+    b.build()
+}
+
+#[test]
+fn via_in_pad_is_off_by_default_and_the_walled_pad_stays_open() {
+    let board = walled_pad_board();
+    let out = route(&board, &exact_cfg()).expect("route");
+    assert_eq!(out.stats.via_in_pad, 0);
+    assert_eq!(out.stats.nets_failed, 1, "{:?}", out.stats);
+    assert!(out.edit.new_vias.iter().all(|v| board.via_in_pad(v).is_none()));
+}
+
+#[test]
+fn via_in_pad_escapes_a_walled_pad_when_enabled() {
+    let board = walled_pad_board();
+    let cfg = RouterConfig { via_in_pad: true, ..exact_cfg() };
+    let out = route(&board, &cfg).expect("route");
+    assert_eq!(out.stats.nets_failed, 0, "{:?}", out.stats);
+    assert_eq!(out.stats.via_in_pad, 1, "{:?}", out.stats);
+    assert_clean_and_complete(&board, &out, true);
+    let via = out.edit.new_vias.iter().find(|v| board.via_in_pad(v).is_some()).expect("via");
+    let pad = board.via_in_pad(via).expect("pad");
+    assert_eq!(via.pos, board.pad_position(pad));
+    assert!(board.pad_hull(pad).contains_disk(via.pos, via.diameter / 2));
+    let again = route(&board, &cfg).expect("route");
+    assert_eq!(out.edit, again.edit, "deterministic");
+}
+
+#[test]
+fn via_in_pad_is_never_used_on_through_hole_pads() {
+    let mut b = BoardBuilder::new(mm(30), mm(20), 2);
+    let a = b.net("A");
+    b.header("J1", pt10(50, 100), 0.0, &[a, NetId(0)]);
+    b.smd2("R2", pt10(200, 100), 0.0, a, NetId(0));
+    let board = b.build();
+    let out = route(&board, &RouterConfig { via_in_pad: true, ..exact_cfg() }).expect("route");
+    assert!(out.edit.new_vias.iter().all(|v| board.via_in_pad(v).is_none()));
+    assert_clean_and_complete(&board, &out, true);
 }

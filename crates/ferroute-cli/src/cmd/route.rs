@@ -91,6 +91,10 @@ pub struct RouteArgs {
     /// Exit with status 2 if any per-net electrical rule is not met.
     #[arg(long)]
     pub strict_rules: bool,
+    /// Allow vias inside SMD pads (also `[routing] via_in_pad = true` in --rules). Such vias
+    /// must be filled and capped (IPC-4761 type VII): an extra fabrication cost.
+    #[arg(long)]
+    pub allow_via_in_pad: bool,
 }
 
 /// Parses a rules file (`[stackup]` + `[[net]]` tables).
@@ -108,10 +112,12 @@ pub fn run(a: &RouteArgs) -> Result<ExitCode> {
     let kb = load(&a.input)?;
     let mut doc = kb.doc;
     let mut board = kb.board;
+    let mut via_in_pad = a.allow_via_in_pad;
     if let Some(path) = &a.rules {
         let text =
             std::fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
         let rules = parse_rules(&text).with_context(|| format!("in {}", path.display()))?;
+        via_in_pad |= rules.via_in_pad();
         for w in rules.apply(&mut board)? {
             out(&format!("rules warning: {w}"));
         }
@@ -145,6 +151,7 @@ pub fn run(a: &RouteArgs) -> Result<ExitCode> {
             layers,
             max_iterations: a.iterations,
             accel: a.accel.into(),
+            via_in_pad,
             ..RouterConfig::default()
         },
         nudge: a.allow_move.then(|| {
@@ -200,6 +207,13 @@ pub fn run(a: &RouteArgs) -> Result<ExitCode> {
         m.runtime_ms,
         res.route.accel_backend
     ));
+    let via_in_pad_count =
+        res.edit.new_vias.iter().filter(|v| res.board_after.via_in_pad(v).is_some()).count();
+    if via_in_pad_count > 0 {
+        out(&format!(
+            "via-in-pad: {via_in_pad_count} via(s) — require filled & capped vias (extra fabrication cost)"
+        ));
+    }
     if !failed.is_empty() {
         out(&format!("unrouted nets: {}", failed.join(", ")));
     }
@@ -216,7 +230,7 @@ pub fn run(a: &RouteArgs) -> Result<ExitCode> {
             "ferroute_version": env!("CARGO_PKG_VERSION"),
             "input": a.input, "output": a.output, "seed": a.seed,
             "metrics": m, "route": res.route, "place": res.place, "failed_nets": failed,
-            "lns_rounds_run": res.rounds,
+            "lns_rounds_run": res.rounds, "via_in_pad": via_in_pad_count,
             "rule_notes": res.rule_notes, "rule_issues": issues,
             "drc": { "violations": res.drc.violations.len(), "connectivity": res.drc.connectivity },
         });
@@ -286,6 +300,15 @@ mod tests {
         assert_eq!(rs.matches[1].skew_mm, Some(0.5));
         assert!(parse_rules("[[match]]\nname=\"x\"\nskew_mm=0.1\nbogus=1").is_err());
         assert_eq!(rs.stackup.and_then(|s| s.outer_dielectric_mm), Some(0.2));
+    }
+
+    #[test]
+    fn routing_table_switches_via_in_pad_and_defaults_off() {
+        assert!(!parse_rules("").expect("empty").via_in_pad());
+        assert!(!parse_rules("[routing]").expect("empty table").via_in_pad());
+        assert!(parse_rules("[routing]\nvia_in_pad = true").expect("on").via_in_pad());
+        assert!(!parse_rules("[routing]\nvia_in_pad = false").expect("off").via_in_pad());
+        assert!(parse_rules("[routing]\nvia_in_pads = true").is_err(), "typo rejected");
     }
 
     #[test]

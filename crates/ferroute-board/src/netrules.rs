@@ -29,6 +29,14 @@ pub struct StackupSpec {
     pub board_thickness_mm: Option<f64>,
 }
 
+/// Router switches from the rules file (`[routing]`; all optional).
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RoutingSpec {
+    /// Allow vias inside SMD pads (needs filled and capped vias: extra fabrication cost).
+    pub via_in_pad: Option<bool>,
+}
+
 /// One rule: selector globs plus the constraints it sets.
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -102,6 +110,8 @@ impl MatchRule {
 pub struct RuleSet {
     #[serde(default)]
     pub stackup: Option<StackupSpec>,
+    #[serde(default)]
+    pub routing: Option<RoutingSpec>,
     #[serde(default, rename = "net")]
     pub rules: Vec<NetRule>,
     #[serde(default, rename = "match")]
@@ -189,6 +199,12 @@ impl NetRule {
 }
 
 impl RuleSet {
+    /// `[routing] via_in_pad` (`false` when absent).
+    #[must_use]
+    pub fn via_in_pad(&self) -> bool {
+        self.routing.as_ref().and_then(|r| r.via_in_pad).unwrap_or(false)
+    }
+
     /// Checks every value; nothing is applied if any is invalid.
     ///
     /// # Errors

@@ -314,6 +314,18 @@ impl Obstacles {
     /// Exact state of a through via of class `cg` centred at `p` (all layers).
     #[must_use]
     pub fn classify_via(&self, p: Point, cg: &ClassGeom) -> u32 {
+        self.classify_via_in(p, cg, None)
+    }
+
+    /// Like [`Obstacles::classify_via`], but the via may sit inside its own pad: the pad
+    /// copper `own` of net `net` is neither a policy block nor a clearance conflict (the
+    /// caller guarantees the via copper lies within it). Every other pad stays blocking.
+    #[must_use]
+    pub fn classify_via_in_pad(&self, p: Point, cg: &ClassGeom, own: &Hull, net: NetId) -> u32 {
+        self.classify_via_in(p, cg, Some((own, net)))
+    }
+
+    fn classify_via_in(&self, p: Point, cg: &ClassGeom, own: Option<(&Hull, NetId)>) -> u32 {
         if !self.inside_board(p) {
             return BLOCKED;
         }
@@ -336,8 +348,10 @@ impl Obstacles {
                         return BLOCKED;
                     }
                 }
+                ObsKind::Copper { pad: true, .. }
+                    if own.is_some_and(|(h, n)| o.net == n && &o.hull == h) => {}
                 ObsKind::Copper { clearance, pad } => {
-                    // Policy: no via-in-pad (any net).
+                    // Policy: no via-in-pad (any net) unless explicitly allowed above.
                     if pad && copper.clearance_violated(&o.hull, 0) {
                         return BLOCKED;
                     }
