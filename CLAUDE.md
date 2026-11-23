@@ -47,6 +47,10 @@ layout engineer accept this result without touching it?"
      share a crate); don't re-run green checks without a change in between.
   5. The lead always verifies the result against what was ordered (diff review, tests,
      oracle/KiCad DRC, rendered output) and fixes or re-delegates gaps before committing.
+* **Autonomy:** the lead works continuously through the task board in priority order —
+  decide, delegate, verify, merge, push — without waiting for approval between steps.
+  Ask the user only for genuinely blocking decisions (credentials, irreversible external
+  actions, conflicting requirements).
 * **Delegation rules:** the lead writes the interface contract (types + signatures), the
   acceptance tests or criteria, and the list of files the worker may touch. Workers never
   edit crates they do not own, never edit the root `Cargo.toml` (add crate-local deps and
