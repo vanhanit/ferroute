@@ -22,32 +22,7 @@ fn mm_field(o: &Map<String, Value>, key: &str) -> Option<Coord> {
     o.get(key).and_then(Value::as_f64).map(mm_to_nm)
 }
 
-/// Glob match with `*` (any run) and `?` (one char).
-fn glob(pattern: &str, text: &str) -> bool {
-    let p: Vec<char> = pattern.chars().collect();
-    let t: Vec<char> = text.chars().collect();
-    let (mut pi, mut ti) = (0usize, 0usize);
-    let mut star: Option<(usize, usize)> = None;
-    while ti < t.len() {
-        if pi < p.len() && (p[pi] == '?' || p[pi] == t[ti]) {
-            pi += 1;
-            ti += 1;
-        } else if pi < p.len() && p[pi] == '*' {
-            star = Some((pi, ti));
-            pi += 1;
-        } else if let Some((sp, st)) = star {
-            pi = sp + 1;
-            ti = st + 1;
-            star = Some((sp, st + 1));
-        } else {
-            return false;
-        }
-    }
-    while pi < p.len() && p[pi] == '*' {
-        pi += 1;
-    }
-    pi == p.len()
-}
+use ferroute_board::glob;
 
 /// Fills `board.rules` (net classes, board-level minima) and each net's class from the
 /// contents of a `.kicad_pro` file.
@@ -210,21 +185,4 @@ pub fn write_project_json(board: &Board) -> String {
     let mut s = serde_json::to_string_pretty(&doc).unwrap_or_default();
     s.push('\n');
     s
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn globbing() {
-        assert!(glob("*", "anything"));
-        assert!(glob("+3V*", "+3V3"));
-        assert!(glob("D?", "D1"));
-        assert!(!glob("D?", "D12"));
-        assert!(glob("*GND*", "AGND_SENSE"));
-        assert!(!glob("GND", "GNDA"));
-        assert!(glob("a*b*c", "aXXbYYc"));
-        assert!(!glob("a*b*c", "aXXbYY"));
-    }
 }

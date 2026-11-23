@@ -243,8 +243,8 @@ fn project_patterns_and_inheritance() {
         r#"(footprint "L:X" (layer "F.Cu") (at 1 1) (pad "1" smd rect (at 0 0) (size 1 1) (layers "F.Cu") (net 1 "N1")))"#,
     )
     .board;
-    b.nets.push(ferroute_board::Net { name: "+5V_USB".into(), class: 0 });
-    b.nets.push(ferroute_board::Net { name: "CLK".into(), class: 0 });
+    b.nets.push(ferroute_board::Net::new("+5V_USB", 0));
+    b.nets.push(ferroute_board::Net::new("CLK", 0));
     let json = r#"{
       "board": {"design_settings": {"rules": {"min_hole_to_hole": 0.3, "min_through_hole_diameter": 0.2}}},
       "net_settings": {

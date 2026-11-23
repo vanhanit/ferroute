@@ -47,7 +47,7 @@ impl BoardBuilder {
                 .into_iter()
                 .map(|name| CopperLayer { name, routable: true })
                 .collect(),
-            nets: vec![Net { name: String::new(), class: 0 }],
+            nets: vec![Net::new(String::new(), 0)],
             outline: Outline {
                 outer: Polygon::from_rect(Rect::new(Point::ORIGIN, Point::new(w, h))),
                 holes: vec![],
@@ -67,7 +67,7 @@ impl BoardBuilder {
         if let Some(id) = self.board.net_by_name(name) {
             return id;
         }
-        self.board.nets.push(Net { name: name.to_owned(), class: 0 });
+        self.board.nets.push(Net::new(name.to_owned(), 0));
         NetId(u32::try_from(self.board.nets.len() - 1).unwrap_or(u32::MAX))
     }
 

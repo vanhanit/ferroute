@@ -14,8 +14,12 @@ use ferroute_geom::{Angle, Coord, Hull, Point, Polygon, Rect};
 use serde::{Deserialize, Serialize};
 
 pub mod builder;
+pub mod constraints;
+pub mod netrules;
 pub mod rules;
+pub mod text;
 pub use rules::{DesignRules, NetClass};
+pub use text::glob;
 
 macro_rules! id_type {
     ($(#[$m:meta])* $name:ident) => {
@@ -130,6 +134,17 @@ pub struct Net {
     pub name: String,
     /// Index into [`DesignRules::classes`].
     pub class: u16,
+    /// Electrical constraints (current, frequency, impedance, length, vias).
+    #[serde(default)]
+    pub constraints: constraints::NetConstraints,
+}
+
+impl Net {
+    /// A net without electrical constraints.
+    #[must_use]
+    pub fn new(name: impl Into<String>, class: u16) -> Self {
+        Self { name: name.into(), class, constraints: constraints::NetConstraints::default() }
+    }
 }
 
 /// Which side of the board a footprint is mounted on.
@@ -406,6 +421,8 @@ pub struct Board {
     pub keepouts: Vec<Keepout>,
     pub outline: Outline,
     pub rules: DesignRules,
+    #[serde(default)]
+    pub stackup: constraints::Stackup,
 }
 
 /// Errors from [`Board::validate`].

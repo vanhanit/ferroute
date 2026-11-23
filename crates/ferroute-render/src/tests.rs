@@ -14,7 +14,7 @@ fn test_board() -> Board {
             CopperLayer { name: "F.Cu".into(), routable: true },
             CopperLayer { name: "B.Cu".into(), routable: true },
         ],
-        nets: vec![Net { name: String::new(), class: 0 }, Net { name: "SIG&<>".into(), class: 0 }],
+        nets: vec![Net::new(String::new(), 0), Net::new("SIG&<>", 0)],
         outline: Outline {
             outer: Polygon::from_rect(Rect::new(
                 Point::new(0, 0),

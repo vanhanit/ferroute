@@ -62,7 +62,7 @@ fn num_at(node: &SExpr, i: usize) -> Result<Coord, KicadError> {
 impl Reader {
     fn net_new(&mut self, name: &str) -> NetId {
         let id = NetId(u32::try_from(self.nets.len()).unwrap_or(u32::MAX));
-        self.nets.push(Net { name: name.to_owned(), class: 0 });
+        self.nets.push(Net::new(name.to_owned(), 0));
         self.by_name.insert(name.to_owned(), id);
         id
     }
@@ -436,7 +436,7 @@ pub(crate) fn parse_board(root: &SExpr) -> Result<Parsed, KicadError> {
     let layers = Layers::from_root(root)?;
     let mut r = Reader {
         layers: layers.clone(),
-        nets: vec![Net { name: String::new(), class: 0 }],
+        nets: vec![Net::new(String::new(), 0)],
         by_name: HashMap::new(),
         by_code: HashMap::new(),
         warnings: Vec::new(),
