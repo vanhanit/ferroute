@@ -20,6 +20,8 @@ pub enum IssueKind {
     Skew { group: String, spread: Coord, max: Coord },
     /// More vias than allowed.
     ViaCount { actual: u32, max: u32 },
+    /// The impedance target cannot be reached by any width with this stack-up.
+    Impedance { target_mohm: u32 },
 }
 
 impl IssueKind {
@@ -30,6 +32,7 @@ impl IssueKind {
             Self::Length { .. } => "length",
             Self::Skew { .. } => "skew",
             Self::ViaCount { .. } => "vias",
+            Self::Impedance { .. } => "impedance",
         }
     }
 }
@@ -66,6 +69,10 @@ impl ConstraintIssue {
             IssueKind::ViaCount { actual, max } => {
                 format!("net {net}: {actual} vias > allowed {max}")
             }
+            IssueKind::Impedance { target_mohm } => format!(
+                "net {net}: impedance {:.1} Ω unattainable with this stack-up",
+                f64::from(*target_mohm) / 1000.0
+            ),
         }
     }
 }
@@ -123,6 +130,11 @@ pub fn check_constraints(board: &Board) -> Vec<ConstraintIssue> {
                 net: id,
                 kind: IssueKind::Length { actual: l, min: c.length_min, max: c.length_max },
             });
+        }
+        if let Some(z) = c.impedance_mohm
+            && ferroute_board::constraints::impedance_unattainable(board, id)
+        {
+            out.push(ConstraintIssue { net: id, kind: IssueKind::Impedance { target_mohm: z } });
         }
         if let Some(max) = c.max_vias
             && vias[i] > max
