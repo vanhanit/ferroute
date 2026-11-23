@@ -189,7 +189,7 @@ Completion and DRC come first; within that, every result must look hand-tuned:
 
 | # | Task | Owner | Notes |
 |---|---|---|---|
-| 1 | Gridless post-optimiser: any-angle shortcutting (Theta\*-style) + 45° smoothing, verified by oracle | Lead | M2 |
+| 1 | Gridless post-optimiser: extend `router::straighten` (octilinear 1–2-segment chain shortcuts exist) to fine-pitch fan-outs (U1-style jogs) and via repositioning | Lead + worker | M2 |
 | 2 | Per-layer preferred directions + via minimisation pass | Lead | M2 |
 | 3 | Differential pairs (Dubins-aware): coupled routing with constant gap, symmetric tuning | Lead | M2; length tuning exists (`router::tune`, `router::meander`) |
 | 4 | Region-window LNS (rip-up + nudge around failures) | Lead | M2 |
