@@ -142,6 +142,25 @@ mod tests {
 
     use super::*;
 
+    /// `HeadlessServer::spawn` that retries ETXTBSY ("text file busy"): a parallel test's
+    /// fork can briefly hold the write handle of a script we just created.
+    fn spawn_retry(
+        cli: &Path,
+        board: Option<&Path>,
+        sock: &Path,
+        timeout: Duration,
+    ) -> Result<HeadlessServer, IpcError> {
+        for _ in 0..50 {
+            match HeadlessServer::spawn(cli, board, sock, timeout) {
+                Err(IpcError::Io(e)) if e.raw_os_error() == Some(26) => {
+                    std::thread::sleep(Duration::from_millis(20));
+                }
+                other => return other,
+            }
+        }
+        HeadlessServer::spawn(cli, board, sock, timeout)
+    }
+
     fn script(dir: &Path, name: &str, body: &str) -> PathBuf {
         let p = dir.join(name);
         std::fs::write(&p, format!("#!/bin/sh\n{body}\n")).unwrap();
@@ -165,8 +184,7 @@ mod tests {
         let d = tempfile::tempdir().unwrap();
         let cli = script(d.path(), "kicad-cli", "exit 3");
         let err =
-            HeadlessServer::spawn(&cli, None, &d.path().join("s.sock"), Duration::from_secs(5))
-                .unwrap_err();
+            spawn_retry(&cli, None, &d.path().join("s.sock"), Duration::from_secs(5)).unwrap_err();
         assert!(matches!(err, IpcError::Protocol(m) if m.contains("exited early")));
     }
 
@@ -174,16 +192,15 @@ mod tests {
     fn never_ready_times_out_and_kills_child() {
         let d = tempfile::tempdir().unwrap();
         let cli = script(d.path(), "kicad-cli", "sleep 30");
-        let err =
-            HeadlessServer::spawn(&cli, None, &d.path().join("s.sock"), Duration::from_millis(400))
-                .unwrap_err();
+        let err = spawn_retry(&cli, None, &d.path().join("s.sock"), Duration::from_millis(400))
+            .unwrap_err();
         assert!(matches!(err, IpcError::Timeout));
     }
 
     #[test]
     fn spawn_of_missing_binary_is_io_error() {
         let d = tempfile::tempdir().unwrap();
-        let err = HeadlessServer::spawn(
+        let err = spawn_retry(
             &d.path().join("no-such-kicad-cli"),
             None,
             &d.path().join("s.sock"),
@@ -201,8 +218,7 @@ mod tests {
             script(d.path(), "kicad-cli", &format!("echo \"$@\" > '{}'\nexit 7", out.display()));
         let sock = d.path().join("s.sock");
         let board = d.path().join("b.kicad_pcb");
-        let err =
-            HeadlessServer::spawn(&cli, Some(&board), &sock, Duration::from_secs(5)).unwrap_err();
+        let err = spawn_retry(&cli, Some(&board), &sock, Duration::from_secs(5)).unwrap_err();
         assert!(matches!(&err, IpcError::Protocol(m) if m.contains("exited early")), "{err:?}");
         let args = std::fs::read_to_string(&out).unwrap();
         assert_eq!(
@@ -245,7 +261,7 @@ mod tests {
             // keep the connection until the client side drops it
             let _ = nng::read_msg(&mut s);
         });
-        let server = HeadlessServer::spawn(&cli, None, &sock, Duration::from_secs(10)).unwrap();
+        let server = spawn_retry(&cli, None, &sock, Duration::from_secs(10)).unwrap();
         assert_eq!(server.endpoint().socket_path(), sock);
         assert!(server.pid() > 0);
         drop(server);
