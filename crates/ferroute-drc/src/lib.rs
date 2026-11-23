@@ -26,6 +26,7 @@ use serde::{Deserialize, Serialize};
 
 pub mod connectivity;
 pub mod quality;
+pub mod rules;
 pub use connectivity::{Connectivity, Unconnected};
 
 /// What the oracle checks.
