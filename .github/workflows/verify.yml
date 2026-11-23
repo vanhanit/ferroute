@@ -26,6 +26,8 @@ jobs:
       - name: Install toolchain (rust-toolchain.toml)
         run: rustup show active-toolchain || rustup toolchain install
       - run: cargo fmt --all -- --check
+      - name: Toolchain pins aligned (rust-toolchain.toml, Dockerfile, rust-version)
+        run: scripts/check_toolchain.sh
 
   clippy:
     runs-on: ubuntu-24.04
@@ -141,7 +143,9 @@ jobs:
           [ ${#boards[@]} -gt 0 ] || { echo "no boards"; exit 1; }
           for f in "${boards[@]}"; do
             n=$(basename "$f" .kicad_pcb)
-            ./bin/ferroute route "$f" -o "out/$n.routed.kicad_pcb" --report "out/$n.json" --svg "out/$n.svg" --seed 1
+            rules=()
+            [ -f "testdata/rules/$n.toml" ] && rules=(--rules "testdata/rules/$n.toml" --strict-rules)
+            ./bin/ferroute route "$f" -o "out/$n.routed.kicad_pcb" --report "out/$n.json" --svg "out/$n.svg" --seed 1 "${rules[@]}"
           done
       - name: KiCad DRC
         shell: bash

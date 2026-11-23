@@ -119,64 +119,38 @@ jobs:
           name: release-notes
           path: release-notes.md
 
+  # All release binaries are cross-compiled from Linux inside the Docker `cross` stage
+  # (cargo-zigbuild; zig as the cross linker). Native macOS/Windows runners are only used
+  # for running the test-suite (verify.yml), not for producing artifacts.
   binaries:
-    name: binary (${{ matrix.target }})
+    name: binaries (cross-compiled in Linux container)
     needs: release
     if: needs.release.outputs.released == 'true'
-    runs-on: ${{ matrix.os }}
-    timeout-minutes: 60
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
     permissions:
       contents: read
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - { target: x86_64-unknown-linux-musl, os: ubuntu-24.04, musl: true }
-          - { target: aarch64-unknown-linux-musl, os: ubuntu-24.04-arm, musl: true }
-          - { target: x86_64-apple-darwin, os: macos-latest }
-          - { target: aarch64-apple-darwin, os: macos-latest }
-          - { target: x86_64-pc-windows-msvc, os: windows-latest, ext: .exe }
-    defaults:
-      run:
-        shell: bash
     env:
       TAG: ${{ needs.release.outputs.tag }}
     steps:
       - uses: actions/checkout@v7
         with:
           ref: ${{ needs.release.outputs.tag }}
-      - run: rustup show active-toolchain || rustup toolchain install
-      - run: rustup target add ${{ matrix.target }}
-      - if: matrix.musl
-        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends musl-tools
-      - uses: Swatinem/rust-cache@v2
+      - uses: docker/setup-buildx-action@v4
+      - name: Build cross-compilation image
+        uses: docker/build-push-action@v7
         with:
-          key: ${{ matrix.target }}
-      - run: cargo build --release --locked --target ${{ matrix.target }} -p ferroute-cli
-      - name: Package
-        env:
-          TARGET: ${{ matrix.target }}
-          EXT: ${{ matrix.ext }}
-        run: |
-          set -euo pipefail
-          name="ferroute-${TAG}-${TARGET}"
-          mkdir -p "dist/$name"
-          cp "target/${TARGET}/release/ferroute${EXT}" "dist/$name/"
-          cp LICENSE NOTICE COMMERCIAL.md README.md "dist/$name/"
-          cd dist
-          if [ "$RUNNER_OS" = "Windows" ]; then
-            powershell -NoProfile -Command "Compress-Archive -Path '$name' -DestinationPath '$name.zip'"
-            archive="$name.zip"
-          else
-            tar -czf "$name.tar.gz" "$name"
-            archive="$name.tar.gz"
-          fi
-          if command -v sha256sum >/dev/null; then sha256sum "$archive" > "$archive.sha256"; else shasum -a 256 "$archive" > "$archive.sha256"; fi
-          cat "$archive.sha256"
-          rm -rf "$name"
+          context: .
+          target: cross
+          load: true
+          tags: ferroute-cross:ci
+          cache-from: type=gha,scope=cross
+          cache-to: type=gha,mode=max,scope=cross
+      - name: Cross-compile and package every target
+        run: docker run --rm -v "$PWD":/work -w /work ferroute-cross:ci scripts/dist.sh "$TAG"
       - uses: actions/upload-artifact@v7
         with:
-          name: ferroute-${{ matrix.target }}
+          name: ferroute-binaries
           path: dist/*
           if-no-files-found: error
 

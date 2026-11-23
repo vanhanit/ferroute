@@ -36,7 +36,7 @@ endif
 # Cargo target dir as seen by commands executed through RUN (shell-expanded there).
 TGT := $${CARGO_TARGET_DIR:-target}
 
-.PHONY: help dev-image shell build test test-gpu fmt fmt-check lint bench drc-bench audit coverage \
+.PHONY: help dev-image shell build test test-gpu fmt fmt-check lint bench drc-bench audit coverage dist \
         sonar sonar-up sonar-down e2e kicad10-drc docker-build release changelog hooks clean
 
 help: ## Show this help
@@ -65,7 +65,8 @@ fmt: ## Format sources with rustfmt
 fmt-check: ## Check formatting
 	$(call RUN,cargo fmt --all -- --check)
 
-lint: fmt-check ## rustfmt check + clippy (-D warnings)
+lint: fmt-check ## rustfmt check + clippy (-D warnings) + toolchain alignment
+	scripts/check_toolchain.sh
 	$(call RUN,cargo clippy --workspace --all-targets --locked -- -D warnings)
 
 bench: ## Criterion benchmarks
@@ -90,8 +91,8 @@ sonar-up: ## Start local SonarQube (http://localhost:9000)
 sonar-down: ## Stop local SonarQube
 	$(DOCKER) compose --profile sonar down
 
-e2e: ## Route every testdata board, then run ferroute's own DRC on the result
-	$(call RUN,cargo build --release --locked -p ferroute-cli && mkdir -p out && for f in testdata/boards/*.kicad_pcb; do n=$$(basename $$f .kicad_pcb); echo "== $$n"; $(TGT)/release/ferroute route $$f -o out/$$n.routed.kicad_pcb --report out/$$n.json --svg out/$$n.svg --seed 1; $(TGT)/release/ferroute drc out/$$n.routed.kicad_pcb --fail-on-violation; done)
+e2e: ## Route every testdata board (with testdata/rules/<board>.toml if present), then run ferroute's DRC
+	$(call RUN,cargo build --release --locked -p ferroute-cli && mkdir -p out && for f in testdata/boards/*.kicad_pcb; do n=$$(basename $$f .kicad_pcb); echo "== $$n"; r=""; [ -f testdata/rules/$$n.toml ] && r="--rules testdata/rules/$$n.toml --strict-rules"; $(TGT)/release/ferroute route $$f -o out/$$n.routed.kicad_pcb --report out/$$n.json --svg out/$$n.svg --seed 1 $$r || exit 1; $(TGT)/release/ferroute drc out/$$n.routed.kicad_pcb --fail-on-violation; done)
 
 kicad10-drc: ## Independent KiCad 10 DRC on routed boards (run `make e2e` first)
 	@test -n "$(BOARDS)" || { echo "no boards in testdata/boards"; exit 1; }
@@ -104,6 +105,17 @@ docker-build: ## Build the runtime image
 
 release: ## Static musl release binary into dist/
 	$(call RUN,cargo build --release --locked --target x86_64-unknown-linux-musl -p ferroute-cli && mkdir -p dist && cp $(TGT)/x86_64-unknown-linux-musl/release/ferroute dist/ferroute-x86_64-unknown-linux-musl)
+
+CROSS_IMAGE ?= ferroute-cross:local
+TAG ?= dev
+dist: ## Cross-compile + package every release target in the Linux `cross` container (TAG=vX.Y.Z)
+ifeq ($(NATIVE),1)
+	scripts/dist.sh $(TAG)
+else
+	DOCKER_BUILDKIT=1 $(DOCKER) build --target cross -t $(CROSS_IMAGE) .
+	$(DOCKER) run --rm -u $(UID_GID) -e HOME=/tmp -e CARGO_HOME=/usr/local/cargo -v "$(PWD_)":/work -w /work \
+	  -v ferroute-cargo-registry:/usr/local/cargo/registry $(CROSS_IMAGE) scripts/dist.sh $(TAG)
+endif
 
 changelog: ## Regenerate CHANGELOG.md with git-cliff
 	$(call RUN,git cliff --config cliff.toml --output CHANGELOG.md)

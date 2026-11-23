@@ -1,5 +1,5 @@
 # syntax=docker/dockerfile:1.7
-# ferroute — multi-stage build. Targets: base, tools, dev, builder, runtime.
+# ferroute — multi-stage build. Targets: base, tools, dev, cross, builder, runtime.
 # Every base image is pinned by tag AND digest (Dependabot's docker ecosystem bumps both).
 
 ############################ base ############################
@@ -14,7 +14,7 @@ RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
     rm -f /etc/apt/apt.conf.d/docker-clean \
     && apt-get update \
     && apt-get install -y --no-install-recommends \
-        ca-certificates git pkg-config make python3 musl-tools \
+        ca-certificates git pkg-config make python3 python3-venv musl-tools \
         mesa-vulkan-drivers libvulkan1
 RUN rustup component add rustfmt clippy \
     && rustup target add x86_64-unknown-linux-musl
@@ -36,6 +36,26 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry \
         cargo-llvm-cov@${CARGO_LLVM_COV_VERSION} \
         cargo-nextest@${CARGO_NEXTEST_VERSION} \
         git-cliff@${GIT_CLIFF_VERSION}
+
+############################ cross ############################
+# One Linux container cross-compiles every release target (zig is the cross linker;
+# Windows uses the GNU target because MSVC needs the Windows SDK). `make dist`.
+FROM base AS cross
+ARG ZIG_VERSION=0.17.1
+ARG CARGO_ZIGBUILD_VERSION=0.24.1
+RUN python3 -m venv /opt/zig \
+    && /opt/zig/bin/pip install --no-cache-dir "ziglang==${ZIG_VERSION}" \
+    && ln -s /opt/zig/bin/python-zig /usr/local/bin/python-zig
+ENV PATH="/opt/zig/bin:${PATH}"
+RUN rustup target add aarch64-unknown-linux-musl x86_64-apple-darwin aarch64-apple-darwin x86_64-pc-windows-gnu
+RUN --mount=type=cache,target=/usr/local/cargo/registry \
+    --mount=type=cache,target=/tmp/zb-target \
+    CARGO_TARGET_DIR=/tmp/zb-target cargo install --locked cargo-zigbuild@${CARGO_ZIGBUILD_VERSION}
+# Any `-u uid:gid` must be able to use the toolchain, registry and zig cache.
+RUN chmod -R a+rwX /usr/local/cargo /usr/local/rustup /opt/zig \
+    && git config --system --add safe.directory /work
+ENV ZIG_GLOBAL_CACHE_DIR=/tmp/zig-cache
+WORKDIR /work
 
 ############################ dev ############################
 FROM base AS dev
