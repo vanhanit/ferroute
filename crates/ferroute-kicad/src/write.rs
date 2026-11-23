@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 //! Complete KiCad 10 `.kicad_pcb` generation from a [`Board`].
 
-use crate::doc::{track_node, via_node};
+use crate::doc::{arc_node, track_node, via_node};
 use crate::layers::kicad_cu_id;
 use crate::read::NetDialect;
 use crate::sexpr::SExpr;
@@ -347,6 +347,11 @@ fn build(board: &Board, seed: u64) -> SExpr {
     let dialect = NetDialect::Names;
     for (i, t) in board.tracks.iter().enumerate() {
         if let Ok(n) = track_node(&dialect, board, t, seed, i as u64) {
+            root.push(n);
+        }
+    }
+    for (i, a) in board.arcs.iter().enumerate() {
+        if let Ok(n) = arc_node(&dialect, board, a, seed, i as u64) {
             root.push(n);
         }
     }

@@ -6,12 +6,13 @@ use crate::KicadError;
 use crate::read::NetDialect;
 use crate::sexpr::SExpr;
 use crate::util::{float, format_angle, kq, kv, node, norm180, same_angle, uuid_for, xy_node};
-use ferroute_board::{Board, BoardEdit, Placement, Track, Via};
+use ferroute_board::{ArcTrack, Board, BoardEdit, Placement, Track, Via};
 use ferroute_geom::units::{format_mm, parse_mm};
 
 /// UUID kinds (domain separation for [`uuid_for`]).
 pub(crate) const KIND_TRACK: u64 = 1;
 pub(crate) const KIND_VIA: u64 = 2;
+pub(crate) const KIND_ARC: u64 = 3;
 
 /// A parsed `.kicad_pcb` that can be edited in place and written back.
 #[derive(Clone, Debug)]
@@ -24,6 +25,7 @@ pub struct KicadDocument {
     /// Number of tracks / vias this document has appended (keeps UUIDs unique across
     /// successive edits with the same seed).
     pub(crate) added_tracks: u64,
+    pub(crate) added_arcs: u64,
     pub(crate) added_vias: u64,
 }
 
@@ -175,6 +177,29 @@ pub(crate) fn track_node(
     Ok(node("segment", items))
 }
 
+/// `(arc ...)` track node in KiCad 10 attribute order.
+pub(crate) fn arc_node(
+    dialect: &NetDialect,
+    board: &Board,
+    a: &ArcTrack,
+    seed: u64,
+    index: u64,
+) -> Result<SExpr, KicadError> {
+    let mut items = vec![
+        xy_node("start", a.start),
+        xy_node("mid", a.mid),
+        xy_node("end", a.end),
+        kv("width", format_mm(a.width)),
+    ];
+    if a.locked {
+        items.push(kv("locked", "yes"));
+    }
+    items.push(kq("layer", layer_name(board, a.layer)?));
+    items.push(net_node(dialect, board, a.net)?);
+    items.push(kq("uuid", uuid_for(seed, KIND_ARC, index)));
+    Ok(node("arc", items))
+}
+
 /// `(via ...)` node in KiCad 10 attribute order.
 pub(crate) fn via_node(
     dialect: &NetDialect,
@@ -217,7 +242,7 @@ impl KicadDocument {
         dialect: NetDialect,
         fp_nodes: Vec<usize>,
     ) -> Self {
-        Self { root, version, dialect, fp_nodes, added_tracks: 0, added_vias: 0 }
+        Self { root, version, dialect, fp_nodes, added_tracks: 0, added_arcs: 0, added_vias: 0 }
     }
 
     /// The `(version N)` of the file (KiCad 10 writes 20260206).
@@ -272,7 +297,7 @@ impl KicadDocument {
 
     /// Applies `edit` (computed against `board_before`) to the tree: rewrites the `(at)` of
     /// moved footprints (and rotates pad/text angles by the same delta as KiCad does) and
-    /// appends new segments and vias. No other node is modified. Output is deterministic in
+    /// appends new segments, arcs and vias (in that order). No other node is modified. Output is deterministic in
     /// `(document, edit, seed)`.
     ///
     /// # Errors
@@ -292,10 +317,16 @@ impl KicadDocument {
             ));
         }
         // Build everything first so a failure leaves the document untouched.
-        let mut new_nodes = Vec::with_capacity(edit.new_tracks.len() + edit.new_vias.len());
+        // New copper order: segments, then arcs, then vias.
+        let mut new_nodes =
+            Vec::with_capacity(edit.new_tracks.len() + edit.new_arcs.len() + edit.new_vias.len());
         for (i, t) in edit.new_tracks.iter().enumerate() {
             let idx = self.added_tracks + i as u64;
             new_nodes.push(track_node(&self.dialect, board_before, t, seed, idx)?);
+        }
+        for (i, a) in edit.new_arcs.iter().enumerate() {
+            let idx = self.added_arcs + i as u64;
+            new_nodes.push(arc_node(&self.dialect, board_before, a, seed, idx)?);
         }
         for (i, v) in edit.new_vias.iter().enumerate() {
             let idx = self.added_vias + i as u64;
@@ -327,6 +358,7 @@ impl KicadDocument {
             }
         }
         self.added_tracks += edit.new_tracks.len() as u64;
+        self.added_arcs += edit.new_arcs.len() as u64;
         self.added_vias += edit.new_vias.len() as u64;
         Ok(())
     }

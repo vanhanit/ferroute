@@ -332,3 +332,101 @@ fn legacy_numeric_dialect_edit() {
         assert!(near(expect.pad_position(id), after.board.pad_position(id), 1));
     }
 }
+
+fn arc_edit(net: NetId) -> BoardEdit {
+    BoardEdit {
+        new_arcs: vec![ferroute_board::ArcTrack {
+            start: Point::new(mm(110.0), mm(110.0)),
+            mid: Point::new(mm(111.0), mm(110.25)),
+            end: Point::new(mm(112.0), mm(111.0)),
+            width: mm(0.25),
+            layer: LayerId(0),
+            net,
+            locked: false,
+            origin: Origin::Routed,
+        }],
+        ..BoardEdit::default()
+    }
+}
+
+/// The `(arc ...)` block of `text` and `text` without it.
+fn split_arc(text: &str) -> (String, String) {
+    let a = text.rfind("\t(arc\n").expect("arc node");
+    let b = a + text[a..].find("\n\t)\n").unwrap() + 4;
+    let flat = text[a..b]
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .replace("( ", "(")
+        .replace(" )", ")");
+    (flat, format!("{}{}", &text[..a], &text[b..]))
+}
+
+fn arc_flat(text: &str) -> String {
+    split_arc(text).0
+}
+
+fn arc_edit_roundtrip(name: &str, net_name: &str) -> (String, String) {
+    let kb = load(name);
+    let board = kb.board.clone();
+    let net = board.net_by_name(net_name).unwrap();
+    let edit = arc_edit(net);
+    let before = kb.doc.to_kicad_string();
+    let mut doc = kb.doc;
+    doc.apply_edit(&board, &edit, 7).unwrap();
+    let text = doc.to_kicad_string();
+    // untouched text is byte-identical: removing the arc node restores the input
+    let line = arc_flat(&text);
+    let again = {
+        let mut d2 = load(name).doc;
+        d2.apply_edit(&board, &edit, 7).unwrap();
+        d2.to_kicad_string()
+    };
+    assert_eq!(text, again, "deterministic");
+    assert_ne!(text, before);
+    let b = read_board(&text, &ReadOptions::default()).unwrap().board;
+    assert!(!b.tracks.is_empty());
+    let chords: Vec<_> =
+        b.tracks.iter().filter(|t| t.net == net && t.layer == LayerId(0)).collect();
+    let (s, e) = (Point::new(mm(110.0), mm(110.0)), Point::new(mm(112.0), mm(111.0)));
+    assert!(chords.iter().any(|t| t.start == s || t.end == s));
+    assert!(chords.iter().any(|t| t.start == e || t.end == e));
+    (text, line.trim().to_string())
+}
+
+#[test]
+fn arc_written_kicad10_names() {
+    let (text, line) = arc_edit_roundtrip("demo_2layer.kicad_pcb", "SDA");
+    assert!(line.starts_with("(arc (start 110 110) (mid 111 110.25) (end 112 111) (width 0.25)"));
+    assert!(line.contains("(layer \"F.Cu\") (net \"SDA\") (uuid \""), "{line}");
+    // removing the arc line gives the original byte-for-byte
+    let orig = load("demo_2layer.kicad_pcb").doc.to_kicad_string();
+    assert_eq!(split_arc(&text).1, orig);
+}
+
+#[test]
+fn arc_written_kicad9_numeric() {
+    let (text, line) = arc_edit_roundtrip("legacy_v9_numeric.kicad_pcb", "SIG");
+    assert!(line.contains("(layer \"F.Cu\") (net 3) (uuid \""), "{line}");
+    let orig = load("legacy_v9_numeric.kicad_pcb").doc.to_kicad_string();
+    assert_eq!(split_arc(&text).1, orig);
+}
+
+#[test]
+fn empty_edit_leaves_file_unchanged() {
+    let kb = load("demo_2layer.kicad_pcb");
+    let board = kb.board.clone();
+    let orig = kb.doc.to_kicad_string();
+    let mut doc = kb.doc;
+    doc.apply_edit(&board, &BoardEdit::default(), 1).unwrap();
+    assert_eq!(doc.to_kicad_string(), orig);
+}
+
+#[test]
+fn new_board_writes_arcs() {
+    let mut b = load("demo_2layer.kicad_pcb").board;
+    let net = b.net_by_name("SDA").unwrap();
+    b.arcs = arc_edit(net).new_arcs;
+    let text = ferroute_kicad::write_new_board(&b, 3);
+    assert!(arc_flat(&text).starts_with("(arc (start 110 110) (mid 111 110.25) (end 112 111)"));
+}
