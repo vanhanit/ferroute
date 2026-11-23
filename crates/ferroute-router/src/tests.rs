@@ -596,7 +596,15 @@ fn order_refinement_never_worse() {
     eprintln!("once {q0:?} full {q1:?} rounds {}", full.stats.order_rounds_run);
     assert!(q1 <= q0);
     assert_clean_and_complete(&board, &full, true);
-    let off = route(&board, &RouterConfig { order_rounds: 0, ..exact_cfg() }).expect("route");
+    let off = route(
+        &board,
+        &RouterConfig {
+            order_rounds: 0,
+            lns: lns::LnsConfig { rounds: 0, ..Default::default() },
+            ..exact_cfg()
+        },
+    )
+    .expect("route");
     assert_eq!(off.edit, once.edit);
     assert_eq!(off.stats.order_rounds_run, 0);
 }
@@ -623,4 +631,71 @@ fn chamfer_never_adds_bends_and_stats_match_the_oracle() {
         twice.apply(&again);
         assert!(ferroute_drc::quality::right_angles(&twice).len() <= r, "seed {seed}");
     }
+}
+
+// ---- coordinated rip-up & re-route (LNS) -------------------------------------------
+
+fn no_lns() -> RouterConfig {
+    RouterConfig { lns: lns::LnsConfig { rounds: 0, ..lns::LnsConfig::default() }, ..exact_cfg() }
+}
+
+#[test]
+fn lns_repairs_a_badly_ordered_corridor() {
+    // B routed first leaves A with a long detour; the order refinement is disabled, so
+    // only the coordinated re-route of {A, B} can recover the direct corridor.
+    let (board, _, n) = corridor_board();
+    let cfg = RouterConfig { order_rounds: 0, first: vec![n], ..no_lns() };
+    let start = route_once(&board, &cfg).expect("route");
+    let m0 = lns::measure(&board, &start.edit, &start.failed);
+    let better =
+        lns::improve(&board, &RouterConfig { lns: lns::LnsConfig::default(), ..cfg }, start)
+            .expect("lns");
+    let m1 = lns::measure(&board, &better.edit, &better.failed);
+    eprintln!(
+        "before {m0:?}\nafter {m1:?} stats {} / {}",
+        better.stats.lns_rounds_run, better.stats.lns_accepted
+    );
+    assert!(better.stats.lns_rounds_run > 0);
+    assert!(m1.improves_on(&m0), "{m0:?} -> {m1:?}");
+    assert!(better.stats.lns_accepted >= 1);
+    assert_clean_and_complete(&board, &better, true);
+}
+
+#[test]
+fn lns_is_never_worse_and_stays_clean() {
+    for seed in 0..10 {
+        let board = random_board(seed, 16);
+        let base = route(&board, &no_lns()).expect("route");
+        let m0 = lns::measure(&board, &base.edit, &base.failed);
+        let out = lns::improve(&board, &exact_cfg(), base).expect("lns");
+        let m1 = lns::measure(&board, &out.edit, &out.failed);
+        assert!(m1 == m0 || m1.improves_on(&m0), "seed {seed}: {m0:?} -> {m1:?}");
+        assert_clean_and_complete(&board, &out, false);
+        let mut after = board;
+        after.apply(&out.edit);
+        assert!(ferroute_drc::quality::acute_angles(&after).is_empty(), "seed {seed}");
+        assert_eq!(out.stats.slivers, m1.slivers);
+        assert_eq!(out.stats.vias, out.edit.new_vias.len());
+    }
+}
+
+#[test]
+fn lns_disabled_changes_nothing() {
+    let board = random_board(5, 12);
+    let base = route(&board, &no_lns()).expect("route");
+    let out = lns::improve(&board, &no_lns(), base.clone()).expect("lns");
+    assert_eq!(out.edit, base.edit);
+    assert_eq!(out.stats.lns_rounds_run, 0);
+}
+
+#[test]
+fn lns_is_deterministic_across_thread_counts() {
+    let board = random_board(11, 16);
+    let run = |threads: usize| {
+        let pool = rayon::ThreadPoolBuilder::new().num_threads(threads).build().expect("pool");
+        pool.install(|| route(&board, &exact_cfg()).expect("route"))
+    };
+    let (a, b) = (run(1), run(4));
+    assert_eq!(a.edit, b.edit, "thread count changed the LNS result");
+    assert_eq!(a.stats.lns_accepted, b.stats.lns_accepted);
 }

@@ -21,6 +21,7 @@ pub mod emit;
 pub mod grid;
 pub mod junction;
 pub mod legality;
+pub mod lns;
 pub mod meander;
 pub mod negotiate;
 pub mod plan;
@@ -88,6 +89,9 @@ pub struct RouterConfig {
     /// them (the pad is then connected directly). Off by default.
     #[serde(default)]
     pub via_in_pad: bool,
+    /// Coordinated rip-up & re-route of small net neighbourhoods after the first passes.
+    #[serde(default)]
+    pub lns: lns::LnsConfig,
 }
 
 const fn default_order_rounds() -> u32 {
@@ -115,6 +119,7 @@ impl Default for RouterConfig {
             first: Vec::new(),
             order_rounds: default_order_rounds(),
             via_in_pad: false,
+            lns: lns::LnsConfig::default(),
         }
     }
 }
@@ -147,6 +152,12 @@ pub struct RouteStats {
     pub drc_gate_rips: usize,
     /// Detour-driven re-ordering rounds that were run (0 = first pass was kept as is).
     pub order_rounds_run: u32,
+    /// Large-neighbourhood re-route attempts that were run.
+    #[serde(default)]
+    pub lns_rounds_run: u32,
+    /// Of those, the ones that improved the result and were kept.
+    #[serde(default)]
+    pub lns_accepted: u32,
     /// Sum of detour excess (mm) of the returned outcome.
     pub detour_excess_mm: f64,
 }
@@ -255,6 +266,10 @@ pub fn route(board: &Board, cfg: &RouterConfig) -> Result<RouteOutcome, RouteErr
         }
     }
     best.stats.order_rounds_run = run;
+    if cfg.lns.rounds > 0 {
+        best = lns::improve(board, cfg, best)?;
+        best_q = detour::quality(board, &best);
+    }
     #[allow(clippy::cast_precision_loss)]
     {
         best.stats.detour_excess_mm = best_q.excess_um as f64 / 1000.0;
@@ -294,6 +309,11 @@ pub fn route_once(board: &Board, cfg: &RouterConfig) -> Result<RouteOutcome, Rou
         &plan::class_geoms(&board.rules),
         &grid.layers,
     );
+    // Only the requested nets get links (the rest is fixed copper of the caller).
+    let links: Vec<direct::Link> = links
+        .into_iter()
+        .filter(|l| cfg.nets.as_ref().is_none_or(|v| v.contains(&l.track.net)))
+        .collect();
     let original = board;
     let mut work = board.clone();
     work.tracks.extend(links.iter().map(|l| ferroute_board::Track {
@@ -502,6 +522,8 @@ pub fn route_once(board: &Board, cfg: &RouterConfig) -> Result<RouteOutcome, Rou
         accel_backend: accel_name,
         drc_gate_rips: gate_rips,
         order_rounds_run: 0,
+        lns_rounds_run: 0,
+        lns_accepted: 0,
         detour_excess_mm: 0.0,
     };
     Ok(RouteOutcome {

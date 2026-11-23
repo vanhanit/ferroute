@@ -19,7 +19,9 @@ fn bus_match_order_refinement_reduces_detours() {
     let rs: ferroute_board::netrules::RuleSet = toml::from_str(&rules).expect("rules");
     rs.apply(&mut board).expect("apply");
     let run = |order_rounds: u32| {
-        let out = route(&board, &RouterConfig { order_rounds, ..RouterConfig::default() })
+        // The order refinement is measured in isolation (no neighbourhood re-route).
+        let lns = ferroute_router::lns::LnsConfig { rounds: 0, ..Default::default() };
+        let out = route(&board, &RouterConfig { order_rounds, lns, ..RouterConfig::default() })
             .expect("route");
         let mut after = board.clone();
         after.apply(&out.edit);

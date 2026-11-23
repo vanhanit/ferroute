@@ -81,7 +81,7 @@ fn demo_routes_with_rules_are_clean() {
 #[test]
 fn bus_match_routes_are_clean_of_slivers_and_right_angles() {
     let rules = ["--rules", "testdata/rules/bus_match.toml", "--strict-rules"];
-    check("bus-fixed", &route("bus_match", &rules), (0, 0, 1));
+    check("bus-fixed", &route("bus_match", &rules), (0, 0, 0));
     // Nudging changes the lengths the match groups can reach: no strict rules here.
     let mv = ["--rules", "testdata/rules/bus_match.toml", "--allow-move"];
     check("bus-move", &route("bus_match", &mv), (0, 0, 2));
@@ -93,6 +93,6 @@ fn synthetic_ci_suite_is_clean_of_slivers_and_right_angles() {
         let board = ferroute_engine::synth::generate(&spec);
         let res = ferroute_engine::run(&board, &ferroute_engine::PipelineConfig::default())
             .expect("route");
-        check(&spec.name, &res.board_after, (2, 3, 10));
+        check(&spec.name, &res.board_after, (2, 1, 10));
     }
 }
