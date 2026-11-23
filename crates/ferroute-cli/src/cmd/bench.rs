@@ -11,7 +11,7 @@ use std::process::ExitCode;
 
 #[derive(clap::Args, Debug)]
 pub struct GenArgs {
-    /// Synthetic suite to generate (`ci` or `full`).
+    /// Synthetic suite to generate (`ci`, `full`, or `fixtures` for the hand-made testdata boards).
     #[arg(long, default_value = "ci")]
     pub suite: String,
     /// Output directory.
@@ -22,6 +22,17 @@ pub struct GenArgs {
 /// Executes `ferroute gen`.
 pub fn gen_run(a: &GenArgs) -> Result<ExitCode> {
     std::fs::create_dir_all(&a.out)?;
+    if a.suite == "fixtures" {
+        let board = synth::bus_match();
+        let pcb = a.out.join("bus_match.kicad_pcb");
+        std::fs::write(&pcb, ferroute_kicad::write_new_board(&board, 1))?;
+        std::fs::write(
+            pcb.with_extension("kicad_pro"),
+            ferroute_kicad::project::write_project_json(&board),
+        )?;
+        out(&format!("wrote {}", pcb.display()));
+        return Ok(ExitCode::SUCCESS);
+    }
     for spec in synth::suite(&a.suite) {
         let board = synth::generate(&spec);
         let pcb = a.out.join(format!("{}.kicad_pcb", spec.name));

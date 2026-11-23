@@ -191,6 +191,25 @@ pub fn generate(spec: &SynthSpec) -> Board {
     board
 }
 
+/// Hand-designed fixture for nested length matching: a locked 1×6 header fans out to
+/// resistors at deliberately different distances. Differential pairs `D0_*` (near) and
+/// `D1_*` (far) are matched within 0.1 mm each, and `CLK` (middle) must match both pairs
+/// within 0.5 mm (rules in `testdata/rules/bus_match.toml`), so tuning must nest.
+#[must_use]
+pub fn bus_match() -> Board {
+    let mut b = BoardBuilder::new(mm(50), mm(35), 2);
+    let names = ["D0_P", "D0_N", "D1_P", "D1_N", "CLK", "GND"];
+    let nets: Vec<NetId> = names.iter().map(|n| b.net(n)).collect();
+    let j1 = b.header("J1", Point::new(mm(5), mm(8)), 0.0, &nets);
+    b.mobility(j1, Mobility::Locked);
+    // (net index, x mm, y mm)
+    let parts = [(0, 22, 5), (1, 22, 10), (4, 31, 16), (2, 40, 22), (3, 40, 28)];
+    for (k, &(n, x, y)) in parts.iter().enumerate() {
+        b.smd2(&format!("R{}", k + 1), Point::new(mm(x), mm(y)), 0.0, nets[n], nets[5]);
+    }
+    b.build()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

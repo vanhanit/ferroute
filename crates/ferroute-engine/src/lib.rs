@@ -409,3 +409,54 @@ mod tune_tests {
         assert_eq!(r.edit, again.edit, "deterministic");
     }
 }
+
+#[cfg(test)]
+mod bus_match_tests {
+    use super::*;
+    use ferroute_board::constraints::MatchGroup;
+    use ferroute_drc::rules::net_lengths;
+
+    /// Nested groups (two pairs within 0.1 mm, CLK + both pairs within 0.5 mm) on the
+    /// `bus_match` fixture, with the groups set programmatically.
+    #[test]
+    fn nested_bus_matching_is_met_in_fixed_and_nudging_mode() {
+        let mut board = synth::bus_match();
+        let id = |n: &str| board.net_by_name(n).expect("net");
+        let (d0p, d0n, d1p, d1n, clk) = (id("D0_P"), id("D0_N"), id("D1_P"), id("D1_N"), id("CLK"));
+        let mm = ferroute_board::builder::mm;
+        let g = |name: &str, skew, nets: &[NetId]| MatchGroup {
+            name: name.into(),
+            skew_max: skew,
+            nets: nets.to_vec(),
+        };
+        board.match_groups = vec![
+            g("pair0", mm(1) / 10, &[d0p, d0n]),
+            g("pair1", mm(1) / 10, &[d1p, d1n]),
+            g("bus", mm(1) / 2, &[d0p, d0n, d1p, d1n, clk]),
+        ];
+        for nudge in [false, true] {
+            let cfg = PipelineConfig {
+                router: RouterConfig {
+                    accel: ferroute_router::Accel::Cpu,
+                    ..RouterConfig::default()
+                },
+                nudge: nudge.then(|| (MovePolicy::default(), PlaceConfig::default())),
+                ..PipelineConfig::default()
+            };
+            let r = run(&board, &cfg).expect("run");
+            let tag = format!("nudge={nudge}");
+            assert!(r.metrics.drc_clean, "{tag}: {:?}", r.drc.introduced().collect::<Vec<_>>());
+            assert!((r.metrics.completion - 1.0).abs() < 1e-9, "{tag}");
+            assert!(r.constraint_issues.is_empty(), "{tag}: {:?}", r.constraint_issues);
+            assert!(!r.edit.new_arcs.is_empty(), "{tag}: meander corners are arcs");
+            let l = net_lengths(&r.board_after);
+            let spread = |n: &[NetId]| {
+                let v: Vec<_> = n.iter().map(|x| l[x.idx()]).collect();
+                v.iter().max().unwrap() - v.iter().min().unwrap()
+            };
+            assert!(spread(&[d0p, d0n]) <= mm(1) / 10, "{tag}");
+            assert!(spread(&[d1p, d1n]) <= mm(1) / 10, "{tag}");
+            assert!(spread(&[d0p, d0n, d1p, d1n, clk]) <= mm(1) / 2, "{tag}");
+        }
+    }
+}

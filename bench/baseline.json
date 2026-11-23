@@ -52,7 +52,43 @@
         "moved_footprints": 30,
         "displacement_mm": 51.83156486704026,
         "constraint_issues": 0,
-        "runtime_ms": 200.0
+        "runtime_ms": 300.0
+      }
+    },
+    {
+      "board": "bus_match-fixed",
+      "seed": 1,
+      "metrics": {
+        "drc_clean": true,
+        "introduced_violations": 0,
+        "total_violations": 0,
+        "completion": 1.0,
+        "connections_total": 10,
+        "connections_missing": 0,
+        "wirelength_mm": 197.22253670090603,
+        "vias": 3,
+        "moved_footprints": 0,
+        "displacement_mm": 0.0,
+        "constraint_issues": 0,
+        "runtime_ms": 100.0
+      }
+    },
+    {
+      "board": "bus_match",
+      "seed": 1,
+      "metrics": {
+        "drc_clean": true,
+        "introduced_violations": 0,
+        "total_violations": 0,
+        "completion": 1.0,
+        "connections_total": 10,
+        "connections_missing": 0,
+        "wirelength_mm": 184.01538807889838,
+        "vias": 3,
+        "moved_footprints": 5,
+        "displacement_mm": 9.881737861543039,
+        "constraint_issues": 0,
+        "runtime_ms": 100.0
       }
     },
     {

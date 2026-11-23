@@ -1,0 +1,13 @@
+[[match]]
+name = "pair0"
+nets = ["D0_P", "D0_N"]
+skew_mm = 0.1
+[[match]]
+name = "pair1"
+nets = ["D1_P", "D1_N"]
+skew_mm = 0.1
+[[match]]
+name = "bus"
+groups = ["pair*"]
+nets = ["CLK"]
+skew_mm = 0.5
