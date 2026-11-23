@@ -462,6 +462,9 @@ pub struct Board {
     pub rules: DesignRules,
     #[serde(default)]
     pub stackup: constraints::Stackup,
+    /// Explicit length-matching groups (on top of the legacy per-net `match_group` fields).
+    #[serde(default)]
+    pub match_groups: Vec<constraints::MatchGroup>,
 }
 
 /// Errors from [`Board::validate`].

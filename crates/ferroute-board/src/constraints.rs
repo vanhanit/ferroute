@@ -11,6 +11,7 @@ use ferroute_geom::Coord;
 use ferroute_geom::detmath::{exp, pow};
 use ferroute_geom::units::format_mm;
 use serde::{Deserialize, Serialize};
+use std::collections::{BTreeMap, BTreeSet};
 
 /// Frequency at or above which a net is routed with the high-speed policy.
 pub const HIGH_SPEED_HZ: u64 = 50_000_000;
@@ -43,6 +44,94 @@ impl NetConstraints {
     pub fn is_high_speed(&self) -> bool {
         self.frequency_hz.is_some_and(|f| f >= HIGH_SPEED_HZ) || self.impedance_mohm.is_some()
     }
+}
+
+/// A length-matching group: every member's routed length must lie within `skew_max` of the
+/// others. Groups may share nets, so a pair can sit inside a bus (nesting).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MatchGroup {
+    pub name: String,
+    pub skew_max: Coord,
+    /// Member nets, sorted and de-duplicated.
+    pub nets: Vec<NetId>,
+}
+
+/// Explicit `board.match_groups` plus legacy per-net groups (`match_group` + `skew_max`),
+/// merged by name (union of nets, smaller skew). Sorted by name; groups with fewer than two
+/// nets are dropped.
+#[must_use]
+pub fn match_groups(board: &Board) -> Vec<MatchGroup> {
+    let mut by_name: BTreeMap<String, (Coord, BTreeSet<NetId>)> = BTreeMap::new();
+    let mut add = |name: &str, skew: Coord, nets: &mut dyn Iterator<Item = NetId>| {
+        let e = by_name.entry(name.to_owned()).or_insert((skew, BTreeSet::new()));
+        e.0 = e.0.min(skew);
+        e.1.extend(nets);
+    };
+    for g in &board.match_groups {
+        add(&g.name, g.skew_max, &mut g.nets.iter().copied());
+    }
+    for (i, net) in board.nets.iter().enumerate().skip(1) {
+        let c = &net.constraints;
+        if let (Some(g), Some(skew)) = (c.match_group.as_deref(), c.skew_max) {
+            let id = NetId(u32::try_from(i).unwrap_or(u32::MAX));
+            add(g, skew, &mut std::iter::once(id));
+        }
+    }
+    by_name
+        .into_iter()
+        .filter(|(_, (_, nets))| nets.len() >= 2)
+        .map(|(name, (skew_max, nets))| MatchGroup {
+            name,
+            skew_max,
+            nets: nets.into_iter().collect(),
+        })
+        .collect()
+}
+
+/// Per-net target lengths (index = net id), never below the current `lengths`. Nets below
+/// `length_min` rise to `length_min + 2 µm`; then, until stable, every group whose spread
+/// exceeds its skew raises members below `max − skew` to `max − skew/2`. A target never
+/// exceeds the net's `length_max` (the rule then stays unmet and is reported by the DRC).
+#[must_use]
+pub fn match_targets(board: &Board, lengths: &[Coord]) -> Vec<Coord> {
+    let mut t = lengths.to_vec();
+    let cap = |i: usize, v: Coord| board.nets[i].constraints.length_max.map_or(v, |m| v.min(m));
+    for i in 1..t.len().min(board.nets.len()) {
+        if let Some(min) = board.nets[i].constraints.length_min
+            && t[i] < min
+        {
+            // A little over the limit so float summation can never land just below it.
+            t[i] = t[i].max(cap(i, min + 2_000));
+        }
+    }
+    let groups = match_groups(board);
+    for _ in 0..64 * groups.len().max(1) {
+        let mut changed = false;
+        for g in &groups {
+            let ids: Vec<usize> = g.nets.iter().map(|n| n.idx()).filter(|&i| i < t.len()).collect();
+            let (Some(&hi), Some(&lo)) =
+                (ids.iter().map(|&i| &t[i]).max(), ids.iter().map(|&i| &t[i]).min())
+            else {
+                continue;
+            };
+            if hi - lo <= g.skew_max {
+                continue;
+            }
+            for &i in &ids {
+                if t[i] < hi - g.skew_max {
+                    let v = cap(i, hi - g.skew_max / 2);
+                    if v > t[i] {
+                        t[i] = v;
+                        changed = true;
+                    }
+                }
+            }
+        }
+        if !changed {
+            break;
+        }
+    }
+    t
 }
 
 /// Physical stack-up facts used by the width formulas.
@@ -222,5 +311,69 @@ mod tests {
         assert!(!c.is_high_speed());
         c.impedance_mohm = Some(50_000);
         assert!(c.is_high_speed());
+    }
+
+    fn match_board(names: &[&str]) -> (Board, Vec<NetId>) {
+        let mut b = BoardBuilder::new(mm(30), mm(20), 2);
+        let ids = names.iter().map(|n| b.net(n)).collect();
+        (b.build(), ids)
+    }
+
+    fn group(name: &str, skew: Coord, nets: &[NetId]) -> MatchGroup {
+        MatchGroup { name: name.into(), skew_max: skew, nets: nets.to_vec() }
+    }
+
+    fn spread(t: &[Coord], nets: &[NetId]) -> Coord {
+        let v: Vec<Coord> = nets.iter().map(|n| t[n.idx()]).collect();
+        v.iter().max().unwrap() - v.iter().min().unwrap()
+    }
+
+    #[test]
+    fn nested_groups_match_pairs_and_bus() {
+        let (mut b, n) = match_board(&["A", "B", "C", "D"]);
+        let (p0, p1) = ([n[0], n[1]], [n[2], n[3]]);
+        b.match_groups = vec![
+            group("p0", mm(1) / 10, &p0),
+            group("p1", mm(1) / 10, &p1),
+            group("bus", mm(1) / 2, &n),
+        ];
+        let l = [0, mm(10), mm(105) / 10, mm(20), mm(202) / 10];
+        let t = match_targets(&b, &l);
+        assert_eq!(t, match_targets(&b, &l), "deterministic");
+        for g in &b.match_groups {
+            assert!(spread(&t, &g.nets) <= g.skew_max, "{} {t:?}", g.name);
+        }
+        assert!(t.iter().all(|&v| v <= mm(202) / 10), "nothing above the longest: {t:?}");
+        assert!(t.iter().zip(&l).all(|(a, b)| a >= b), "never shrinks");
+    }
+
+    #[test]
+    fn net_in_two_groups_and_length_cap() {
+        let (mut b, n) = match_board(&["A", "B", "C"]);
+        b.match_groups =
+            vec![group("x", mm(1) / 10, &[n[0], n[1]]), group("y", mm(1) / 10, &[n[1], n[2]])];
+        let l = [0, mm(10), mm(12), mm(14)];
+        let t = match_targets(&b, &l);
+        assert!(spread(&t, &n) <= mm(1) / 5, "{t:?}");
+        b.nets[n[0].idx()].constraints.length_max = Some(mm(11));
+        let t = match_targets(&b, &l);
+        assert_eq!(t[n[0].idx()], mm(11), "capped");
+        assert!(spread(&t, &[n[0], n[1]]) > mm(1) / 10, "group stays unmet");
+        b.nets[n[0].idx()].constraints.length_max = None;
+        b.nets[n[2].idx()].constraints.length_min = Some(mm(20));
+        assert_eq!(match_targets(&b, &l)[n[2].idx()], mm(20) + 2_000);
+    }
+
+    #[test]
+    fn legacy_groups_and_merge_with_explicit() {
+        let (mut b, n) = match_board(&["A", "B", "C"]);
+        for (i, skew) in [(0, mm(1)), (1, mm(1) / 2)] {
+            let c = &mut b.nets[n[i].idx()].constraints;
+            c.match_group = Some("g".into());
+            c.skew_max = Some(skew);
+        }
+        assert_eq!(match_groups(&b), vec![group("g", mm(1) / 2, &[n[0], n[1]])]);
+        b.match_groups = vec![group("g", mm(1) / 4, &[n[2], n[1]]), group("solo", 1, &[n[0]])];
+        assert_eq!(match_groups(&b), vec![group("g", mm(1) / 4, &n)], "union, smaller skew");
     }
 }
