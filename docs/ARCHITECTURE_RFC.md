@@ -274,9 +274,15 @@ globs, applied in order, unknown keys rejected). The values are converted once, 
 edge.
 
 * **Width:** the required width is the widest of the net-class width, the IPC-2221
-  current width (`I = k·ΔT^0.44·A^0.725`, internal-layer `k` on multilayer boards) and the
-  IPC-2141 microstrip width for a target impedance over the stack-up. It is rounded *up*
-  to 10 µm, computed only with `detmath` (IEEE-portable `exp/ln/pow`). `resolve` moves a
+  current width (`I = k·ΔT^0.44·A^0.725`, internal-layer `k` on multilayer boards), the
+  Hammerstad–Jensen (1980) microstrip width with Hammerstad–Bekkadal thickness correction
+  for outer layers and the Cohn/Wadell stripline width for inner layers (when the stack-up
+  has an inner dielectric), both solved by integer bisection to a target impedance.
+  Differential pairs use the IPC-2141A coupling factor on the HJ single line (microstrip)
+  and Cohn odd-mode impedance (stripline) (`diff_pair_geometry`: width or gap fixed, the other solved), and
+  `delay_ps_per_mm` gives √εeff/c for delay matching. IPC-2152 is deliberately not
+  implemented (proprietary charts). Results are rounded *up* to 10 µm, computed only with
+  `detmath` (IEEE-portable `exp/ln/pow`). `resolve` moves a
   wider-than-class net into a derived class before routing. Traces are never narrowed.
 * **Cost policy (router::search::net_costs):** high-speed nets (≥ 50 MHz or
   impedance-controlled) pay vias ×3, 90° bends ×4 (two 45° bends are cheaper) and

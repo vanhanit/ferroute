@@ -23,6 +23,8 @@ pub struct StackupSpec {
     pub outer_dielectric_mm: Option<f64>,
     /// Relative permittivity.
     pub epsilon_r: Option<f64>,
+    /// Plane-to-plane spacing of inner (stripline) layers (mm).
+    pub inner_dielectric_mm: Option<f64>,
 }
 
 /// One rule: selector globs plus the constraints it sets.
@@ -161,6 +163,7 @@ impl RuleSet {
                 (s.copper_um, "copper_um"),
                 (s.outer_dielectric_mm, "outer_dielectric_mm"),
                 (s.epsilon_r, "epsilon_r"),
+                (s.inner_dielectric_mm, "inner_dielectric_mm"),
             ] {
                 if v.is_some_and(|x| !(x.is_finite() && x > 0.0)) {
                     return Err(RuleError::Stackup { field });
@@ -246,6 +249,9 @@ impl RuleSet {
             }
             if let Some(h) = s.outer_dielectric_mm {
                 board.stackup.outer_dielectric = mm_to_nm(h);
+            }
+            if let Some(b) = s.inner_dielectric_mm {
+                board.stackup.inner_dielectric = Some(mm_to_nm(b));
             }
             if let Some(e) = s.epsilon_r {
                 board.stackup.epsilon_r_milli = scaled(e, 1000.0).unwrap_or(u32::MAX);
@@ -389,6 +395,7 @@ mod tests {
                 copper_um: Some(70.0),
                 outer_dielectric_mm: Some(0.2),
                 epsilon_r: Some(3.66),
+                inner_dielectric_mm: Some(0.4),
             }),
             rules: vec![],
             ..RuleSet::default()
@@ -396,6 +403,7 @@ mod tests {
         rs.apply(&mut b).expect("valid");
         assert_eq!(b.stackup.copper_thickness, vec![70_000, 70_000]);
         assert_eq!(b.stackup.outer_dielectric, 200_000);
+        assert_eq!(b.stackup.inner_dielectric, Some(400_000));
         assert_eq!(b.stackup.epsilon_r_milli, 3660);
     }
 
