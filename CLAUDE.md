@@ -201,6 +201,7 @@ Completion and DRC come first; within that, every result must look hand-tuned:
 | 10 | Copper pour awareness, blind/buried/micro vias | Lead | M4 |
 | 11 | Stack-up from `.kicad_pcb` `(setup (stackup …))` → `Board::stackup` (today: defaults or `--rules [stackup]`) | Worker | contract: `ferroute_board::constraints::Stackup` |
 | 12 | Fine-pitch escape: congestion-aware pin-access ordering for QFN/QFP/BGA | Lead | M2 |
+| 14 | Routing-quality residuals: demo has ≤ 1 sliver and ≤ 1 right angle per mode (diagonal–diagonal corner next to a T junction near (108.5, 126.5) with nudging); ci-s2-medium has 3 right angles and ci-s4-medium 2 slivers, where chamfers are illegal and need a local re-route; near-pad bends > 0 on synth boards; tighten the `fixture_quality` bounds to 0 | Lead + worker | commits a8e4162/5244ce8 landed with swapped scopes (a8e4162 also holds the router chamfer, stub and straighten work) |
 | 13 | Coverage ≥ 85 % per crate: CLI output via injected `&mut dyn Write`, ipc/render/kicad gaps | Worker | `make coverage` |
 
 ## Environment notes for cloud sessions
