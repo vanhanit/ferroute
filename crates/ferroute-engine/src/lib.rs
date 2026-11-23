@@ -8,7 +8,8 @@
 //! 3. PathFinder routing,
 //! 4. large-neighbourhood rounds: re-nudge with failed nets up-weighted and re-route,
 //!    keeping the best candidate,
-//! 5. the deterministic DRC oracle as the final acceptance gate.
+//! 5. length tuning (meanders) for `length_min` / length-matching rules,
+//! 6. the deterministic DRC oracle as the final acceptance gate.
 //!
 //! Also hosts the synthetic board generator ([`synth`]) and benchmark scoring
 //! ([`score`]) used by the CI regression gate.
@@ -179,11 +180,14 @@ pub fn run(board: &Board, cfg: &PipelineConfig) -> Result<PipelineResult, RouteE
             }
         }
     }
-    let edit = BoardEdit {
+    let mut edit = BoardEdit {
         moves: best.moves.clone(),
         new_tracks: best.out.edit.new_tracks.clone(),
         new_vias: best.out.edit.new_vias.clone(),
     };
+    // Length rules (length_min, match groups): meanders, each verified by the oracle.
+    let mut rule_notes = rule_notes;
+    rule_notes.extend(ferroute_router::tune::tune_lengths(&policy_board, &mut edit));
     debug_assert!(edit.check_invariants(&policy_board).is_ok());
     let mut board_after = policy_board.clone();
     board_after.apply(&edit);
@@ -360,5 +364,46 @@ mod nudge_tests {
             assert_eq!(m.to.pos.x % grid, 0, "INV-PLACE-3");
             assert_eq!(m.to.pos.y % grid, 0, "INV-PLACE-3");
         }
+    }
+}
+
+#[cfg(test)]
+mod tune_tests {
+    use super::*;
+    use ferroute_board::builder::{BoardBuilder, mm, pt10};
+    use ferroute_drc::rules::net_lengths;
+
+    /// Two signals from a locked connector to two resistors at different distances,
+    /// matched within 0.5 mm: the pipeline must meander the shorter one.
+    #[test]
+    fn pipeline_meets_length_matching_with_meanders() {
+        let mut b = BoardBuilder::new(mm(45), mm(25), 2);
+        let p = b.net("D_P");
+        let n = b.net("D_N");
+        let j = b.header("J1", pt10(40, 80), 0.0, &[p, n]);
+        b.mobility(j, ferroute_board::Mobility::Locked);
+        b.smd2("R1", pt10(400, 80), 0.0, p, NetId::NONE);
+        b.smd2("R2", pt10(250, 105), 0.0, n, NetId::NONE);
+        let mut board = b.build();
+        for id in [p, n] {
+            let c = &mut board.nets[id.idx()].constraints;
+            c.match_group = Some("pair".into());
+            c.skew_max = Some(mm(1) / 2);
+        }
+        let cfg = PipelineConfig {
+            router: RouterConfig { accel: ferroute_router::Accel::Cpu, ..RouterConfig::default() },
+            ..PipelineConfig::default()
+        };
+        let r = run(&board, &cfg).expect("run");
+        assert!(r.metrics.drc_clean, "{:?}", r.drc.introduced().collect::<Vec<_>>());
+        assert_eq!(r.metrics.connections_missing, 0);
+        assert!(r.constraint_issues.is_empty(), "{:?}", r.constraint_issues);
+        assert!(r.rule_notes.iter().any(|n| n.contains("length tuned")), "{:?}", r.rule_notes);
+        assert!(ferroute_drc::quality::acute_angles(&r.board_after).is_empty());
+        let l = net_lengths(&r.board_after);
+        assert!((l[p.idx()] - l[n.idx()]).abs() <= mm(1) / 2);
+        r.edit.check_invariants(&r.policy_board).expect("INV-EDIT-1");
+        let again = run(&board, &cfg).expect("run");
+        assert_eq!(r.edit, again.edit, "deterministic");
     }
 }
