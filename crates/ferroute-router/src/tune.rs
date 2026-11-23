@@ -132,7 +132,9 @@ fn tune_run(base: &Board, edit: &mut BoardEdit, i: usize, need: f64, gate: &Gate
     let spacing = seg.width + cl.max(2 * seg.width);
     // Lowest amplitude that meets the whole need on this run first (a long, low accordion
     // looks hand-made); only then taller bumps for a partial gain on a short run.
-    let amps = [spacing, spacing * 3 / 2, 2 * spacing, 3 * spacing];
+    // Taller bumps (up to 6 spacings) only when lower ones cannot carry the need; the gate
+    // still verifies every candidate against all copper.
+    let amps = [spacing, spacing * 3 / 2, 2 * spacing, 3 * spacing, 4 * spacing, 6 * spacing];
     let full = amps.iter().map(|&a| (a, true));
     let partial = amps.iter().rev().map(|&a| (a, false));
     // Fillets keep the copper's inner edge at a positive radius.
