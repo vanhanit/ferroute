@@ -14,6 +14,7 @@
 //!   would introduce a violation is never emitted.
 
 pub mod access;
+pub mod chamfer;
 pub mod detour;
 pub mod direct;
 pub mod emit;
@@ -124,6 +125,12 @@ pub struct RouteStats {
     pub nets_failed: usize,
     pub tracks: usize,
     pub vias: usize,
+    /// 90° bends left in the emitted copper after the chamfer pass.
+    pub right_angle_bends: usize,
+    /// Avoidable bends next to same-net pads left in the emitted copper.
+    pub near_pad_bends: usize,
+    /// Same-net copper pairs closer than the clearance without touching (slivers).
+    pub slivers: usize,
     pub wirelength_nm: f64,
     pub negotiation: NegotiationStats,
     pub accel_backend: String,
@@ -449,10 +456,21 @@ pub fn route_once(board: &Board, cfg: &RouterConfig) -> Result<RouteOutcome, Rou
     }
     // Gridless clean-up of the emitted copper (guarded by the oracle inside).
     let edit = straighten::straighten(original, &assemble(&per_net, &links));
+    // No trace bends 90°: every right angle becomes two 45° bends where exactly legal.
+    let edit = chamfer::chamfer(original, &edit);
     let gate_ms = t2.elapsed().as_secs_f64() * 1e3;
     failed.extend(per_net.iter().filter(|e| !e.3).map(|e| e.0));
     failed.sort_unstable();
     failed.dedup();
+    let (right_angle_bends, near_pad_bends, slivers) = {
+        let mut after = original.clone();
+        after.apply(&edit);
+        (
+            ferroute_drc::quality::right_angles(&after).len(),
+            ferroute_drc::quality::near_pad_bends(&after).len(),
+            ferroute_drc::quality::slivers(&after).len(),
+        )
+    };
     let stats = RouteStats {
         pitch,
         grid: (grid.nx, grid.ny, grid.nl()),
@@ -463,6 +481,9 @@ pub fn route_once(board: &Board, cfg: &RouterConfig) -> Result<RouteOutcome, Rou
         nets_failed: failed.len(),
         tracks: edit.new_tracks.len(),
         vias: edit.new_vias.len(),
+        right_angle_bends,
+        near_pad_bends,
+        slivers,
         wirelength_nm: edit.new_tracks.iter().map(|t| t.start.dist(t.end)).sum::<f64>() + 0.0,
         negotiation: nstats,
         accel_backend: accel_name,

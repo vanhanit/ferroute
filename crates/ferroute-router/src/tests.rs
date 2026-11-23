@@ -319,8 +319,22 @@ fn no_short_kinks_next_to_pads() {
             if centres.contains(&t.start) || centres.contains(&t.end) {
                 continue;
             }
+            // 90° chamfers (short 45° legs) and the remainders of the legs they shorten
+            // are intentionally short.
             #[allow(clippy::cast_precision_loss)]
             let min = pitch as f64 - 1.0;
+            let short_diag = |u: &ferroute_board::Track| {
+                let d = u.end - u.start;
+                d.x.abs() == d.y.abs()
+            };
+            if out.edit.new_tracks.iter().any(|u| {
+                u.net == t.net
+                    && u.layer == t.layer
+                    && short_diag(u)
+                    && [t.start, t.end].iter().any(|&q| q == u.start || q == u.end)
+            }) {
+                continue;
+            }
             assert!(
                 t.start.dist(t.end) >= min,
                 "seed {seed}: kink segment {t:?} shorter than the pitch {pitch}"
@@ -585,4 +599,28 @@ fn order_refinement_never_worse() {
     let off = route(&board, &RouterConfig { order_rounds: 0, ..exact_cfg() }).expect("route");
     assert_eq!(off.edit, once.edit);
     assert_eq!(off.stats.order_rounds_run, 0);
+}
+
+#[test]
+fn chamfer_never_adds_bends_and_stats_match_the_oracle() {
+    for seed in 0..16 {
+        let board = random_board(seed, 14);
+        let out = route(&board, &exact_cfg()).expect("route");
+        let mut after = board.clone();
+        after.apply(&out.edit);
+        let (r, n, s) = (
+            ferroute_drc::quality::right_angles(&after).len(),
+            ferroute_drc::quality::near_pad_bends(&after).len(),
+            ferroute_drc::quality::slivers(&after).len(),
+        );
+        assert_eq!(out.stats.right_angle_bends, r, "seed {seed}");
+        assert_eq!(out.stats.near_pad_bends, n, "seed {seed}");
+        assert_eq!(out.stats.slivers, s, "seed {seed}");
+        assert!(ferroute_drc::quality::acute_angles(&after).is_empty(), "seed {seed}");
+        // The pass is idempotent: running it again never changes the result.
+        let again = chamfer::chamfer(&board, &out.edit);
+        let mut twice = board;
+        twice.apply(&again);
+        assert!(ferroute_drc::quality::right_angles(&twice).len() <= r, "seed {seed}");
+    }
 }

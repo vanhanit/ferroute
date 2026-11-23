@@ -177,6 +177,8 @@ pub fn net_costs(base: &Costs, c: &ferroute_board::constraints::NetConstraints) 
         let f = 1.0 + 4.0 / (1.0 + max.min(1 << 20) as f32);
         k.via *= f;
     }
+    // A 90° bend never beats two 45° bends (the chamfer pass would undo it anyway).
+    k.bend90 = k.bend90.max(2.0 * k.bend45 * 1.25);
     k
 }
 
@@ -396,6 +398,21 @@ mod tests {
         assert!(hs.via > slow.via && hs.bend90 > slow.bend90);
         assert!(hs.bend90 > 2.0 * hs.bend45, "two 45° bends beat one 90° bend");
         assert_eq!(hs.kink, slow.kink);
+    }
+
+    #[test]
+    fn right_angle_always_costs_more_than_two_forty_fives() {
+        let odd = Costs { bend45: 0.8, bend90: 1.0, ..base() };
+        for c in [
+            NetConstraints::default(),
+            NetConstraints { frequency_hz: Some(480_000_000), ..NetConstraints::default() },
+            NetConstraints { max_vias: Some(0), ..NetConstraints::default() },
+        ] {
+            for b in [base(), odd] {
+                let k = net_costs(&b, &c);
+                assert!(k.bend90 > 2.0 * k.bend45, "{k:?}");
+            }
+        }
     }
 
     #[test]

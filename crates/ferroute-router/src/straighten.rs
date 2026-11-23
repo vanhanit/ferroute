@@ -7,7 +7,8 @@
 //! anchors (junctions, vias, pads, width changes, touching existing copper) is greedily
 //! shortcut by 1- or 2-segment octilinear connections between non-adjacent vertices.
 //!
-//! A shortcut is accepted only when it is strictly better by `(bends, 90° bends, length)`
+//! A shortcut is accepted only when it is strictly better by
+//! `(slivers, avoidable bends next to pads, bends, 90° bends, length)`
 //! and *exactly* legal: pad entry axes (INV-ROUTE-2), no turn sharper than 90°
 //! (INV-ROUTE-3), net-pair clearance, board edge, keep-outs and hole clearance against all
 //! other copper including the other nets' new tracks, and no overlap with the net's own
@@ -17,6 +18,7 @@
 
 use crate::access::{entry_dirs, octilinear_paths};
 use ferroute_board::{Board, BoardEdit, LayerId, LayerSet, NetId, PadId, Track};
+use ferroute_drc::quality::{avoidable_pad_bend, is_sliver};
 use ferroute_drc::{BucketGrid, CopperItem, DrcConfig, ItemRef, check, copper_items};
 use ferroute_geom::{Coord, Hull, Point, Rect, orient};
 use rustc_hash::FxHashMap;
@@ -30,10 +32,10 @@ const MAX_PASSES: usize = 4;
 /// Longest window (in vertices) considered for one shortcut.
 const MAX_WINDOW: usize = 96;
 
-/// `(bends, bends of 90° or more, rounded length in nm)`, compared lexicographically.
-type Score = (u32, u32, u64);
+/// `(slivers, avoidable bends next to pads, bends, bends of 90° or more, rounded length in nm)`, compared lexicographically.
+type Score = (u32, u32, u32, u32, u64);
 
-fn unit(v: Point) -> (i64, i64) {
+pub(crate) fn unit(v: Point) -> (i64, i64) {
     (v.x.signum(), v.y.signum())
 }
 
@@ -42,7 +44,7 @@ fn same_net(a: NetId, b: NetId) -> bool {
 }
 
 /// Does copper `h` cover the point `p`?
-fn covers(h: &Hull, p: Point) -> bool {
+pub(crate) fn covers(h: &Hull, p: Point) -> bool {
     h.clearance_violated(&Hull::disk(p, 0), 0)
 }
 
@@ -51,12 +53,20 @@ fn on_interior(a: Point, b: Point, q: Point) -> bool {
     q != a && q != b && orient(a, b, q) == 0 && Rect::new(a, b).contains(q)
 }
 
-fn score(prev: Option<Point>, pts: &[Point], next: Option<Point>) -> Score {
+/// Score of the polyline `pts` (with its neighbours) of `ch`; lower is better.
+pub(crate) fn score(
+    base: &Board,
+    ch: &Chain,
+    prev: Option<Point>,
+    pts: &[Point],
+    next: Option<Point>,
+    slivers: u32,
+) -> Score {
     let mut ext: Vec<Point> = Vec::with_capacity(pts.len() + 2);
     ext.extend(prev);
     ext.extend_from_slice(pts);
     ext.extend(next);
-    let (mut bends, mut right) = (0, 0);
+    let (mut near, mut bends, mut right) = (0, 0, 0);
     for w in ext.windows(3) {
         let (u, v) = (unit(w[1] - w[0]), unit(w[2] - w[1]));
         if u != v {
@@ -64,11 +74,14 @@ fn score(prev: Option<Point>, pts: &[Point], next: Option<Point>) -> Score {
             if u.0 * v.0 + u.1 * v.1 <= 0 {
                 right += 1;
             }
+            if avoidable_pad_bend(base, (ch.net, ch.layer, ch.template.width), (w[0], w[1], w[2])) {
+                near += 1;
+            }
         }
     }
     #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
     let len = pts.windows(2).map(|w| w[0].dist(w[1])).sum::<f64>().round() as u64;
-    (bends, right, len)
+    (slivers, near, bends, right, len)
 }
 
 /// Query rectangles covering the segment `a`–`b`, each inflated by `margin`.
@@ -85,30 +98,46 @@ fn pieces(a: Point, b: Point, margin: Coord) -> Vec<Rect> {
 }
 
 /// A track of the edit under optimisation.
-struct Seg {
-    a: Point,
-    b: Point,
-    width: Coord,
-    net: NetId,
-    layer: LayerId,
-    alive: bool,
+pub(crate) struct Seg {
+    pub(crate) a: Point,
+    pub(crate) b: Point,
+    pub(crate) width: Coord,
+    pub(crate) net: NetId,
+    pub(crate) layer: LayerId,
+    pub(crate) alive: bool,
 }
 
 impl Seg {
-    fn hull(&self) -> Hull {
+    pub(crate) fn hull(&self) -> Hull {
         Hull::capsule(self.a, self.b, self.width / 2)
     }
 }
 
 /// Dynamic bucket index over the edit's tracks (they change while chains are rewritten).
 #[derive(Default)]
-struct Dynamic {
-    segs: Vec<Seg>,
-    cells: FxHashMap<(i64, i64), Vec<u32>>,
+pub(crate) struct Dynamic {
+    pub(crate) segs: Vec<Seg>,
+    pub(crate) cells: FxHashMap<(i64, i64), Vec<u32>>,
 }
 
 impl Dynamic {
-    fn insert(&mut self, s: Seg) -> u32 {
+    /// An index holding `tracks`; segment ids equal track indices.
+    pub(crate) fn of(tracks: &[Track]) -> Self {
+        let mut d = Self::default();
+        for t in tracks {
+            d.insert(Seg {
+                a: t.start,
+                b: t.end,
+                width: t.width,
+                net: t.net,
+                layer: t.layer,
+                alive: true,
+            });
+        }
+        d
+    }
+
+    pub(crate) fn insert(&mut self, s: Seg) -> u32 {
         let id = u32::try_from(self.segs.len()).unwrap_or(u32::MAX);
         let r = s.hull().bbox();
         for cy in r.min.y.div_euclid(CELL)..=r.max.y.div_euclid(CELL) {
@@ -120,7 +149,7 @@ impl Dynamic {
         id
     }
 
-    fn remove(&mut self, id: u32) {
+    pub(crate) fn remove(&mut self, id: u32) {
         self.segs[id as usize].alive = false;
     }
 
@@ -149,22 +178,22 @@ impl Dynamic {
     }
 }
 
-struct Hole {
+pub(crate) struct Hole {
     hull: Hull,
     net: NetId,
 }
 
 /// Static obstacles: everything of the board plus the edit's vias and arcs.
-struct Statics<'a> {
-    base: &'a Board,
-    items: Vec<CopperItem>,
-    boxes: Vec<Rect>,
-    grid: BucketGrid,
-    holes: Vec<Hole>,
-    hole_boxes: Vec<Rect>,
-    hole_grid: BucketGrid,
-    pads_at: BTreeMap<Point, Vec<PadId>>,
-    reach: Coord,
+pub(crate) struct Statics<'a> {
+    pub(crate) base: &'a Board,
+    pub(crate) items: Vec<CopperItem>,
+    pub(crate) boxes: Vec<Rect>,
+    pub(crate) grid: BucketGrid,
+    pub(crate) holes: Vec<Hole>,
+    pub(crate) hole_boxes: Vec<Rect>,
+    pub(crate) hole_grid: BucketGrid,
+    pub(crate) pads_at: BTreeMap<Point, Vec<PadId>>,
+    pub(crate) reach: Coord,
 }
 
 /// The segment window being replaced and what is exempt from the same-net checks.
@@ -180,18 +209,43 @@ struct Window<'a> {
 }
 
 /// A maximal run of degree-2 vertices between anchors.
-struct Chain {
-    net: NetId,
-    layer: LayerId,
-    template: Track,
-    pts: Vec<Point>,
-    ids: Vec<u32>,
-    orig: Vec<usize>,
-    changed: bool,
+pub(crate) struct Chain {
+    pub(crate) net: NetId,
+    pub(crate) layer: LayerId,
+    pub(crate) template: Track,
+    pub(crate) pts: Vec<Point>,
+    pub(crate) ids: Vec<u32>,
+    pub(crate) orig: Vec<usize>,
+    pub(crate) changed: bool,
+}
+
+impl Chain {
+    /// Replaces the vertices `i..=j` by the polyline `cand`, keeping `dynamic` in sync.
+    pub(crate) fn splice(&mut self, dynamic: &mut Dynamic, i: usize, j: usize, cand: Vec<Point>) {
+        for &id in &self.ids[i..j] {
+            dynamic.remove(id);
+        }
+        let new_ids: Vec<u32> = cand
+            .windows(2)
+            .map(|s| {
+                dynamic.insert(Seg {
+                    a: s[0],
+                    b: s[1],
+                    width: self.template.width,
+                    net: self.net,
+                    layer: self.layer,
+                    alive: true,
+                })
+            })
+            .collect();
+        self.ids.splice(i..j, new_ids);
+        self.pts.splice(i..=j, cand);
+        self.changed = true;
+    }
 }
 
 impl<'a> Statics<'a> {
-    fn new(base: &'a Board, edit: &BoardEdit) -> Self {
+    pub(crate) fn new(base: &'a Board, edit: &BoardEdit) -> Self {
         let mut items = copper_items(base);
         let nv = base.vias.len();
         for (k, v) in edit.new_vias.iter().enumerate() {
@@ -255,7 +309,7 @@ impl<'a> Statics<'a> {
     }
 
     /// Is `p` a point the optimiser must keep (touched by existing same-net copper)?
-    fn static_anchor(&self, net: NetId, layer: LayerId, p: Point) -> bool {
+    pub(crate) fn static_anchor(&self, net: NetId, layer: LayerId, p: Point) -> bool {
         if self.pads_at.get(&p).is_some_and(|ps| {
             ps.iter().any(|&id| {
                 let pad = self.base.pad(id);
@@ -405,7 +459,7 @@ impl<'a> Statics<'a> {
     }
 
     /// Can `cand` (a polyline from vertex `i` to vertex `j`) replace that part of `ch`?
-    fn admissible(
+    pub(crate) fn admissible(
         &self,
         dynamic: &Dynamic,
         ch: &Chain,
@@ -450,6 +504,45 @@ impl<'a> Statics<'a> {
         !ch.pts[i..=j].windows(2).any(|s| self.scan(dynamic, &win, (s[0], s[1]), width, true))
     }
 
+    /// Same-net sliver pairs between the polyline `pts` and other copper, ignoring the
+    /// chain's own window `i..j` (which the polyline replaces).
+    pub(crate) fn slivers(
+        &self,
+        dynamic: &Dynamic,
+        ch: &Chain,
+        i: usize,
+        j: usize,
+        pts: &[Point],
+    ) -> u32 {
+        let base = self.base;
+        let clr = base.clearance_between(ch.net, ch.net);
+        let margin = ch.template.width / 2 + clr + 1;
+        let mut n = 0;
+        for s in pts.windows(2) {
+            let hull = Hull::capsule(s[0], s[1], ch.template.width / 2);
+            for k in self.static_near(s[0], s[1], margin) {
+                let it = &self.items[k as usize];
+                if it.layers.contains(ch.layer)
+                    && same_net(it.net, ch.net)
+                    && is_sliver(&hull, &it.hull, clr)
+                {
+                    n += 1;
+                }
+            }
+            for id in dynamic.near(s[0], s[1], margin) {
+                let o = &dynamic.segs[id as usize];
+                if o.layer == ch.layer
+                    && same_net(o.net, ch.net)
+                    && !ch.ids[i..j].contains(&id)
+                    && is_sliver(&hull, &o.hull(), clr)
+                {
+                    n += 1;
+                }
+            }
+        }
+        n
+    }
+
     /// Greedy shortcutting of one chain. Returns `true` if anything changed.
     fn improve(&self, dynamic: &mut Dynamic, ch: &mut Chain) -> bool {
         let mut any = false;
@@ -466,12 +559,26 @@ impl<'a> Statics<'a> {
                         continue;
                     }
                     let next = (j < n).then(|| ch.pts[j + 1]);
-                    let old = score(prev, &ch.pts[i..=j], next);
+                    let old = score(
+                        self.base,
+                        ch,
+                        prev,
+                        &ch.pts[i..=j],
+                        next,
+                        self.slivers(dynamic, ch, i, j, &ch.pts[i..=j]),
+                    );
                     let mut best: Option<(Score, Vec<Point>)> = None;
                     // `octilinear_paths` lists the diagonal-first dog-leg first; prefer the
                     // straight-first one on ties ("straight out of the pad, one 45°").
                     for cand in octilinear_paths(vi, vj).into_iter().rev() {
-                        let s = score(prev, &cand, next);
+                        let s = score(
+                            self.base,
+                            ch,
+                            prev,
+                            &cand,
+                            next,
+                            self.slivers(dynamic, ch, i, j, &cand),
+                        );
                         if s >= old || best.as_ref().is_some_and(|b| s >= b.0) {
                             continue;
                         }
@@ -485,25 +592,7 @@ impl<'a> Statics<'a> {
                     }
                 }
                 if let Some((j, cand)) = chosen {
-                    for &id in &ch.ids[i..j] {
-                        dynamic.remove(id);
-                    }
-                    let new_ids: Vec<u32> = cand
-                        .windows(2)
-                        .map(|s| {
-                            dynamic.insert(Seg {
-                                a: s[0],
-                                b: s[1],
-                                width: ch.template.width,
-                                net: ch.net,
-                                layer: ch.layer,
-                                alive: true,
-                            })
-                        })
-                        .collect();
-                    ch.ids.splice(i..j, new_ids);
-                    ch.pts.splice(i..=j, cand);
-                    ch.changed = true;
+                    ch.splice(dynamic, i, j, cand);
                     changed = true;
                 }
                 i += 1;
@@ -517,7 +606,7 @@ impl<'a> Statics<'a> {
     }
 
     /// Extracts every optimisable chain of the edit's tracks, in a deterministic order.
-    fn chains(&self, tracks: &[Track]) -> Vec<Chain> {
+    pub(crate) fn chains(&self, tracks: &[Track]) -> Vec<Chain> {
         let mut groups: BTreeMap<(u32, u8), Vec<usize>> = BTreeMap::new();
         for (k, t) in tracks.iter().enumerate() {
             if t.net != NetId::NONE && t.start != t.end {
@@ -622,7 +711,7 @@ impl<'a> Statics<'a> {
 }
 
 /// `(introduced violations, acid traps, missing connections)` of `base + edit`.
-fn quality(base: &Board, edit: &BoardEdit) -> (usize, usize, usize) {
+pub(crate) fn quality(base: &Board, edit: &BoardEdit) -> (usize, usize, usize) {
     let mut after = base.clone();
     after.apply(edit);
     let rep = check(&after, &DrcConfig { courtyards: false, ..DrcConfig::default() });
@@ -633,41 +722,20 @@ fn quality(base: &Board, edit: &BoardEdit) -> (usize, usize, usize) {
     )
 }
 
-/// Straightens routed connections off-lattice. `base` is the board BEFORE `edit`
-/// (pads, existing copper, rules, outline, keepouts). Returns an edit that differs only in
-/// `new_tracks`; vias, moves and all `Origin::Existing` copper are untouched.
-#[must_use]
-pub fn straighten(base: &Board, edit: &BoardEdit) -> BoardEdit {
-    let moved;
-    let board = if edit.moves.is_empty() {
-        base
-    } else {
-        let mut b = base.clone();
-        for m in &edit.moves {
-            b.footprints[m.footprint.idx()].placement = m.to;
-        }
-        moved = b;
-        &moved
-    };
-    let st = Statics::new(board, edit);
-    let mut dynamic = Dynamic::default();
-    for t in &edit.new_tracks {
-        dynamic.insert(Seg {
-            a: t.start,
-            b: t.end,
-            width: t.width,
-            net: t.net,
-            layer: t.layer,
-            alive: true,
-        });
+/// `base` with the edit's footprint moves applied (borrowed when there are none).
+pub(crate) fn moved_board<'a>(base: &'a Board, edit: &BoardEdit) -> std::borrow::Cow<'a, Board> {
+    if edit.moves.is_empty() {
+        return std::borrow::Cow::Borrowed(base);
     }
-    let mut chains = st.chains(&edit.new_tracks);
-    for ch in &mut chains {
-        st.improve(&mut dynamic, ch);
+    let mut b = base.clone();
+    for m in &edit.moves {
+        b.footprints[m.footprint.idx()].placement = m.to;
     }
-    if !chains.iter().any(|c| c.changed) {
-        return edit.clone();
-    }
+    std::borrow::Cow::Owned(b)
+}
+
+/// The edit with every changed chain's tracks replaced by its current polyline.
+pub(crate) fn rebuild(edit: &BoardEdit, chains: &[Chain]) -> BoardEdit {
     let mut drop = vec![false; edit.new_tracks.len()];
     let mut insert: BTreeMap<usize, Vec<Track>> = BTreeMap::new();
     for ch in chains.iter().filter(|c| c.changed) {
@@ -692,7 +760,26 @@ pub fn straighten(base: &Board, edit: &BoardEdit) -> BoardEdit {
             new_tracks.push(t.clone());
         }
     }
-    let out = BoardEdit { new_tracks, ..edit.clone() };
+    BoardEdit { new_tracks, ..edit.clone() }
+}
+
+/// Straightens routed connections off-lattice. `base` is the board BEFORE `edit`
+/// (pads, existing copper, rules, outline, keepouts). Returns an edit that differs only in
+/// `new_tracks`; vias, moves and all `Origin::Existing` copper are untouched.
+#[must_use]
+pub fn straighten(base: &Board, edit: &BoardEdit) -> BoardEdit {
+    let moved = moved_board(base, edit);
+    let board = moved.as_ref();
+    let st = Statics::new(board, edit);
+    let mut dynamic = Dynamic::of(&edit.new_tracks);
+    let mut chains = st.chains(&edit.new_tracks);
+    for ch in &mut chains {
+        st.improve(&mut dynamic, ch);
+    }
+    if !chains.iter().any(|c| c.changed) {
+        return edit.clone();
+    }
+    let out = rebuild(edit, &chains);
     // Safety net: never return anything the oracle likes less than the input.
     let (before, after) = (quality(base, edit), quality(base, &out));
     if after.0 > before.0 || after.1 > before.1 || after.2 > before.2 {
@@ -933,5 +1020,26 @@ mod tests {
         let mut dirs = st.incident(&dynamic, &win, at);
         dirs.sort();
         assert_eq!(dirs, vec![p(-10.0, 0.0), p(5.0, 0.0)]);
+    }
+
+    #[test]
+    fn round_pad_is_left_diagonally_instead_of_bending_at_its_edge() {
+        let mut bb = BoardBuilder::new(mm(30), mm(20), 2);
+        let n = bb.net("N");
+        bb.header("J1", p(10.0, 10.0), 0.0, &[n, n]);
+        let base = bb.build();
+        // Pin 2 (round) at (10, 12.54): out horizontally, 45° bend at its edge, then on.
+        let a = p(10.0, 12.54);
+        let pts = [a, p(11.1, 12.54), p(12.1, 13.54), p(20.0, 13.54), p(22.0, 15.54)];
+        let edit = BoardEdit { new_tracks: trk(n, 0, &pts), ..BoardEdit::default() };
+        let mut before = base.clone();
+        before.apply(&edit);
+        assert_eq!(ferroute_drc::quality::near_pad_bends(&before).len(), 1);
+        let out = straighten(&base, &edit);
+        let mut after = base;
+        after.apply(&out);
+        assert!(ferroute_drc::quality::near_pad_bends(&after).is_empty());
+        let rep = check(&after, &DrcConfig { courtyards: false, ..DrcConfig::default() });
+        assert_eq!(rep.introduced().count(), 0);
     }
 }

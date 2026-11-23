@@ -512,6 +512,32 @@ impl Board {
         pad.hull(self.footprint(pad.footprint).placement)
     }
 
+    /// Allowed entry/exit directions of a pad, as integer unit steps `(ux, uy)`:
+    /// * circular pads (and therefore through-hole pads, vias and holes): all 8 octilinear
+    ///   directions through the centre;
+    /// * every other shape: the 4 pad axes, i.e. perpendicular to each side through its
+    ///   midpoint (short and long sides), following the pad rotation. Pads rotated by a
+    ///   non-octilinear angle fall back to the 8 octilinear directions.
+    #[must_use]
+    pub fn pad_entry_dirs(&self, id: PadId) -> Vec<(i64, i64)> {
+        const ALL8: [(i64, i64); 8] =
+            [(1, 0), (1, -1), (0, -1), (-1, -1), (-1, 0), (-1, 1), (0, 1), (1, 1)];
+        let p = self.pad(id);
+        if matches!(p.shape, PadShape::Circle { .. }) {
+            return ALL8.to_vec();
+        }
+        let rot = self.footprint(p.footprint).placement.rot.add(p.local_rot);
+        let mut out = Vec::with_capacity(4);
+        for axis in [(1, 0), (0, 1), (-1, 0), (0, -1)] {
+            let v = Point::new(axis.0 * 1_000_000, axis.1 * 1_000_000).rotated(rot);
+            if !v.is_octilinear() {
+                return ALL8.to_vec();
+            }
+            out.push((v.x.signum(), v.y.signum()));
+        }
+        out
+    }
+
     #[must_use]
     pub fn pad_position(&self, id: PadId) -> Point {
         let pad = self.pad(id);

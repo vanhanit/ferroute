@@ -11,7 +11,8 @@
 use crate::grid::{Grid, NodeIdx};
 use crate::legality::{ClassLegality, Obstacles, allows};
 use crate::plan::{ClassPlan, Plan};
-use ferroute_board::{Board, LayerId, NetId, PadId, PadShape};
+use ferroute_board::{Board, LayerId, NetId, PadId};
+use ferroute_drc::quality::is_sliver;
 use ferroute_geom::{Coord, Dir8, Hull, Point, Segment, point_segment_dist_lt};
 
 /// A pad-centre → lattice-node stub.
@@ -60,31 +61,10 @@ const MAX_STUBS: usize = 12;
 const MAX_PER_DIR: usize = 2;
 const MAX_KINK_PER_DIR: usize = 1;
 
-/// Allowed entry/exit directions of a pad, as integer unit steps `(ux, uy)`:
-/// * circular pads (and therefore through-hole pads, vias and holes): all 8 octilinear
-///   directions through the centre;
-/// * every other shape: the 4 pad axes, i.e. perpendicular to each side through its
-///   midpoint (short and long sides), following the pad rotation. Pads rotated by a
-///   non-octilinear angle fall back to the 8 octilinear directions.
+/// Allowed entry/exit directions of a pad (see [`Board::pad_entry_dirs`]).
 #[must_use]
 pub fn entry_dirs(board: &Board, pad: PadId) -> Vec<(i64, i64)> {
-    const ALL8: [(i64, i64); 8] =
-        [(1, 0), (1, -1), (0, -1), (-1, -1), (-1, 0), (-1, 1), (0, 1), (1, 1)];
-    let p = board.pad(pad);
-    if matches!(p.shape, PadShape::Circle { .. }) {
-        return ALL8.to_vec();
-    }
-    let rot = board.footprint(p.footprint).placement.rot.add(p.local_rot);
-    let mut out = Vec::with_capacity(4);
-    for axis in [(1, 0), (0, 1), (-1, 0), (0, -1)] {
-        let v = Point::new(axis.0 * 1_000_000, axis.1 * 1_000_000).rotated(rot);
-        let d = (v.x.signum(), v.y.signum());
-        if !v.is_octilinear() {
-            return ALL8.to_vec();
-        }
-        out.push(d);
-    }
-    out
+    board.pad_entry_dirs(pad)
 }
 
 /// Smallest `k ≥ 0` such that `pred(k)` is false, assuming `pred` is monotone
@@ -149,7 +129,7 @@ pub fn pad_terminals(
     let reach = stub_reach(plan, cp, obs.rules.hole_clearance);
     // (length, segments, dir index, node, layer, path)
     // (kink, length, bend, direction index, node, grid layer, polyline)
-    type Cand = (bool, u64, u8, usize, NodeIdx, u32, Vec<Point>);
+    type Cand = (bool, u64, u8, usize, NodeIdx, u32, Vec<Point>, bool);
     let mut cands: Vec<Cand> = Vec::new();
     let Some((i0, j0, i1, j1)) = grid.index_range(bb.inflate(3 * grid.pitch)) else {
         return Vec::new();
@@ -200,18 +180,34 @@ pub fn pad_terminals(
                         });
                         if ok {
                             let (bend, kink) = stub_shape(&path, grid.pitch);
-                            cands.push((kink, path_len(&path), bend, di, n, l, path));
+                            // A post-bend leg running alongside its own pad leaves a
+                            // narrow sliver of laminate between them.
+                            let sliver = path.len() == 3
+                                && is_sliver(
+                                    &Hull::capsule(path[1], path[2], r),
+                                    &hull,
+                                    cp.geom.clearance,
+                                );
+                            cands.push((kink, path_len(&path), bend, di, n, l, path, sliver));
                         }
                     }
                 }
             }
         }
     }
+    // Drop sliver-forming variants when another variant exists; else keep them as kinks.
+    if cands.iter().any(|x| !x.7) {
+        cands.retain(|x| !x.7);
+    } else {
+        for x in &mut cands {
+            x.0 = true;
+        }
+    }
     cands.sort_by_key(|x| (x.0, x.1, x.2, x.3, x.4));
     let mut per_dir = vec![0usize; dirs.len()];
     let mut kinks_per_dir = vec![0usize; dirs.len()];
     let mut out = Vec::new();
-    for (kink, _, bend, di, n, l, path) in cands {
+    for (kink, _, bend, di, n, l, path, _) in cands {
         if out.len() >= MAX_STUBS
             || (!kink && per_dir[di] >= MAX_PER_DIR)
             || (kink && kinks_per_dir[di] >= MAX_KINK_PER_DIR)
