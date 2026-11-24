@@ -5,10 +5,12 @@
 //! usually off the lattice rows/columns) and follows lattice lines for the long run. This
 //! pass works on the *emitted* copper: every maximal chain of same-net tracks between
 //! anchors (junctions, vias, pads, width changes, touching existing copper) is greedily
-//! shortcut by 1- or 2-segment octilinear connections between non-adjacent vertices.
+//! shortcut by 1- or 2-segment octilinear connections between non-adjacent vertices; a
+//! pad connection that wraps around its own pad (a dip next to the pad) is repaired by a
+//! three-segment Z / mirror-Z whose 45° transition is sampled deterministically.
 //!
 //! A shortcut is accepted only when it is strictly better by
-//! `(slivers, avoidable bends next to pads, bends, 90° bends, length)`
+//! `(slivers, avoidable bends next to pads, pad wraps, bends, 90° bends, length)`
 //! and *exactly* legal: pad entry axes (INV-ROUTE-2), no turn sharper than 90°
 //! (INV-ROUTE-3), net-pair clearance, board edge, keep-outs and hole clearance against all
 //! other copper including the other nets' new tracks, and no overlap with the net's own
@@ -18,7 +20,7 @@
 
 use crate::access::{entry_dirs, octilinear_paths};
 use ferroute_board::{Board, BoardEdit, LayerId, LayerSet, NetId, PadId, Track};
-use ferroute_drc::quality::{avoidable_pad_bend, is_sliver};
+use ferroute_drc::quality::{avoidable_pad_bend, is_sliver, wrap_hit};
 use ferroute_drc::{BucketGrid, CopperItem, DrcConfig, ItemRef, check, copper_items};
 use ferroute_geom::{Coord, Hull, Point, Rect, orient};
 use rustc_hash::FxHashMap;
@@ -611,9 +613,48 @@ impl<'a> Statics<'a> {
         n
     }
 
+    /// The pad of `ch`'s net and layer centred on `p`, if any.
+    fn end_pad(&self, ch: &Chain, p: Point) -> Option<PadId> {
+        self.pads_at.get(&p)?.iter().copied().find(|&id| {
+            let pad = self.base.pad(id);
+            pad.net == ch.net && pad.layers.contains(ch.layer)
+        })
+    }
+
+    /// Number of chain ends whose connection wraps around its pad (see
+    /// [`ferroute_drc::quality::pad_wraps`]) when `cand` replaces the vertices `i..=j`.
+    fn wraps(
+        &self,
+        ch: &Chain,
+        ends: [Option<PadId>; 2],
+        i: usize,
+        j: usize,
+        cand: &[Point],
+    ) -> u32 {
+        if ends == [None, None] {
+            return 0;
+        }
+        let mut full: Vec<Point> = Vec::with_capacity(ch.pts.len() + cand.len());
+        full.extend_from_slice(&ch.pts[..i]);
+        full.extend_from_slice(cand);
+        full.extend_from_slice(&ch.pts[j + 1..]);
+        let mut n = 0;
+        if let Some(pad) = ends[0] {
+            n += u32::from(wrap_hit(self.base, pad, &full).is_some());
+        }
+        if let Some(pad) = ends[1] {
+            full.reverse();
+            n += u32::from(wrap_hit(self.base, pad, &full).is_some());
+        }
+        n
+    }
+
     /// Greedy shortcutting of one chain. Returns `true` if anything changed.
     fn improve(&self, dynamic: &mut Dynamic, ch: &mut Chain) -> bool {
         let mut any = false;
+        let ends = [self.end_pad(ch, ch.pts[0]), self.end_pad(ch, ch.pts[ch.pts.len() - 1])];
+        // `(slivers, near-pad bends, pad wraps, bends, 90° bends, length)`.
+        let key = |s: Score, wraps: u32| (s.0, s.1, wraps, s.2, s.3, s.4);
         for _ in 0..MAX_PASSES {
             let mut changed = false;
             let mut i = 0;
@@ -627,31 +668,47 @@ impl<'a> Statics<'a> {
                         continue;
                     }
                     let next = (j < n).then(|| ch.pts[j + 1]);
-                    let old = score(
-                        self.base,
-                        ch,
-                        prev,
-                        &ch.pts[i..=j],
-                        next,
-                        self.slivers(dynamic, ch, i, j, &ch.pts[i..=j]),
-                    );
-                    let mut best: Option<(Score, Vec<Point>)> = None;
-                    // `octilinear_paths` lists the diagonal-first dog-leg first; prefer the
-                    // straight-first one on ties ("straight out of the pad, one 45°").
-                    for cand in octilinear_paths(vi, vj).into_iter().rev() {
-                        let s = score(
+                    let old = key(
+                        score(
                             self.base,
                             ch,
                             prev,
-                            &cand,
+                            &ch.pts[i..=j],
                             next,
-                            self.slivers(dynamic, ch, i, j, &cand),
-                        );
-                        if s >= old || best.as_ref().is_some_and(|b| s >= b.0) {
+                            self.slivers(dynamic, ch, i, j, &ch.pts[i..=j]),
+                        ),
+                        self.wraps(ch, ends, i, j, &ch.pts[i..=j]),
+                    );
+                    let mut best: Option<(_, Vec<Point>)> = None;
+                    // `octilinear_paths` lists the diagonal-first dog-leg first; prefer the
+                    // straight-first one on ties ("straight out of the pad, one 45°").
+                    let mut cands = octilinear_paths(vi, vj);
+                    cands.reverse();
+                    let n2 = cands.len();
+                    // Three-segment candidates (Z / mirror Z) only repair pad wraps: they must
+                    // remove one without adding slivers, near-pad or 90° bends.
+                    cands.extend(three_segment_paths(ch.template.width, &ch.pts[i..=j]));
+                    for (ci, cand) in cands.into_iter().enumerate() {
+                        // Slivers and wraps are expensive: bound the key from below first.
+                        let s0 = score(self.base, ch, prev, &cand, next, 0);
+                        if key(s0, 0) >= old {
+                            continue;
+                        }
+                        let wraps = self.wraps(ch, ends, i, j, &cand);
+                        if key(s0, wraps) >= old {
+                            continue;
+                        }
+                        let sl = self.slivers(dynamic, ch, i, j, &cand);
+                        let k = key((sl, s0.1, s0.2, s0.3, s0.4), wraps);
+                        if k >= old
+                            || (ci >= n2
+                                && (k.2 >= old.2 || k.0 > old.0 || k.1 > old.1 || k.4 > old.4))
+                            || best.as_ref().is_some_and(|b| k >= b.0)
+                        {
                             continue;
                         }
                         if self.admissible(dynamic, ch, i, j, &cand) {
-                            best = Some((s, cand));
+                            best = Some((k, cand));
                         }
                     }
                     if let Some((_, cand)) = best {
@@ -781,6 +838,151 @@ impl<'a> Statics<'a> {
         });
         out
     }
+}
+
+/// The eight octilinear unit directions in counter-clockwise order.
+const DIRS: [(i64, i64); 8] =
+    [(1, 0), (1, 1), (0, 1), (-1, 1), (-1, 0), (-1, -1), (0, -1), (1, -1)];
+/// Spacing of the sampled transition positions of a three-segment candidate.
+const SAMPLE_STEP: i128 = 125_000;
+const MAX_SAMPLES: i128 = 40;
+
+fn cross2(a: (i128, i128), b: (i128, i128)) -> i128 {
+    a.0 * b.1 - a.1 * b.0
+}
+
+fn wide(d: (i64, i64)) -> (i128, i128) {
+    (i128::from(d.0), i128::from(d.1))
+}
+
+/// Shortest leg (in coordinate units along `d`) that satisfies the admissibility minimum
+/// of `2 x width` of length.
+fn min_leg(d: (i64, i64), width: Coord) -> i128 {
+    let w = i128::from(width);
+    if d.0 != 0 && d.1 != 0 { (w * 14_143 + 9_999) / 10_000 } else { 2 * w }
+}
+
+/// Deterministic sample of `lo..=hi`: `lo`, an ascending sweep, `hi`, the midpoint.
+fn samples(lo: i128, hi: i128) -> Vec<i128> {
+    let mut out = vec![lo];
+    let step = SAMPLE_STEP.max((hi - lo) / MAX_SAMPLES);
+    let mut v = lo + step;
+    while v < hi {
+        out.push(v);
+        v += step;
+    }
+    out.push(hi);
+    out.push(lo + (hi - lo) / 2);
+    let mut seen = BTreeSet::new();
+    out.retain(|v| seen.insert(*v));
+    out
+}
+
+/// `lo..=hi` narrowed so that `a + b * t >= 0`.
+fn narrow(lo: &mut i128, hi: &mut i128, a: i128, b: i128) {
+    match b.signum() {
+        0 => {
+            if a < 0 {
+                *hi = *lo - 1;
+            }
+        }
+        1 => *lo = (*lo).max((-a + b - 1).div_euclid(b)),
+        _ => *hi = (*hi).min(a.div_euclid(-b)),
+    }
+}
+
+/// Octilinear three-segment replacements of the chain part `pts` (first and last vertex
+/// are the window ends): "Z" (straight, one 45° transition, straight parallel to it) and
+/// its mirror (diagonal, straight, diagonal), with the transition position sampled
+/// deterministically. The first leg leaves along the old first leg (or 45° beside it) and
+/// the last leg arrives along the old last leg (or 45° beside it); every turn is 45°.
+fn three_segment_paths(width: Coord, pts: &[Point]) -> Vec<Vec<Point>> {
+    let (vi, vj) = (pts[0], pts[pts.len() - 1]);
+    let n = pts.len();
+    let (fv, lv) = (pts[1] - vi, vj - pts[n - 2]);
+    if !fv.is_octilinear() || !lv.is_octilinear() {
+        return Vec::new();
+    }
+    let dir_idx = |v: Point| DIRS.iter().position(|&d| d == unit(v));
+    let (Some(fi), Some(li)) = (dir_idx(fv), dir_idx(lv)) else { return Vec::new() };
+    let dv = vj - vi;
+    let dd = (i128::from(dv.x), i128::from(dv.y));
+    let mut triples: Vec<[usize; 3]> = Vec::new();
+    for a in [0usize, 1, 7] {
+        for c in [0usize, 1, 7] {
+            for b in [1usize, 7] {
+                let (i1, i3) = ((fi + a) % 8, (li + c) % 8);
+                let i2 = (i1 + b) % 8;
+                if matches!((i3 + 8 - i2) % 8, 1 | 7) && !triples.contains(&[i1, i2, i3]) {
+                    triples.push([i1, i2, i3]);
+                }
+            }
+        }
+    }
+    let mut out = Vec::new();
+    for [i1, i2, i3] in triples {
+        let (d1, d2, d3) = (DIRS[i1], DIRS[i2], DIRS[i3]);
+        let (w1, w2, w3) = (wide(d1), wide(d2), wide(d3));
+        let at = |p: Point, k: i128, d: (i64, i64)| -> Option<Point> {
+            Some(Point::new(
+                i64::try_from(i128::from(p.x) + k * i128::from(d.0)).ok()?,
+                i64::try_from(i128::from(p.y) + k * i128::from(d.1)).ok()?,
+            ))
+        };
+        let (k1, k2, k3) = (min_leg(d1, width), min_leg(d2, width), min_leg(d3, width));
+        if i1 == i3 {
+            // Z: s along d1, t along d2, then the rest of the run along d1.
+            let cd = cross2(w2, w1);
+            let num = cross2(dd, w1);
+            if num % cd != 0 || num / cd < k2 {
+                continue;
+            }
+            let t = num / cd;
+            let r = (dd.0 - t * w2.0, dd.1 - t * w2.1);
+            let norm = w1.0 * w1.0 + w1.1 * w1.1;
+            let dot = r.0 * w1.0 + r.1 * w1.1;
+            if dot % norm != 0 {
+                continue;
+            }
+            let total = dot / norm;
+            if total < 2 * k1 {
+                continue;
+            }
+            for s in samples(k1, total - k1) {
+                if let Some((p1, p2)) = at(vi, s, d1).and_then(|p1| Some((p1, at(p1, t, d2)?))) {
+                    out.push(vec![vi, p1, p2, vj]);
+                }
+            }
+        } else {
+            // d1 and d3 perpendicular: the diagonal leg length t is the free parameter.
+            let det = cross2(w1, w3);
+            let sg = det.signum();
+            let ad = det.abs();
+            let (mut lo, mut hi) = (k2, k2 + 2 * dd.0.abs().max(dd.1.abs()));
+            // s * |det| = sg * (cross(D, d3) - t * cross(d2, d3)) >= k1 * |det|
+            narrow(&mut lo, &mut hi, sg * cross2(dd, w3) - k1 * ad, -sg * cross2(w2, w3));
+            // u * |det| = sg * (cross(d1, D) - t * cross(d1, d2)) >= k3 * |det|
+            narrow(&mut lo, &mut hi, sg * cross2(w1, dd) - k3 * ad, -sg * cross2(w1, w2));
+            if hi < lo {
+                continue;
+            }
+            for t in samples(lo, hi) {
+                let r = (dd.0 - t * w2.0, dd.1 - t * w2.1);
+                let (sn, un) = (cross2(r, w3), cross2(w1, r));
+                if sn % det != 0 || un % det != 0 {
+                    continue;
+                }
+                let (s, u) = (sn / det, un / det);
+                if s < k1 || u < k3 {
+                    continue;
+                }
+                if let Some((p1, p2)) = at(vi, s, d1).and_then(|p1| Some((p1, at(p1, t, d2)?))) {
+                    out.push(vec![vi, p1, p2, vj]);
+                }
+            }
+        }
+    }
+    out
 }
 
 /// `(introduced violations, acid traps, missing connections)` of `base + edit`.
@@ -1115,5 +1317,45 @@ mod tests {
         assert!(ferroute_drc::quality::near_pad_bends(&after).is_empty());
         let rep = check(&after, &DrcConfig { courtyards: false, ..DrcConfig::default() });
         assert_eq!(rep.introduced().count(), 0);
+    }
+
+    /// R14 pattern: the route leaves pad 1 down, runs under the part's own pad 2 and climbs
+    /// back across the pad's edge line next to it (a dip). The climb must move away from
+    /// the pad (beyond its examined radius) so the connection no longer wraps.
+    #[test]
+    fn dip_under_own_pad_is_not_a_wrap() {
+        let mut bb = BoardBuilder::new(mm(30), mm(20), 2);
+        let n = bb.net("N");
+        bb.smd2("R1", p(3.0, 5.625), 0.0, n, NetId::NONE);
+        bb.smd2("R2", p(14.8, 6.0), 0.0, n, NetId::NONE);
+        let base = bb.build();
+        let (a, b) = (p(2.2, 5.625), p(14.0, 6.0));
+        let pts = [a, p(2.2, 6.5), p(2.5, 6.8), p(4.0, 6.8), p(4.8, 6.0), b];
+        let edit = BoardEdit { new_tracks: trk(n, 0, &pts), ..BoardEdit::default() };
+        let mut before = base.clone();
+        before.apply(&edit);
+        assert_eq!(ferroute_drc::quality::pad_wraps(&before).len(), 1);
+        assert_clean(&base, &edit);
+        let out = straighten(&base, &edit);
+        assert_clean(&base, &out);
+        let mut after = base;
+        after.apply(&out);
+        assert!(ferroute_drc::quality::pad_wraps(&after).is_empty());
+        assert!(bends(&out.new_tracks) <= bends(&edit.new_tracks));
+        // INV-ROUTE-2: the first leg leaves pad 1 along its axis (straight down).
+        let first = out.new_tracks.iter().find(|t| t.start == a || t.end == a).expect("at pad");
+        let other = if first.start == a { first.end } else { first.start };
+        assert!(other.x == a.x && other.y > a.y, "{other:?}");
+    }
+
+    #[test]
+    fn three_segment_paths_are_octilinear_and_connect() {
+        let pts = [p(0.0, 0.0), p(1.0, 0.0), p(2.0, 1.0), p(10.0, 1.0)];
+        let cands = three_segment_paths(W, &pts);
+        assert!(!cands.is_empty());
+        for c in cands {
+            assert_eq!((c[0], c[c.len() - 1]), (pts[0], pts[3]));
+            assert!(c.windows(2).all(|w| (w[1] - w[0]).is_octilinear() && w[0] != w[1]), "{c:?}");
+        }
     }
 }

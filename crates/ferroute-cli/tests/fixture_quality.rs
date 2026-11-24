@@ -135,15 +135,14 @@ fn synthetic_ci_suite_is_clean_of_slivers_and_right_angles() {
 }
 
 /// Every fixture, both placement modes: connections never circle their pad or double
-/// back across its edge line, except for the dips recorded here (a dip under the part's
-/// other pad that returns within 2 x (pad size + clearance) of the pad), which locked
-/// neighbours on the lattice rows force.
+/// back across its edge line, except for the one recorded here (demo_2layer with
+/// nudging: a wrap at a junction of the pad's own net).
 #[test]
 fn fixtures_have_no_pad_wraps_beyond_the_known_dips() {
     let cases: [(&str, &[&str], usize); 12] = [
-        ("bga_planes", &[], 4),
-        ("bga_planes", &["--allow-move"], 4),
-        ("demo_2layer", &[], 2),
+        ("bga_planes", &[], 0),
+        ("bga_planes", &["--allow-move"], 0),
+        ("demo_2layer", &[], 0),
         ("demo_2layer", &["--allow-move"], 1),
         ("demo_dru", &[], 0),
         ("demo_dru", &["--allow-move"], 0),
@@ -165,6 +164,6 @@ fn synthetic_ci_suite_pad_wraps_are_bounded() {
         let board = ferroute_engine::synth::generate(&spec);
         let res = ferroute_engine::run(&board, &ferroute_engine::PipelineConfig::default())
             .expect("route");
-        check_wraps(&spec.name, &res.board_after, usize::from(spec.name == "ci-s2-small"));
+        check_wraps(&spec.name, &res.board_after, 0);
     }
 }

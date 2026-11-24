@@ -238,11 +238,7 @@ pub fn pad_wraps(board: &Board) -> Vec<PadWrap> {
             continue;
         }
         let c = board.pad_position(id);
-        let hull = board.pad_hull(id);
-        let bb = hull.bbox();
-        let clearance = board.clearance_between(pad.net, pad.net);
-        let radius = 2 * (bb.width().max(bb.height()) + clearance);
-        let inside = |q: Point| hull.clearance_violated(&Hull::disk(q, 0), 0);
+        let radius = wrap_radius(board, id);
         for layer in (0..=u8::MAX).map(LayerId).filter(|&l| pad.layers.contains(l)) {
             let Some(pieces) = groups.get(&(layer.0, pad.net.0)) else { continue };
             let touching = |p: Point, skip: Option<usize>| -> Vec<usize> {
@@ -254,44 +250,14 @@ pub fn pad_wraps(board: &Board) -> Vec<PadWrap> {
                 if pieces[first].arc {
                     continue;
                 }
-                let s0 = pieces[first].seg;
-                let u0 = (if s0.a == c { s0.b } else { s0.a }) - c;
-                // Axis coordinate of the point where the chain leaves the pad copper.
-                let mut edge: Option<i128> = None;
-                let mut hit = None;
-                let (mut turn, mut cur, mut piece, mut prev_dir) = (0i32, c, first, None::<Point>);
+                // The vertices of the plain degree-2 chain leaving the pad, up to and
+                // including the first one beyond `radius`.
+                let mut pts = vec![c];
+                let (mut cur, mut piece) = (c, first);
                 loop {
                     let s = pieces[piece].seg;
                     let next = if s.a == cur { s.b } else { s.a };
-                    let dir = next - cur;
-                    if let Some(u) = prev_dir {
-                        turn += turn_units(u, dir);
-                        if turn.abs() >= 4 {
-                            hit = Some(cur);
-                            break;
-                        }
-                    }
-                    if let Some(e) = edge {
-                        if (next - c).dot(u0) < e {
-                            hit = Some(next);
-                            break;
-                        }
-                    } else if !inside(next) {
-                        // Where this leg leaves the pad copper (the pad is convex).
-                        let at = |t: i128| {
-                            let d = next - cur;
-                            cur + Point::new(
-                                i64::try_from((i128::from(d.x) * t) >> 20).unwrap_or(0),
-                                i64::try_from((i128::from(d.y) * t) >> 20).unwrap_or(0),
-                            )
-                        };
-                        let (mut lo, mut hi) = (0i128, 1i128 << 20);
-                        while hi - lo > 1 {
-                            let mid = (lo + hi) / 2;
-                            if inside(at(mid)) { lo = mid } else { hi = mid }
-                        }
-                        edge = Some((at(hi) - c).dot(u0));
-                    }
+                    pts.push(next);
                     if !within(next, c, radius) {
                         break;
                     }
@@ -304,15 +270,72 @@ pub fn pad_wraps(board: &Board) -> Vec<PadWrap> {
                     if pieces[n].arc {
                         break;
                     }
-                    (cur, piece, prev_dir) = (next, n, Some(dir));
+                    (cur, piece) = (next, n);
                 }
-                if let Some(at) = hit {
+                if let Some(at) = wrap_hit(board, id, &pts) {
                     out.push(PadWrap { pad: id, layer, net: pad.net, at });
                 }
             }
         }
     }
     out
+}
+
+/// Distance from a pad centre within which a connection is examined for wrapping.
+fn wrap_radius(board: &Board, id: ferroute_board::PadId) -> Coord {
+    let pad = board.pad(id);
+    let bb = board.pad_hull(id).bbox();
+    2 * (bb.width().max(bb.height()) + board.clearance_between(pad.net, pad.net))
+}
+
+/// Does the polyline `pts` (starting at the centre of pad `id`) wrap around the pad
+/// (see [`pad_wraps`])? Returns where the wrap is detected. Vertices beyond the examined
+/// radius are ignored, so `pts` may be longer than needed.
+#[must_use]
+pub fn wrap_hit(board: &Board, id: ferroute_board::PadId, pts: &[Point]) -> Option<Point> {
+    let c = board.pad_position(id);
+    let hull = board.pad_hull(id);
+    let radius = wrap_radius(board, id);
+    let inside = |q: Point| hull.clearance_violated(&Hull::disk(q, 0), 0);
+    let u0 = *pts.get(1)? - c;
+    // Axis coordinate of the point where the chain leaves the pad copper.
+    let mut edge: Option<i128> = None;
+    let (mut turn, mut prev_dir) = (0i32, None::<Point>);
+    for w in pts.windows(2) {
+        let (cur, next) = (w[0], w[1]);
+        let dir = next - cur;
+        if let Some(u) = prev_dir {
+            turn += turn_units(u, dir);
+            if turn.abs() >= 4 {
+                return Some(cur);
+            }
+        }
+        if let Some(e) = edge {
+            if (next - c).dot(u0) < e {
+                return Some(next);
+            }
+        } else if !inside(next) {
+            // Where this leg leaves the pad copper (the pad is convex).
+            let at = |t: i128| {
+                let d = next - cur;
+                cur + Point::new(
+                    i64::try_from((i128::from(d.x) * t) >> 20).unwrap_or(0),
+                    i64::try_from((i128::from(d.y) * t) >> 20).unwrap_or(0),
+                )
+            };
+            let (mut lo, mut hi) = (0i128, 1i128 << 20);
+            while hi - lo > 1 {
+                let mid = (lo + hi) / 2;
+                if inside(at(mid)) { lo = mid } else { hi = mid }
+            }
+            edge = Some((at(hi) - c).dot(u0));
+        }
+        if !within(next, c, radius) {
+            break;
+        }
+        prev_dir = Some(dir);
+    }
+    None
 }
 
 /// Two same-net copper items that do not touch but are closer than the net clearance: a
