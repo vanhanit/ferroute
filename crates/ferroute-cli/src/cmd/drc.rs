@@ -56,8 +56,19 @@ pub fn run(a: &DrcArgs) -> Result<ExitCode> {
             ferroute_geom::units::nm_to_mm(v.required)
         ));
     }
+    let dfm = ferroute_drc::dfm::check(&kb.board, &ferroute_drc::dfm::DfmConfig::default());
+    if !dfm.is_empty() {
+        out(&format!("{} DFM note(s) (not violations):", dfm.len()));
+    }
+    for i in dfm.iter().take(50) {
+        out(&format!("  - dfm: {}", i.describe(&item_label(&kb.board, i.item))));
+    }
     if let Some(p) = &a.json {
-        std::fs::write(p, serde_json::to_string_pretty(&rep)?)?;
+        let mut v = serde_json::to_value(&rep)?;
+        if let Some(o) = v.as_object_mut() {
+            o.insert("dfm".into(), serde_json::to_value(&dfm)?);
+        }
+        std::fs::write(p, serde_json::to_string_pretty(&v)?)?;
     }
     let fail = (a.fail_on_violation && !rep.violations.is_empty())
         || (a.fail_on_unconnected && rep.connectivity.connections_missing > 0);

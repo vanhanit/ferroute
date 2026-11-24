@@ -26,6 +26,7 @@ use rustc_hash::FxHashMap;
 use serde::{Deserialize, Serialize};
 
 pub mod connectivity;
+pub mod dfm;
 pub mod pairs;
 pub mod quality;
 pub mod refill;
