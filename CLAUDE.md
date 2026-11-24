@@ -208,7 +208,7 @@ Completion and DRC come first; within that, every result must look hand-tuned:
 | 8 | Dense BGA / 4–8-layer benchmark suites | Worker | extend `synth` |
 | 9 | Proto drift check against upstream KiCad `api/proto` in nightly lane | Worker | |
 | 10 | Copper pour awareness, blind/buried/micro vias | Lead | M4 |
-| 11 | Stack-up from `.kicad_pcb` `(setup (stackup …))` → `Board::stackup` (today: defaults or `--rules [stackup]`) | Worker | contract: `ferroute_board::constraints::Stackup` |
+| 11 | ✅ Stack-up read from `.kicad_pcb` (per-dielectric thickness/εr, sub-layers, board thickness) | Worker | done |
 | 12 | Fine-pitch escape: congestion-aware pin-access ordering for QFN/QFP/BGA | Lead | M2 |
 | 15 | `.kicad_dru` custom rules: parse the KiCad DRC rule language (clearance, track_width, via_diameter, hole_size, hole_clearance, edge_clearance, annular_width, diff_pair_gap, length, skew; NetClass/NetName/Type/layer conditions); unsupported conditions apply conservatively and are reported, never ignored | Worker | P1 — correctness gap |
 | 15b | `.kicad_dru` follow-ups: pair-specific clearance in the router plan (today a pair rule raises both nets' clearance against everything — conservative, may cost completion on dense boards); enforce `max`/`opt` limits; pad annular rings; `hole_to_hole`, `diff_pair_gap`, `skew` and time-unit length rules; non-error severities | Lead + worker | from #15 |
