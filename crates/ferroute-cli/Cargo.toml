@@ -46,3 +46,4 @@ ferroute-engine.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true
+prost.workspace = true

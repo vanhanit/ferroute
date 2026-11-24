@@ -231,7 +231,7 @@ Completion and DRC come first; within that, every result must look hand-tuned:
 | 29 | BGA escape: parked on branch `wip/bga-escape` (planner + pour-net rip order). Findings on bga_256_4l: the 75.5 → 88.7 % gain came from ripping pour nets last, not from escapes; escapes add 8 right angles at their end nodes (router arrives at 90°) and +5 slivers; rip order alone regresses bga_484_6l via the pour fallback (79.4 → 70.5 %), escapes rescue it (90.1 %). Next: escape ends with a diagonal departure stub so arrivals are never 90°, stagger ends, let escapes pick micro/blind vias (#30), make rip order pour-continuity-aware (#31); merge only when right angles = 0 and slivers ≤ no-escape run | Lead + worker | P1 |
 | 30 | ✅ Blind / buried / micro vias (opt-in `--via-types`, `[routing] via_types`; span-specific legality/reservation, KiCad 10 via kinds, microvia sizes, per-span DRC/DFM, HDI cost note; bga_256_4l 75.5 % → 97.8 %, KiCad DRC clean). Next: `micro_in_pad` (parsed, not yet used by the router); span search ~2.9× slower than through-only; let #29 escapes choose via kinds | Lead + worker | done |
 | 31 | Pour continuity on dense multilayer boards: bga_484_6l falls back to obstacle mode because routed copper would split a plane — route/escape vias with pour-continuity gaps, prefer keeping planes contiguous (cost term), refill may then proceed | Lead + worker | from #29 findings |
-| 13 | Coverage ≥ 85 % per crate: CLI output via injected `&mut dyn Write`, ipc/render/kicad gaps | Worker | `make coverage` |
+| 13 | Coverage ≥ 85 % per crate: ✅ ipc 96 %, render 93 %, kicad 90 %, dsn 87 %, cli 91 % (IPC mock server tests). Next: re-measure router/engine/drc/board/place/geom | Worker | `make coverage` |
 
 ## Environment notes for cloud sessions
 
