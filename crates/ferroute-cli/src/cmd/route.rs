@@ -4,8 +4,8 @@
 use super::{item_label, load, out, render_opts};
 use crate::length::parse_length;
 use anyhow::{Context, Result, bail};
-use ferroute_board::LayerSet;
 use ferroute_board::netrules::RuleSet;
+use ferroute_board::{LayerSet, ViaKind, ViaPolicy};
 use ferroute_engine::{PipelineConfig, run as run_pipeline};
 use ferroute_geom::Coord;
 use ferroute_place::{MovePolicy, PlaceConfig};
@@ -95,6 +95,14 @@ pub struct RouteArgs {
     /// must be filled and capped (IPC-4761 type VII): an extra fabrication cost.
     #[arg(long)]
     pub allow_via_in_pad: bool,
+    /// Via kinds the router may create, comma separated: through, blind, buried, micro
+    /// (default through; also `[routing] via_types` in --rules). Blind, buried and micro
+    /// vias need HDI fabrication: an extra cost.
+    #[arg(long, value_delimiter = ',')]
+    pub via_types: Vec<String>,
+    /// Allow micro vias inside same-net SMD pads (also `[routing] micro_in_pad = true`).
+    #[arg(long)]
+    pub micro_in_pad: bool,
     /// Enable KiCad's native teardrops on every pad and via that gets new copper (also
     /// `[routing] teardrops = true` in --rules). Only the teardrop property of those pads and
     /// vias is written; KiCad creates the copper when zones are refilled.
@@ -104,6 +112,23 @@ pub struct RouteArgs {
     /// to routed copper and their stored fill is recomputed around it).
     #[arg(long)]
     pub no_refill_zones: bool,
+}
+
+/// Number of new vias per [`ViaKind`] (in `ViaKind::ALL` order).
+fn via_kind_counts(vias: &[ferroute_board::Via]) -> [usize; 4] {
+    let mut c = [0usize; 4];
+    for v in vias {
+        c[ViaKind::ALL.iter().position(|&k| k == v.kind).unwrap_or(0)] += 1;
+    }
+    c
+}
+
+fn via_kinds_json(c: &[usize; 4]) -> serde_json::Value {
+    let mut m = serde_json::Map::new();
+    for (k, n) in ViaKind::ALL.iter().zip(c) {
+        m.insert(k.name().to_owned(), serde_json::json!(n));
+    }
+    serde_json::Value::Object(m)
 }
 
 /// Parses a rules file (`[stackup]` + `[[net]]` tables).
@@ -123,11 +148,22 @@ pub fn run(a: &RouteArgs) -> Result<ExitCode> {
     let mut board = kb.board;
     let mut via_in_pad = a.allow_via_in_pad;
     let mut teardrops = a.teardrops;
+    let mut via_policy = ViaPolicy::default();
+    if !a.via_types.is_empty() {
+        via_policy = ViaPolicy::from_names(a.via_types.iter().map(String::as_str))
+            .map_err(|n| anyhow::anyhow!("--via-types: unknown via kind {n:?}"))?;
+    }
+    via_policy.micro_in_pad |= a.micro_in_pad;
     if let Some(path) = &a.rules {
         let text =
             std::fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
         let rules = parse_rules(&text).with_context(|| format!("in {}", path.display()))?;
         via_in_pad |= rules.via_in_pad();
+        if a.via_types.is_empty()
+            && let Some(p) = rules.via_policy()
+        {
+            via_policy = ViaPolicy { micro_in_pad: via_policy.micro_in_pad || p.micro_in_pad, ..p };
+        }
         teardrops |= rules.teardrops();
         for w in rules.apply(&mut board)? {
             out(&format!("rules warning: {w}"));
@@ -163,6 +199,7 @@ pub fn run(a: &RouteArgs) -> Result<ExitCode> {
             max_iterations: a.iterations,
             accel: a.accel.into(),
             via_in_pad,
+            via_policy,
             ..RouterConfig::default()
         },
         nudge: a.allow_move.then(|| {
@@ -228,6 +265,14 @@ pub fn run(a: &RouteArgs) -> Result<ExitCode> {
             "via-in-pad: {via_in_pad_count} via(s) — require filled & capped vias (extra fabrication cost)"
         ));
     }
+    let kinds = via_kind_counts(&res.edit.new_vias);
+    let hdi: usize = kinds[1..].iter().sum();
+    if hdi > 0 {
+        out(&format!(
+            "blind/buried/micro vias: {hdi} ({} blind, {} buried, {} micro) — require HDI fabrication (extra cost)",
+            kinds[1], kinds[2], kinds[3]
+        ));
+    }
     if teardrops {
         out(&format!(
             "teardrops: enabled on {teardrop_nodes} pad(s)/via(s); KiCad creates the copper on refill"
@@ -254,6 +299,7 @@ pub fn run(a: &RouteArgs) -> Result<ExitCode> {
             "input": a.input, "output": a.output, "seed": a.seed,
             "metrics": m, "route": res.route, "place": res.place, "failed_nets": failed,
             "lns_rounds_run": res.rounds, "via_in_pad": via_in_pad_count,
+            "via_kinds": via_kinds_json(&kinds),
             "rule_notes": res.rule_notes, "rule_issues": issues,
             "teardrops": teardrops.then_some(teardrop_nodes), "dfm_issues": dfm,
             "drc": { "violations": res.drc.violations.len(), "connectivity": res.drc.connectivity },
@@ -285,6 +331,39 @@ pub fn run(a: &RouteArgs) -> Result<ExitCode> {
 #[cfg(test)]
 mod tests {
     use super::parse_rules;
+
+    #[test]
+    fn routing_table_selects_via_kinds() {
+        let rs =
+            parse_rules("[routing]\nvia_types = [\"through\", \"micro\"]\nmicro_in_pad = true\n")
+                .expect("rules");
+        let p = rs.via_policy().expect("policy");
+        assert!(p.through && p.micro && !p.blind && !p.buried && p.micro_in_pad);
+        assert_eq!(parse_rules("[routing]\nvia_in_pad = true").expect("rules").via_policy(), None);
+        let err = parse_rules("[routing]\nvia_types = [\"stacked\"]").expect_err("unknown kind");
+        assert!(format!("{err:#}").contains("stacked"), "{err:#}");
+        assert!(parse_rules("[routing]\nvia_types = []").is_err(), "empty list rejected");
+    }
+
+    #[test]
+    fn via_kind_counts_follow_the_kind_order() {
+        use ferroute_board::{LayerSet, NetId, Origin, Via, ViaKind};
+        let via = |kind| Via {
+            pos: ferroute_geom::Point::ORIGIN,
+            diameter: 1,
+            drill: 1,
+            layers: LayerSet::EMPTY,
+            kind,
+            net: NetId(1),
+            locked: false,
+            origin: Origin::Routed,
+        };
+        let vias = [ViaKind::Micro, ViaKind::Through, ViaKind::Micro, ViaKind::Buried].map(via);
+        assert_eq!(super::via_kind_counts(&vias), [1, 0, 1, 2]);
+        let json = super::via_kinds_json(&[1, 0, 1, 2]);
+        assert_eq!(json["micro"], 2);
+        assert_eq!(json["blind"], 0);
+    }
 
     #[test]
     fn rules_file_round_trip() {

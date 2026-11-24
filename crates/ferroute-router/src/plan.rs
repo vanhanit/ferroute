@@ -59,6 +59,8 @@ pub fn class_geoms(rules: &DesignRules) -> Vec<ClassGeom> {
             via_diameter: c.via_diameter,
             via_radius: c.via_diameter / 2,
             via_drill: c.via_drill,
+            micro_diameter: c.microvia_diameter,
+            micro_drill: c.microvia_drill,
         })
         .collect()
 }
@@ -72,7 +74,31 @@ impl Plan {
     /// Smallest reservation radii satisfying every pairwise separation requirement.
     #[must_use]
     pub fn new(rules: &DesignRules, pitch: Coord) -> Self {
+        Self::with_micro(rules, pitch, false)
+    }
+
+    /// Like [`Plan::new`]; with `micro` the via reservations also cover the microvia size
+    /// of every class (microvias are placed under the same rings, so the larger of the two
+    /// sizes must be separated).
+    #[must_use]
+    pub fn with_micro(rules: &DesignRules, pitch: Coord, micro: bool) -> Self {
         let geoms = class_geoms(rules);
+        let reach: Vec<ClassGeom> = geoms
+            .iter()
+            .map(|g| {
+                if micro {
+                    let d = g.via_diameter.max(g.micro_diameter);
+                    ClassGeom {
+                        via_diameter: d,
+                        via_radius: d / 2,
+                        via_drill: g.via_drill.max(g.micro_drill),
+                        ..*g
+                    }
+                } else {
+                    *g
+                }
+            })
+            .collect();
         let n = geoms.len();
         let mut k = vec![0u32; n];
         let mut rv = vec![0u32; n];
@@ -109,14 +135,14 @@ impl Plan {
             }
             for a in 0..n {
                 for b in 0..n {
-                    let need = steps_needed(d_vt(&geoms[a], &geoms[b]), pitch).saturating_sub(1);
+                    let need = steps_needed(d_vt(&reach[a], &geoms[b]), pitch).saturating_sub(1);
                     if rv[a].max(k[b]) < need {
                         rv[a] = need;
                         changed = true;
                     }
-                    let need = steps_needed(d_vv(&geoms[a], &geoms[b]), pitch).saturating_sub(1);
+                    let need = steps_needed(d_vv(&reach[a], &reach[b]), pitch).saturating_sub(1);
                     if rv[a].max(rv[b]) < need {
-                        if geoms[a].via_radius >= geoms[b].via_radius {
+                        if reach[a].via_radius >= reach[b].via_radius {
                             rv[a] = need;
                         } else {
                             rv[b] = need;
@@ -129,7 +155,7 @@ impl Plan {
                 break;
             }
         }
-        let max_drill = geoms.iter().map(|g| g.via_drill).max().unwrap_or(0);
+        let max_drill = reach.iter().map(|g| g.via_drill).max().unwrap_or(0);
         let need_h = steps_needed(max_drill + rules.hole_to_hole, pitch);
         let rh = need_h.saturating_sub(1).div_ceil(2);
         let classes = geoms
@@ -180,6 +206,7 @@ mod tests {
             track_width: 500_000,
             via_diameter: 800_000,
             via_drill: 400_000,
+            ..Default::default()
         });
         let plan = Plan::new(&rules, default_pitch(&rules));
         assert_eq!(plan.classes[0].k, 0);

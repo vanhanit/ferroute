@@ -589,6 +589,7 @@ mod tests {
             pos: at,
             diameter: 600_000,
             drill: 300_000,
+            kind: ferroute_board::ViaKind::Through,
             layers: board.all_layers(),
             net: n,
             locked: false,

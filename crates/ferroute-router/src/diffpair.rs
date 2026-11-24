@@ -324,6 +324,8 @@ fn candidates(
         via_diameter: class.via_diameter,
         via_radius: class.via_diameter / 2,
         via_drill: class.via_drill,
+        micro_diameter: class.microvia_diameter,
+        micro_drill: class.microvia_drill,
     };
     let (da, db) = (end_dirs(board, ends[0]), end_dirs(board, ends[1]));
     if da.is_empty() || db.is_empty() {

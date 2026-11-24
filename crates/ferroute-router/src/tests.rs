@@ -72,6 +72,7 @@ fn header_and_fat_power_class() {
         track_width: 500_000,
         via_diameter: 800_000,
         via_drill: 400_000,
+        ..Default::default()
     });
     b.header("J1", pt10(50, 80), 0.0, &[vcc, gnd, s1]);
     b.smd2("C1", pt10(250, 100), 0.0, vcc, gnd);
@@ -196,6 +197,7 @@ fn diag_header() {
         track_width: 500_000,
         via_diameter: 800_000,
         via_drill: 400_000,
+        ..Default::default()
     });
     b.header("J1", pt10(50, 80), 0.0, &[vcc, gnd, s1]);
     b.smd2("C1", pt10(250, 100), 0.0, vcc, gnd);

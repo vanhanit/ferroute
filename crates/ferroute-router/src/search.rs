@@ -48,6 +48,10 @@ pub struct Ctx<'a> {
     pub rv_offs: &'a [(i32, i32)],
     /// Hole-channel offsets (radius rh), planar.
     pub rh_offs: &'a [(i32, i32)],
+    /// Which via kinds exist and what they cost.
+    pub vm: &'a crate::vspan::ViaModel,
+    /// Planar steps between two vias of one path when spans are enabled.
+    pub via_gap: u8,
 }
 
 /// Chebyshev-ball offsets of radius `r`.
@@ -410,8 +414,12 @@ fn astar_in(
     let (i0, j0, i1, j1) = ctx.region;
     let (w, h) = (i1 - i0 + 1, j1 - j0 + 1);
     let nl = g.nl();
+    // With spans the state of a node also holds the planar steps still required before
+    // the next via (so that the vias of one path keep their holes apart); without spans
+    // `gap == 1` and the state is the node.
+    let gap = if ctx.vm.spans_enabled() { usize::from(ctx.via_gap) + 1 } else { 1 };
     let columns = w as usize * h as usize;
-    let size = columns * nl as usize;
+    let size = columns * nl as usize * gap;
     if sc.generation == u32::MAX {
         for r in &mut sc.recs {
             r.stamp = 0;
@@ -455,6 +463,7 @@ fn astar_in(
     for s in sources {
         if let Some(ls) = local(s.node) {
             *src_forbid.entry(ls).or_default() |= s.forbid;
+            let ls = ls * gap;
             touch(recs, ls);
             if s.cost < recs[ls].cost {
                 recs[ls].cost = s.cost;
@@ -473,11 +482,12 @@ fn astar_in(
     let rh_offs = Offs::new(ctx.rh_offs, g.nx);
     let has_own = !ctx.own_nodes.is_empty() || !ctx.own_edges.is_empty();
     while let Some(packed) = heap.pop() {
-        let lx = (packed & 0xffff_ffff) as usize;
-        if recs[lx].closed {
+        let sx = (packed & 0xffff_ffff) as usize;
+        if recs[sx].closed {
             continue;
         }
-        recs[lx].closed = true;
+        recs[sx].closed = true;
+        let (lx, hold) = (sx / gap, sx % gap);
         let (i, j, l) = {
             let x = u32::try_from(lx).unwrap_or(u32::MAX);
             let (c, r) = (x % w, x / w);
@@ -486,28 +496,28 @@ fn astar_in(
         let n = g.idx(i, j, l);
         // A source that is also a target (zero-length connection, e.g. two pad stubs on
         // one lattice node) only counts if the target's heading is a legal departure.
-        let parent_lx = recs[lx].parent;
+        let parent_sx = recs[sx].parent;
         let zero_len_ok = |t: TargetInfo| {
             let hd = t.heading;
-            parent_lx != u32::MAX
+            parent_sx != u32::MAX
                 || hd.is_none_or(|h| {
                     src_forbid.get(&lx).copied().unwrap_or(0) & (1 << h.index()) == 0
                 })
         };
         if target(n).is_some_and(zero_len_ok) {
             let mut path = vec![n];
-            let mut cur = lx;
+            let mut cur = sx;
             while recs[cur].parent != u32::MAX {
                 cur = recs[cur].parent as usize;
-                path.push(global(cur));
+                path.push(global(cur / gap));
             }
             path.reverse();
             return Some(path);
         }
-        let base = recs[lx].cost;
-        let arr = recs[lx].arrive;
+        let base = recs[sx].cost;
+        let arr = recs[sx].arrive;
         let forbid =
-            if parent_lx == u32::MAX { src_forbid.get(&lx).copied().unwrap_or(0) } else { 0 };
+            if parent_sx == u32::MAX { src_forbid.get(&lx).copied().unwrap_or(0) } else { 0 };
         let relax = |recs: &mut [Rec],
                      heap: &mut MinHeap,
                      lm: usize,
@@ -533,7 +543,7 @@ fn astar_in(
             let c = base + step + exit;
             if c < recs[lm].cost {
                 recs[lm].cost = c;
-                recs[lm].parent = u32::try_from(lx).unwrap_or(u32::MAX);
+                recs[lm].parent = u32::try_from(sx).unwrap_or(u32::MAX);
                 recs[lm].arrive = next;
                 heap.push(key(c + octile(mi, mj, target_box), lm));
             }
@@ -549,7 +559,7 @@ fn astar_in(
             #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
             let (mi, mj) = (ni as u32, nj as u32);
             let m = g.idx(mi, mj, l);
-            let lm = ((l * h + (mj - j0)) * w + (mi - i0)) as usize;
+            let lm = ((l * h + (mj - j0)) * w + (mi - i0)) as usize * gap + hold.saturating_sub(1);
             touch(recs, lm);
             if recs[lm].closed {
                 continue;
@@ -585,7 +595,48 @@ fn astar_in(
             let step = len * (1.0 + ctx.hist[m as usize]) * (1.0 + ctx.pres_fac * cong) + bend;
             relax(recs, heap, lm, m, (mi, mj), step, Arrival::new(Some(d), false));
         }
-        if !arr.via() && nl > 1 && allows(ctx.leg.via[(j * g.nx + i) as usize], ctx.net) {
+        if !arr.via() && hold == 0 && nl > 1 && ctx.vm.spans_enabled() {
+            // Span-aware layer changes: the kind (and so the layers it occupies and its
+            // cost) follows from the span, see `ViaModel::resolve`.
+            let planar = g.planar(n);
+            let hole = ctx.sum_hole_fast(&rh_offs, i, j);
+            for ll in (0..nl).filter(|&x| x != l) {
+                let m = g.idx(i, j, ll);
+                if !allows(ctx.leg.node[m as usize], ctx.net) || ctx.own_nodes.contains(&m) {
+                    continue;
+                }
+                let Some(kind) = ctx.vm.resolve(ctx.leg, ctx.net, planar, l, ll) else {
+                    continue;
+                };
+                let (lo, hi) = if kind == ferroute_board::ViaKind::Through {
+                    (0, nl - 1)
+                } else {
+                    (l.min(ll), l.max(ll))
+                };
+                let mut cong = hole;
+                for x in lo..=hi {
+                    cong += ctx.sum_occ_fast(&rv_offs, i, j, x);
+                }
+                let lm = ((ll * h + (j - j0)) * w + (i - i0)) as usize * gap + (gap - 1);
+                touch(recs, lm);
+                if recs[lm].closed {
+                    continue;
+                }
+                let step = costs.via
+                    * ctx.vm.factor(kind)
+                    * (1.0 + ctx.hist[m as usize])
+                    * (1.0 + ctx.pres_fac * cong);
+                // Vias of one net keep their holes apart: the next one is a hole-channel
+                // diameter away (a successive pair of cheap layer hops would otherwise
+                // sit on top of each other).
+                relax(recs, heap, lm, m, (i, j), step, Arrival::new(arr.heading(), true));
+            }
+        } else if !arr.via()
+            && !ctx.vm.spans_enabled()
+            && nl > 1
+            && ctx.vm.policy.through
+            && allows(ctx.leg.via[(j * g.nx + i) as usize], ctx.net)
+        {
             let col = ((j - j0) * w + (i - i0)) as usize;
             if vstamp[col] != generation {
                 let mut cong = ctx.sum_hole_fast(&rh_offs, i, j);
@@ -692,6 +743,7 @@ mod tests {
             node: vec![FREE; len],
             edge: vec![FREE; len * 4],
             via: vec![FREE; grid.plane()],
+            via_span: Vec::new(),
         };
         let zeros16 = vec![0u16; len];
         let zeros_plane = vec![0u16; grid.plane()];
@@ -699,6 +751,7 @@ mod tests {
         let (k, rv, rh) = (ball(1), ball(1), ball(1));
         let none_nodes = rustc_hash::FxHashSet::default();
         let none_edges = rustc_hash::FxHashSet::default();
+        let vm = crate::vspan::ViaModel::through_only();
         let ctx = |region: IBox| Ctx {
             grid: &grid,
             leg: &leg,
@@ -716,6 +769,8 @@ mod tests {
             k_offs: &k,
             rv_offs: &rv,
             rh_offs: &rh,
+            vm: &vm,
+            via_gap: 3,
         };
         let (a, b) = (grid.idx(2, 3, 0), grid.idx(20, 11, 1));
         let src = [Endpoint { node: a, heading: None, forbid: 0, cost: 0.0 }];

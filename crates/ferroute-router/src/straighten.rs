@@ -1043,6 +1043,7 @@ mod tests {
             pos: via,
             diameter: 600_000,
             drill: 300_000,
+            kind: ferroute_board::ViaKind::Through,
             layers: base.all_layers(),
             net: n,
             locked: false,

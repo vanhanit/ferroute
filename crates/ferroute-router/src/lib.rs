@@ -33,6 +33,7 @@ pub mod smooth;
 pub mod straighten;
 pub mod tune;
 pub mod vias;
+pub mod vspan;
 
 use access::{Stub, Terminal, pad_terminals};
 use ferroute_board::{Board, BoardEdit, LayerSet, NetId, PadId};
@@ -94,6 +95,17 @@ pub struct RouterConfig {
     /// Off by default.
     #[serde(default)]
     pub via_in_pad: bool,
+    /// Via kinds the router may create (default: through vias only). Blind, buried and
+    /// micro vias occupy only the layers they span, which frees routing space on the
+    /// others, but need HDI fabrication (extra cost).
+    #[serde(default)]
+    pub via_policy: ferroute_board::ViaPolicy,
+    /// Cost of a micro via relative to a through via.
+    #[serde(default = "default_micro_factor")]
+    pub micro_via_factor: f32,
+    /// Cost of a blind or buried via relative to a through via.
+    #[serde(default = "default_span_factor")]
+    pub span_via_factor: f32,
     /// Coordinated rip-up & re-route of small net neighbourhoods after the first passes.
     #[serde(default)]
     pub lns: lns::LnsConfig,
@@ -101,6 +113,14 @@ pub struct RouterConfig {
 
 const fn default_order_rounds() -> u32 {
     3
+}
+
+const fn default_micro_factor() -> f32 {
+    vspan::MICRO_FACTOR
+}
+
+const fn default_span_factor() -> f32 {
+    vspan::SPAN_FACTOR
 }
 
 impl Default for RouterConfig {
@@ -124,6 +144,9 @@ impl Default for RouterConfig {
             first: Vec::new(),
             order_rounds: default_order_rounds(),
             via_in_pad: false,
+            via_policy: ferroute_board::ViaPolicy::default(),
+            micro_via_factor: vspan::MICRO_FACTOR,
+            span_via_factor: vspan::SPAN_FACTOR,
             lns: lns::LnsConfig::default(),
         }
     }
@@ -141,6 +164,13 @@ pub struct RouteStats {
     pub nets_failed: usize,
     pub tracks: usize,
     pub vias: usize,
+    /// Of those vias, the blind / buried / micro ones (HDI fabrication, extra cost).
+    #[serde(default)]
+    pub blind_vias: usize,
+    #[serde(default)]
+    pub buried_vias: usize,
+    #[serde(default)]
+    pub micro_vias: usize,
     /// Of those vias, the ones inside an SMD pad (need filling and capping).
     #[serde(default)]
     pub via_in_pad: usize,
@@ -337,6 +367,8 @@ pub struct Prepared {
     legal: Vec<ClassLegality>,
     accel_name: String,
     legality_ms: f64,
+    /// Via kinds and costs (`via_policy` and the cost factors are board-level settings).
+    vm: vspan::ViaModel,
 }
 
 /// One routing pass with the net order given by `cfg.first`, then HPWL and seed.
@@ -365,9 +397,16 @@ pub fn prepare(board: &Board, cfg: &RouterConfig) -> Result<Prepared, RouteError
     let bbox0 =
         board.outline.bbox().ok_or_else(|| RouteError::InvalidBoard("no outline".into()))?;
     let (pitch, origin) = choose_lattice(board, bbox0, cfg.pitch);
-    let plan = Plan::new(&board.rules, pitch);
     let bbox = board.outline.bbox().ok_or_else(|| RouteError::InvalidBoard("no outline".into()))?;
     let grid = Grid::covering(Rect::new(origin, bbox.max), pitch, layers);
+    let vm = vspan::ViaModel::new(
+        cfg.via_policy,
+        &grid,
+        board.copper_layers.len(),
+        cfg.micro_via_factor,
+        cfg.span_via_factor,
+    );
+    let plan = Plan::with_micro(&board.rules, pitch, vm.policy.micro);
     if grid.len() > (1 << 26) {
         return Err(RouteError::GridTooLarge(grid.len()));
     }
@@ -410,7 +449,7 @@ pub fn prepare(board: &Board, cfg: &RouterConfig) -> Result<Prepared, RouteError
     let legal: Vec<ClassLegality> = plan
         .classes
         .iter()
-        .map(|cp| legality::compute(&grid, &obs, &cp.geom, accel.as_ref()))
+        .map(|cp| legality::compute_with(&grid, &obs, &cp.geom, accel.as_ref(), &vm))
         .collect();
     // Routes never run across pads: pads are entered only through their stubs.
     let interior = access::pad_interior_nodes(board, &grid);
@@ -435,6 +474,7 @@ pub fn prepare(board: &Board, cfg: &RouterConfig) -> Result<Prepared, RouteError
         legal,
         accel_name,
         legality_ms,
+        vm,
     })
 }
 
@@ -458,6 +498,7 @@ pub fn route_prepared(prep: &Prepared, cfg: &RouterConfig) -> Result<RouteOutcom
         legal,
         accel_name,
         legality_ms,
+        vm,
         ..
     } = prep;
     let (pitch, legality_ms) = (*pitch, *legality_ms);
@@ -570,6 +611,7 @@ pub fn route_prepared(prep: &Prepared, cfg: &RouterConfig) -> Result<RouteOutcom
         hist_fac: cfg.hist_fac,
         costs: base_costs,
         margin: cfg.margin,
+        vm: vm.clone(),
     };
     let t1 = Instant::now();
     let (routes, nstats) =
@@ -687,6 +729,21 @@ pub fn route_prepared(prep: &Prepared, cfg: &RouterConfig) -> Result<RouteOutcom
         nets_failed: failed.len(),
         tracks: edit.new_tracks.len(),
         vias: edit.new_vias.len(),
+        blind_vias: edit
+            .new_vias
+            .iter()
+            .filter(|v| v.kind == ferroute_board::ViaKind::Blind)
+            .count(),
+        buried_vias: edit
+            .new_vias
+            .iter()
+            .filter(|v| v.kind == ferroute_board::ViaKind::Buried)
+            .count(),
+        micro_vias: edit
+            .new_vias
+            .iter()
+            .filter(|v| v.kind == ferroute_board::ViaKind::Micro)
+            .count(),
         via_in_pad,
         right_angle_bends,
         near_pad_bends,
@@ -818,3 +875,6 @@ fn build_accel(
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod via_span_tests;

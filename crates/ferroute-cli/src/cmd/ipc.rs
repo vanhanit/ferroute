@@ -145,6 +145,8 @@ pub fn run(c: &IpcCommand) -> Result<ExitCode> {
                 rules: rules.clone(),
                 strict_rules: false,
                 allow_via_in_pad: *allow_via_in_pad,
+                via_types: Vec::new(),
+                micro_in_pad: false,
                 teardrops: *teardrops,
                 no_refill_zones: false,
             };

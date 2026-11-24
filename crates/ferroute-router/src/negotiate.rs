@@ -13,7 +13,8 @@ use crate::grid::{Grid, NodeIdx};
 use crate::legality::ClassLegality;
 use crate::plan::Plan;
 use crate::search::{Costs, Ctx, Endpoint, IBox, TargetInfo, astar, ball, stub_penalty};
-use ferroute_board::NetId;
+use crate::vspan::{ViaModel, ViaSite};
+use ferroute_board::{NetId, ViaKind};
 use ferroute_geom::Dir8;
 use rayon::prelude::*;
 use rustc_hash::FxHashMap;
@@ -44,6 +45,8 @@ pub struct NetRoute {
     pub reserved: Vec<NodeIdx>,
     /// Deduplicated via sites (planar).
     pub vias: Vec<u32>,
+    /// Deduplicated vias with their span and kind (through vias span the full stack).
+    pub via_sites: Vec<ViaSite>,
     pub complete: bool,
     /// Planar bbox of reserved nodes.
     pub bbox: Option<IBox>,
@@ -58,6 +61,8 @@ pub struct NegotiationConfig {
     pub hist_fac: f32,
     pub costs: Costs,
     pub margin: u32,
+    /// Which via kinds the lattice may use.
+    pub vm: ViaModel,
 }
 
 /// Negotiation statistics.
@@ -103,13 +108,24 @@ fn disjoint(a: IBox, b: IBox) -> bool {
 }
 
 /// Computes reserved nodes / via sites of a route.
-fn reserve(grid: &Grid, plan: &Plan, class: usize, stubs: &[Stub], r: &mut NetRoute) {
+#[allow(clippy::too_many_arguments)]
+fn reserve(
+    grid: &Grid,
+    plan: &Plan,
+    vm: &ViaModel,
+    leg: &ClassLegality,
+    net: NetId,
+    class: usize,
+    stubs: &[Stub],
+    r: &mut NetRoute,
+) {
     let cp = &plan.classes[class];
     let k_offs = ball(cp.k);
     let rv_offs = ball(cp.rv);
     let mut set: Vec<NodeIdx> = Vec::new();
     let mut base: Vec<NodeIdx> = Vec::new();
     let mut vias: Vec<u32> = Vec::new();
+    let mut sites: Vec<ViaSite> = Vec::new();
     let push_ball = |set: &mut Vec<NodeIdx>, i: u32, j: u32, l: u32, offs: &[(i32, i32)]| {
         for &(di, dj) in offs {
             let (x, y) = (i64::from(i) + i64::from(di), i64::from(j) + i64::from(dj));
@@ -128,6 +144,7 @@ fn reserve(grid: &Grid, plan: &Plan, class: usize, stubs: &[Stub], r: &mut NetRo
                 let (mi, mj, ml) = grid.coords(m);
                 if ml != l {
                     vias.push(grid.planar(n));
+                    sites.push(vm.site(leg, net, grid.planar(n), l, ml));
                 } else if mi != i && mj != j {
                     base.push(grid.idx(mi, j, l));
                     base.push(grid.idx(i, mj, l));
@@ -139,9 +156,13 @@ fn reserve(grid: &Grid, plan: &Plan, class: usize, stubs: &[Stub], r: &mut NetRo
     }
     vias.sort_unstable();
     vias.dedup();
-    for &v in &vias {
-        let (i, j) = (v % grid.nx, v / grid.nx);
-        for l in 0..grid.nl() {
+    sites.sort_unstable();
+    sites.dedup();
+    for s in &sites {
+        let (i, j) = (s.planar % grid.nx, s.planar / grid.nx);
+        // Through vias occupy every grid layer, the others only the layers they span.
+        let (lo, hi) = if s.kind == ViaKind::Through { (0, grid.nl() - 1) } else { (s.lo, s.hi) };
+        for l in lo..=hi {
             base.push(grid.idx(i, j, l));
             push_ball(&mut set, i, j, l, &rv_offs);
         }
@@ -160,6 +181,7 @@ fn reserve(grid: &Grid, plan: &Plan, class: usize, stubs: &[Stub], r: &mut NetRo
     });
     r.reserved = set;
     r.vias = vias;
+    r.via_sites = sites;
 }
 
 fn commit(st: &mut State, grid: &Grid, plan: &Plan, r: &NetRoute, sign: i32) {
@@ -331,6 +353,7 @@ fn route_one(
     job: &NetJob,
     margin: u32,
     pres_fac: f32,
+    vm: &ViaModel,
 ) -> (NetRoute, u64) {
     let cp = &plan.classes[job.class];
     let k_offs = ball(cp.k);
@@ -355,6 +378,8 @@ fn route_one(
         k_offs: &k_offs,
         rv_offs: &rv_offs,
         rh_offs: &rh_offs,
+        vm,
+        via_gap: u8::try_from((2 * plan.rh + 1).min(7)).unwrap_or(7),
     };
     // node → (island, stub, heading into the stub) for every terminal.
     let mut term_of: FxHashMap<NodeIdx, Vec<TerminalRef>> = FxHashMap::default();
@@ -485,7 +510,7 @@ fn route_one(
     used_stubs.sort_unstable();
     used_stubs.dedup();
     route.stubs = used_stubs;
-    reserve(grid, plan, job.class, stubs, &mut route);
+    reserve(grid, plan, vm, &legal[job.class], job.net, job.class, stubs, &mut route);
     (route, searches)
 }
 
@@ -566,7 +591,11 @@ pub fn negotiate(
             }
             let results: Vec<(NetRoute, u64)> = batch
                 .par_iter()
-                .map(|&j| route_one(grid, legal, plan, stubs, &st, &jobs[j], margins[j], pres_fac))
+                .map(|&j| {
+                    route_one(
+                        grid, legal, plan, stubs, &st, &jobs[j], margins[j], pres_fac, &cfg.vm,
+                    )
+                })
                 .collect();
             for (&j, (r, s)) in batch.iter().zip(results) {
                 stats.searches += s;
@@ -656,7 +685,7 @@ pub fn negotiate(
             if cand.paths == routes[j].paths {
                 continue;
             }
-            reserve(grid, plan, job.class, stubs, &mut cand);
+            reserve(grid, plan, &cfg.vm, &legal[job.class], job.net, job.class, stubs, &mut cand);
             commit(&mut st, grid, plan, &routes[j], -1);
             commit(&mut st, grid, plan, &cand, 1);
             if conflicts(&st, grid, plan, &cand) {

@@ -10,6 +10,7 @@
 //! "blocked"), so results are bit-identical with and without acceleration.
 
 use crate::grid::{FORWARD, Grid, NodeIdx};
+use crate::vspan::ViaModel;
 use ferroute_board::{Board, DesignRules, LayerId, LayerSet, NetId, Origin};
 use ferroute_drc::BucketGrid;
 use ferroute_geom::{Coord, Hull, Point, Polygon, Rect, point_segment_dist};
@@ -92,6 +93,9 @@ pub struct ClassGeom {
     pub via_diameter: Coord,
     pub via_radius: Coord,
     pub via_drill: Coord,
+    /// Microvia size and drill of the class (used for `ViaKind::Micro`).
+    pub micro_diameter: Coord,
+    pub micro_drill: Coord,
 }
 
 /// Spatially indexed fixed obstacles of a board.
@@ -156,7 +160,7 @@ impl Obstacles {
             });
             items.push(Obstacle {
                 hull: Hull::disk(v.pos, v.drill / 2),
-                layers: all,
+                layers: v.layers,
                 net: v.net,
                 kind: ObsKind::Hole,
             });
@@ -290,7 +294,9 @@ impl Obstacles {
                     }
                 }
                 ObsKind::Hole => {
-                    if h.clearance_violated(&o.hull, self.rules.hole_clearance) {
+                    if o.layers.contains(layer)
+                        && h.clearance_violated(&o.hull, self.rules.hole_clearance)
+                    {
                         state = merge(state, o.net);
                     }
                 }
@@ -314,7 +320,24 @@ impl Obstacles {
     /// Exact state of a through via of class `cg` centred at `p` (all layers).
     #[must_use]
     pub fn classify_via(&self, p: Point, cg: &ClassGeom) -> u32 {
-        self.classify_via_in(p, cg, None)
+        self.classify_via_in(p, cg, None, None)
+    }
+
+    /// Exact state of a via of `diameter` / `drill` that exists only on the copper layers
+    /// `span`: copper, keep-outs and fills on other layers are irrelevant to it, and holes
+    /// of other vias matter only where they share a layer (hole-to-hole always applies).
+    #[must_use]
+    pub fn classify_span_via(
+        &self,
+        p: Point,
+        cg: &ClassGeom,
+        diameter: Coord,
+        drill: Coord,
+        span: LayerSet,
+    ) -> u32 {
+        let cg =
+            ClassGeom { via_diameter: diameter, via_radius: diameter / 2, via_drill: drill, ..*cg };
+        self.classify_via_in(p, &cg, None, Some(span))
     }
 
     /// Like [`Obstacles::classify_via`], but the via may sit inside its own pad: the pad
@@ -322,14 +345,22 @@ impl Obstacles {
     /// caller guarantees the via copper lies within it). Every other pad stays blocking.
     #[must_use]
     pub fn classify_via_in_pad(&self, p: Point, cg: &ClassGeom, own: &Hull, net: NetId) -> u32 {
-        self.classify_via_in(p, cg, Some((own, net)))
+        self.classify_via_in(p, cg, Some((own, net)), None)
     }
 
-    fn classify_via_in(&self, p: Point, cg: &ClassGeom, own: Option<(&Hull, NetId)>) -> u32 {
+    fn classify_via_in(
+        &self,
+        p: Point,
+        cg: &ClassGeom,
+        own: Option<(&Hull, NetId)>,
+        span: Option<LayerSet>,
+    ) -> u32 {
+        // Does an item on `layers` matter to this via? (`span == None`: all layers.)
+        let on_span = |layers: LayerSet| span.is_none_or(|s| layers.intersects(s));
         if !self.inside_board(p) {
             return BLOCKED;
         }
-        if self.keep_areas.iter().any(|k| k.no_vias && k.area.contains(p)) {
+        if self.keep_areas.iter().any(|k| k.no_vias && on_span(k.layers) && k.area.contains(p)) {
             return BLOCKED;
         }
         let copper = Hull::disk(p, cg.via_radius);
@@ -344,10 +375,11 @@ impl Obstacles {
                     }
                 }
                 ObsKind::KeepoutEdge { no_vias, .. } => {
-                    if no_vias && copper.clearance_violated(&o.hull, 0) {
+                    if no_vias && on_span(o.layers) && copper.clearance_violated(&o.hull, 0) {
                         return BLOCKED;
                     }
                 }
+                ObsKind::Copper { .. } if !on_span(o.layers) => {}
                 ObsKind::Copper { pad: true, .. }
                     if own.is_some_and(|(h, n)| o.net == n && &o.hull == h) => {}
                 ObsKind::Copper { clearance, pad } => {
@@ -365,7 +397,9 @@ impl Obstacles {
                     if drill.clearance_violated(&o.hull, self.rules.hole_to_hole) {
                         return BLOCKED;
                     }
-                    if copper.clearance_violated(&o.hull, self.rules.hole_clearance) {
+                    if on_span(o.layers)
+                        && copper.clearance_violated(&o.hull, self.rules.hole_clearance)
+                    {
                         state = merge(state, o.net);
                     }
                 }
@@ -376,7 +410,9 @@ impl Obstacles {
         }
         for i in self.near_fills(copper.bbox()) {
             let f = &self.fills[i as usize];
-            if f.poly.hull_violates(&copper, cg.clearance.max(f.clearance)) {
+            if span.is_none_or(|s| s.contains(f.layer))
+                && f.poly.hull_violates(&copper, cg.clearance.max(f.clearance))
+            {
                 state = merge(state, f.net);
                 if state == BLOCKED {
                     return BLOCKED;
@@ -445,6 +481,9 @@ pub struct ClassLegality {
     pub edge: Vec<u32>,
     /// Per planar site `(j * nx + i)`.
     pub via: Vec<u32>,
+    /// Blind / buried / micro via states per span, indexed by
+    /// [`crate::vspan::ViaModel::span_index`]; empty vectors for spans without a kind.
+    pub via_span: Vec<Vec<u32>>,
 }
 
 impl ClassLegality {
@@ -507,6 +546,18 @@ pub fn compute(
     obs: &Obstacles,
     cg: &ClassGeom,
     accel: Option<&AccelField>,
+) -> ClassLegality {
+    compute_with(grid, obs, cg, accel, &ViaModel::through_only())
+}
+
+/// Like [`compute`], plus the per-span via tables of `vm` (blind, buried, micro).
+#[must_use]
+pub fn compute_with(
+    grid: &Grid,
+    obs: &Obstacles,
+    cg: &ClassGeom,
+    accel: Option<&AccelField>,
+    vm: &ViaModel,
 ) -> ClassLegality {
     let reach = {
         let r = &obs.rules;
@@ -583,5 +634,25 @@ pub fn compute(
             obs.classify_via(grid.pos_ij(i, j), cg)
         })
         .collect();
-    ClassLegality { node, edge, via }
+    let nl = vm.nl;
+    let mut via_span: Vec<Vec<u32>> = Vec::new();
+    if vm.spans_enabled() {
+        via_span = vec![Vec::new(); (nl * nl) as usize];
+        for lo in 0..nl {
+            for hi in lo + 1..nl {
+                let Some(kind) = vm.span_kind(lo, hi) else { continue };
+                let (d, dr) = vm.sizes(kind, cg);
+                let span = vm.span_layers(grid, lo, hi);
+                via_span[vm.span_index(lo, hi)] = (0..u32::try_from(grid.plane())
+                    .unwrap_or(u32::MAX))
+                    .into_par_iter()
+                    .map(|pl| {
+                        let (i, j) = (pl % grid.nx, pl / grid.nx);
+                        obs.classify_span_via(grid.pos_ij(i, j), cg, d, dr, span)
+                    })
+                    .collect();
+            }
+        }
+    }
+    ClassLegality { node, edge, via, via_span }
 }
