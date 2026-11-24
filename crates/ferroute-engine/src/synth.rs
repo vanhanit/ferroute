@@ -6,9 +6,12 @@
 //! of parts is locked, and an optional power net spans the board.
 
 use ferroute_board::builder::{BoardBuilder, PadSpec, mm};
-use ferroute_board::{Board, Mobility, NetClass, NetId, PadShape, Side};
-use ferroute_geom::Point;
+use ferroute_board::{
+    Board, IslandRemoval, LayerId, LayerSet, Mobility, NetClass, NetId, PadConnection, PadShape,
+    Side, Zone, ZoneFill,
+};
 use ferroute_geom::rng::Rng;
+use ferroute_geom::{Point, Polygon};
 use serde::{Deserialize, Serialize};
 
 mod dense;
@@ -297,6 +300,113 @@ pub fn diff_pair() -> Board {
         true,
     );
     b.build()
+}
+
+/// 4-layer 12×12 ball BGA (1 mm pitch, 0.5 mm balls) with `GND` and `VCC` pours on the two
+/// inner layers: the 50 power balls (every other inner row/column, the rest unconnected) are GND/VCC and must reach their plane through
+/// dog-bone vias, the 44 outer balls are signals to 0603 parts around the package.
+#[must_use]
+pub fn bga_planes() -> Board {
+    let mut b = BoardBuilder::new(mm(40), mm(40), 4);
+    {
+        // Fine-pitch BGA rules: 0.15 mm tracks, 0.1 mm clearance, 0.45/0.2 mm vias.
+        let r = b.rules_mut();
+        r.min_track_width = 100_000;
+        r.min_via_diameter = 400_000;
+        r.min_via_drill = 200_000;
+        r.hole_clearance = 200_000;
+        r.hole_to_hole = 250_000;
+        let c = &mut r.classes[0];
+        c.clearance = 100_000;
+        c.track_width = 150_000;
+        c.via_diameter = 450_000;
+        c.via_drill = 200_000;
+    }
+    let gnd = b.net("GND");
+    let vcc = b.net("VCC");
+    let n = 12i64;
+    let pitch = mm(1);
+    let centre = Point::new(mm(20), mm(20));
+    let at = |r: i64, c: i64| {
+        Point::new(
+            centre.x + (c * 2 - (n - 1)) * pitch / 2,
+            centre.y + (r * 2 - (n - 1)) * pitch / 2,
+        )
+    };
+    let mut pads = Vec::new();
+    let mut parts: Vec<(Point, NetId, u8)> = Vec::new();
+    let mut sig = 0usize;
+    for r in 0..n {
+        for c in 0..n {
+            let edge = r == 0 || c == 0 || r == n - 1 || c == n - 1;
+            let net = if edge {
+                let id = b.net(&format!("S{sig}"));
+                sig += 1;
+                id
+            } else if r % 2 == 1 && c % 2 == 1 {
+                gnd
+            } else if r % 2 == 0 && c % 2 == 0 {
+                vcc
+            } else {
+                NetId::NONE
+            };
+            let local = Point::new(at(r, c).x - centre.x, at(r, c).y - centre.y);
+            if edge {
+                let side = if r == 0 && c < n - 1 {
+                    0
+                } else if c == n - 1 && r < n - 1 {
+                    1
+                } else if r == n - 1 && c > 0 {
+                    2
+                } else {
+                    3
+                };
+                parts.push((at(r, c), net, side));
+            }
+            pads.push(PadSpec {
+                number: format!("{}{}", char::from(b'A' + u8::try_from(r).unwrap_or(0)), c + 1),
+                local_pos: local,
+                shape: PadShape::Circle { diameter: 500_000 },
+                drill: None,
+                net,
+            });
+        }
+    }
+    let u1 = b.footprint("U1", centre, 0.0, Side::Front, &pads);
+    b.mobility(u1, Mobility::Locked);
+    for (k, &(p, net, side)) in parts.iter().enumerate() {
+        // Three staggered rows per side keep the 0603 parts 3 mm apart laterally.
+        let row = mm(9 + 4 * i64::try_from(k % 3).unwrap_or(0));
+        let (dx, dy) = (p.x - centre.x, p.y - centre.y);
+        let (x, y, rot) = match side {
+            0 => (centre.x + dx * 18 / 10, centre.y - row, 90.0),
+            1 => (centre.x + row, centre.y + dy * 125 / 100, 0.0),
+            2 => (centre.x + dx * 18 / 10, centre.y + row, 90.0),
+            _ => (centre.x - row, centre.y + dy * 125 / 100, 0.0),
+        };
+        let fp = b.smd2(&format!("R{k}"), Point::new(x, y), rot, net, NetId::NONE);
+        b.mobility(fp, Mobility::Locked);
+    }
+    let mut board = b.build();
+    let poly = Polygon::from_rect(ferroute_geom::Rect::new(
+        Point::new(mm(1), mm(1)),
+        Point::new(mm(39), mm(39)),
+    ));
+    for (net, layer) in [(gnd, 1u8), (vcc, 2u8)] {
+        board.zones.push(Zone {
+            net,
+            layers: LayerSet::single(LayerId(layer)),
+            outline: poly.clone(),
+            fills: vec![ZoneFill { layer: LayerId(layer), polys: vec![poly.clone()] }],
+            clearance: 100_000,
+            min_thickness: 150_000,
+            priority: 0,
+            pad_connection: PadConnection::ThermalRelief,
+            islands: IslandRemoval::Always,
+            yields: false,
+        });
+    }
+    board
 }
 
 #[cfg(test)]

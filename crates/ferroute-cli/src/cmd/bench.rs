@@ -23,7 +23,11 @@ pub struct GenArgs {
 pub fn gen_run(a: &GenArgs) -> Result<ExitCode> {
     std::fs::create_dir_all(&a.out)?;
     if a.suite == "fixtures" {
-        let fixtures = [("bus_match", synth::bus_match()), ("diff_pair", synth::diff_pair())];
+        let fixtures = [
+            ("bus_match", synth::bus_match()),
+            ("diff_pair", synth::diff_pair()),
+            ("bga_planes", synth::bga_planes()),
+        ];
         for (name, board) in fixtures {
             let pcb = a.out.join(format!("{name}.kicad_pcb"));
             std::fs::write(&pcb, ferroute_kicad::write_new_board(&board, 1))?;

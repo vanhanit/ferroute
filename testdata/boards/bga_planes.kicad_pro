@@ -1,0 +1,35 @@
+{
+  "board": {
+    "design_settings": {
+      "rules": {
+        "min_copper_edge_clearance": 0.5,
+        "min_hole_clearance": 0.2,
+        "min_hole_to_hole": 0.25,
+        "min_through_hole_diameter": 0.2,
+        "min_track_width": 0.1,
+        "min_via_diameter": 0.4
+      }
+    }
+  },
+  "meta": {
+    "filename": "ferroute.kicad_pro",
+    "version": 3
+  },
+  "net_settings": {
+    "classes": [
+      {
+        "clearance": 0.1,
+        "name": "Default",
+        "priority": 2147483647,
+        "track_width": 0.15,
+        "via_diameter": 0.45,
+        "via_drill": 0.2
+      }
+    ],
+    "meta": {
+      "version": 4
+    },
+    "netclass_assignments": {},
+    "netclass_patterns": []
+  }
+}
