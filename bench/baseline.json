@@ -16,7 +16,7 @@
         "moved_footprints": 9,
         "displacement_mm": 15.06796220338052,
         "constraint_issues": 0,
-        "runtime_ms": 200.0
+        "runtime_ms": 300.0
       }
     },
     {
@@ -34,7 +34,7 @@
         "moved_footprints": 22,
         "displacement_mm": 41.728505252050056,
         "constraint_issues": 0,
-        "runtime_ms": 500.0
+        "runtime_ms": 700.0
       }
     },
     {
@@ -52,7 +52,7 @@
         "moved_footprints": 30,
         "displacement_mm": 51.83156486704026,
         "constraint_issues": 0,
-        "runtime_ms": 800.0
+        "runtime_ms": 1000.0
       }
     },
     {
@@ -70,7 +70,7 @@
         "moved_footprints": 0,
         "displacement_mm": 0.0,
         "constraint_issues": 0,
-        "runtime_ms": 200.0
+        "runtime_ms": 300.0
       }
     },
     {
@@ -106,7 +106,7 @@
         "moved_footprints": 0,
         "displacement_mm": 0.0,
         "constraint_issues": 0,
-        "runtime_ms": 600.0
+        "runtime_ms": 700.0
       }
     },
     {
@@ -124,7 +124,7 @@
         "moved_footprints": 6,
         "displacement_mm": 11.921978840013155,
         "constraint_issues": 0,
-        "runtime_ms": 400.0
+        "runtime_ms": 500.0
       }
     },
     {
@@ -142,7 +142,7 @@
         "moved_footprints": 0,
         "displacement_mm": 0.0,
         "constraint_issues": 0,
-        "runtime_ms": 1200.0
+        "runtime_ms": 1500.0
       }
     },
     {
@@ -160,7 +160,7 @@
         "moved_footprints": 6,
         "displacement_mm": 11.921978840013155,
         "constraint_issues": 0,
-        "runtime_ms": 500.0
+        "runtime_ms": 600.0
       }
     },
     {
@@ -183,6 +183,42 @@
     },
     {
       "board": "legacy_v9_numeric",
+      "seed": 1,
+      "metrics": {
+        "drc_clean": true,
+        "introduced_violations": 0,
+        "total_violations": 0,
+        "completion": 1.0,
+        "connections_total": 1,
+        "connections_missing": 0,
+        "wirelength_mm": 18.24122112556947,
+        "vias": 0,
+        "moved_footprints": 0,
+        "displacement_mm": 0.0,
+        "constraint_issues": 0,
+        "runtime_ms": 100.0
+      }
+    },
+    {
+      "board": "pour_block-fixed",
+      "seed": 1,
+      "metrics": {
+        "drc_clean": true,
+        "introduced_violations": 0,
+        "total_violations": 0,
+        "completion": 1.0,
+        "connections_total": 1,
+        "connections_missing": 0,
+        "wirelength_mm": 18.24122112556947,
+        "vias": 0,
+        "moved_footprints": 0,
+        "displacement_mm": 0.0,
+        "constraint_issues": 0,
+        "runtime_ms": 100.0
+      }
+    },
+    {
+      "board": "pour_block",
       "seed": 1,
       "metrics": {
         "drc_clean": true,
