@@ -3,7 +3,7 @@
 //! pads and no copper slivers. `FERROUTE_DIAG=1 cargo test ... -- --nocapture` lists them.
 
 use ferroute_board::Board;
-use ferroute_drc::quality::{near_pad_bends, right_angles, slivers, via_jogs};
+use ferroute_drc::quality::{near_pad_bends, pad_wraps, right_angles, slivers, via_jogs};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
@@ -37,6 +37,24 @@ fn around(b: &Board, at: ferroute_geom::Point, net: ferroute_board::NetId) -> St
         .join(" ")
 }
 
+/// Asserts at most `max` pads whose connection wraps around its own footprint
+/// ([`pad_wraps`]); the limit records what is known to remain, so it can only go down.
+fn check_wraps(name: &str, b: &Board, max: usize) {
+    let w = pad_wraps(b);
+    if std::env::var("FERROUTE_DIAG").is_ok() {
+        eprintln!("{name}: {} pad wraps", w.len());
+        for x in &w {
+            eprintln!(
+                "  padwrap pad@{:?} {:?} {}",
+                b.pad_position(x.pad),
+                x.at,
+                around(b, x.at, x.net)
+            );
+        }
+    }
+    assert!(w.len() <= max, "{name}: pad wraps {w:?}");
+}
+
 /// Asserts at most `(slivers, right angles, via jogs)`; the limits record what is still known to
 /// remain (see the PR notes) so the counts can only go down.
 fn check(name: &str, b: &Board, max: (usize, usize, usize)) {
@@ -57,6 +75,14 @@ fn check(name: &str, b: &Board, max: (usize, usize, usize)) {
         }
         for x in &r {
             eprintln!("  right {:?} {}", x.at, around(b, x.at, x.net));
+        }
+        for x in &pad_wraps(b) {
+            eprintln!(
+                "  padwrap pad@{:?} {:?} {}",
+                b.pad_position(x.pad),
+                x.at,
+                around(b, x.at, x.net)
+            );
         }
     }
     assert!(s.len() <= max.0, "{name}: slivers {s:?}");
@@ -105,5 +131,40 @@ fn synthetic_ci_suite_is_clean_of_slivers_and_right_angles() {
         let res = ferroute_engine::run(&board, &ferroute_engine::PipelineConfig::default())
             .expect("route");
         check(&spec.name, &res.board_after, (2, 1, 10));
+    }
+}
+
+/// Every fixture, both placement modes: connections never circle their pad or double
+/// back across its edge line, except for the dips recorded here (a dip under the part's
+/// other pad that returns within 2 x (pad size + clearance) of the pad), which locked
+/// neighbours on the lattice rows force.
+#[test]
+fn fixtures_have_no_pad_wraps_beyond_the_known_dips() {
+    let cases: [(&str, &[&str], usize); 12] = [
+        ("bga_planes", &[], 4),
+        ("bga_planes", &["--allow-move"], 4),
+        ("demo_2layer", &[], 2),
+        ("demo_2layer", &["--allow-move"], 1),
+        ("demo_dru", &[], 0),
+        ("demo_dru", &["--allow-move"], 0),
+        ("bus_match", &[], 0),
+        ("diff_pair", &[], 0),
+        ("pour_block", &[], 0),
+        ("pour_gnd", &[], 0),
+        ("legacy_v9_numeric", &[], 0),
+        ("bus_match", &["--allow-move"], 0),
+    ];
+    for (name, extra, max) in cases {
+        check_wraps(&format!("{name} {extra:?}"), &route(name, extra), max);
+    }
+}
+
+#[test]
+fn synthetic_ci_suite_pad_wraps_are_bounded() {
+    for spec in ferroute_engine::synth::suite("ci") {
+        let board = ferroute_engine::synth::generate(&spec);
+        let res = ferroute_engine::run(&board, &ferroute_engine::PipelineConfig::default())
+            .expect("route");
+        check_wraps(&spec.name, &res.board_after, usize::from(spec.name == "ci-s2-small"));
     }
 }

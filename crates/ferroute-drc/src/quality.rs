@@ -186,6 +186,135 @@ pub fn near_pad_bends(board: &Board) -> Vec<NearPadBend> {
     out
 }
 
+/// A routed connection that wraps around its target pad's footprint instead of entering
+/// the pad directly (see [`pad_wraps`]).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PadWrap {
+    /// The pad the connection ends at.
+    pub pad: ferroute_board::PadId,
+    pub layer: LayerId,
+    pub net: NetId,
+    /// Where the wrap is detected: the turn or the pad it passes.
+    pub at: Point,
+}
+
+/// Turn from direction `u` to `v` in whole 45° steps, signed (left positive), −4..=4.
+/// Exact integer comparisons against tan 22.5° ≈ 5/12 and tan 67.5° ≈ 29/12.
+fn turn_units(u: Point, v: Point) -> i32 {
+    let (c, d) = (u.cross(v), u.dot(v));
+    let (a, b) = (c.abs() * 12, d.abs());
+    let mag = if d == 0 || a >= 29 * b {
+        2
+    } else if a < 5 * b {
+        if d > 0 { 0 } else { 4 }
+    } else if d > 0 {
+        1
+    } else {
+        3
+    };
+    if c < 0 { -mag } else { mag }
+}
+
+/// Connections that wrap around their target pad instead of entering it directly. Starting
+/// at every pad centre, the same-net chain of straight tracks is followed (through
+/// degree-2 joints, stopping at junctions, arcs and vias) while it stays within
+/// `2 × (pad size + clearance)` of the pad centre (the first vertex beyond that radius is
+/// still examined). It is a wrap when
+///
+/// * it turns by a cumulative signed angle of at least 180° (it circles the pad), or
+/// * it doubles back: after leaving the pad copper along its stub axis it returns across
+///   the pad's edge line (the line through the exit point perpendicular to the stub), so
+///   the connection reaches the pad from the far side of where it heads, passing beside
+///   the pad's own footprint.
+///
+/// Exact integer arithmetic, deterministic order.
+#[must_use]
+pub fn pad_wraps(board: &Board) -> Vec<PadWrap> {
+    let groups = groups(board);
+    let mut out = Vec::new();
+    for id in board.pad_ids() {
+        let pad = board.pad(id);
+        if pad.net == NetId::NONE {
+            continue;
+        }
+        let c = board.pad_position(id);
+        let hull = board.pad_hull(id);
+        let bb = hull.bbox();
+        let clearance = board.clearance_between(pad.net, pad.net);
+        let radius = 2 * (bb.width().max(bb.height()) + clearance);
+        let inside = |q: Point| hull.clearance_violated(&Hull::disk(q, 0), 0);
+        for layer in (0..=u8::MAX).map(LayerId).filter(|&l| pad.layers.contains(l)) {
+            let Some(pieces) = groups.get(&(layer.0, pad.net.0)) else { continue };
+            let touching = |p: Point, skip: Option<usize>| -> Vec<usize> {
+                (0..pieces.len())
+                    .filter(|&i| Some(i) != skip && (pieces[i].seg.a == p || pieces[i].seg.b == p))
+                    .collect()
+            };
+            for first in touching(c, None) {
+                if pieces[first].arc {
+                    continue;
+                }
+                let s0 = pieces[first].seg;
+                let u0 = (if s0.a == c { s0.b } else { s0.a }) - c;
+                // Axis coordinate of the point where the chain leaves the pad copper.
+                let mut edge: Option<i128> = None;
+                let mut hit = None;
+                let (mut turn, mut cur, mut piece, mut prev_dir) = (0i32, c, first, None::<Point>);
+                loop {
+                    let s = pieces[piece].seg;
+                    let next = if s.a == cur { s.b } else { s.a };
+                    let dir = next - cur;
+                    if let Some(u) = prev_dir {
+                        turn += turn_units(u, dir);
+                        if turn.abs() >= 4 {
+                            hit = Some(cur);
+                            break;
+                        }
+                    }
+                    if let Some(e) = edge {
+                        if (next - c).dot(u0) < e {
+                            hit = Some(next);
+                            break;
+                        }
+                    } else if !inside(next) {
+                        // Where this leg leaves the pad copper (the pad is convex).
+                        let at = |t: i128| {
+                            let d = next - cur;
+                            cur + Point::new(
+                                i64::try_from((i128::from(d.x) * t) >> 20).unwrap_or(0),
+                                i64::try_from((i128::from(d.y) * t) >> 20).unwrap_or(0),
+                            )
+                        };
+                        let (mut lo, mut hi) = (0i128, 1i128 << 20);
+                        while hi - lo > 1 {
+                            let mid = (lo + hi) / 2;
+                            if inside(at(mid)) { lo = mid } else { hi = mid }
+                        }
+                        edge = Some((at(hi) - c).dot(u0));
+                    }
+                    if !within(next, c, radius) {
+                        break;
+                    }
+                    // Continue through a plain degree-2 joint only.
+                    if board.vias.iter().any(|v| v.net == pad.net && v.pos == next) {
+                        break;
+                    }
+                    let cont = touching(next, Some(piece));
+                    let [n] = cont[..] else { break };
+                    if pieces[n].arc {
+                        break;
+                    }
+                    (cur, piece, prev_dir) = (next, n, Some(dir));
+                }
+                if let Some(at) = hit {
+                    out.push(PadWrap { pad: id, layer, net: pad.net, at });
+                }
+            }
+        }
+    }
+    out
+}
+
 /// Two same-net copper items that do not touch but are closer than the net clearance: a
 /// narrow sliver of bare laminate between them (an acid trap).
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -684,5 +813,56 @@ mod tests {
             (150, 100),
         );
         assert!(via_jogs(&b).is_empty());
+    }
+
+    /// 0603 part at (10, 10) whose pad 1 (9.2, 10) carries the net, with `chain` (tenths of
+    /// a millimetre, from the pad centre outward) routed on the front layer.
+    fn pad_board(chain: &[(i64, i64)]) -> ferroute_board::Board {
+        use ferroute_board::NetId;
+        let mut b = BoardBuilder::new(mm(30), mm(20), 2);
+        let n = b.net("N");
+        b.smd2("R1", pt10(100, 100), 0.0, n, NetId::NONE);
+        for w in chain.windows(2) {
+            b.track(pt10(w[0].0, w[0].1), pt10(w[1].0, w[1].1), 150_000, 0, n, Origin::Routed);
+        }
+        b.build()
+    }
+
+    #[test]
+    fn direct_pad_entries_are_not_wraps() {
+        // Straight down, then one 45° break-out, then straight away.
+        let b = pad_board(&[(92, 100), (92, 106), (100, 114), (140, 114)]);
+        assert!(pad_wraps(&b).is_empty());
+        // Straight out sideways (away from the part).
+        let b = pad_board(&[(92, 100), (60, 100)]);
+        assert!(pad_wraps(&b).is_empty());
+    }
+
+    #[test]
+    fn dip_that_returns_across_the_pad_edge_is_a_wrap() {
+        // Down, 45°, under the other pad, 45° back up above the pad's lower edge line.
+        let b = pad_board(&[(92, 100), (92, 106), (96, 110), (106, 110), (112, 104), (140, 104)]);
+        let w = pad_wraps(&b);
+        assert_eq!(w.len(), 1, "{w:?}");
+        assert_eq!(w[0].at, pt10(112, 104));
+        // The same dip whose return lies beyond the examined radius is not reported.
+        let far = pad_board(&[(92, 100), (92, 106), (96, 110), (140, 110), (146, 104), (170, 104)]);
+        assert!(pad_wraps(&far).is_empty());
+    }
+
+    #[test]
+    fn circling_the_pad_is_a_wrap() {
+        let b = pad_board(&[(92, 100), (92, 106), (86, 112), (80, 112), (74, 106), (74, 100)]);
+        assert_eq!(pad_wraps(&b).len(), 1);
+    }
+
+    #[test]
+    fn turn_units_are_signed_octants() {
+        assert_eq!(turn_units(Point::new(1, 0), Point::new(1, 1)), 1);
+        assert_eq!(turn_units(Point::new(1, 0), Point::new(0, 1)), 2);
+        assert_eq!(turn_units(Point::new(1, 0), Point::new(-1, 1)), 3);
+        assert_eq!(turn_units(Point::new(1, 0), Point::new(-1, 0)), 4);
+        assert_eq!(turn_units(Point::new(1, 0), Point::new(1, -1)), -1);
+        assert_eq!(turn_units(Point::new(0, 1), Point::new(0, 1)), 0);
     }
 }
