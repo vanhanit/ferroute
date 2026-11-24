@@ -84,6 +84,9 @@ pub struct BenchArgs {
     /// Nudge → re-route rounds for failed nets (default: the pipeline's own).
     #[arg(long)]
     pub lns_rounds: Option<u32>,
+    /// Also write each routed board as `<name>.kicad_pcb` into `--out` (byte-identity checks).
+    #[arg(long)]
+    pub write_boards: bool,
 }
 
 /// Executes `ferroute bench`.
@@ -146,6 +149,12 @@ pub fn run(a: &BenchArgs) -> Result<ExitCode> {
             &res.board_after,
             &render_opts(&res.board_after, &res.drc, title),
         )?;
+        if a.write_boards {
+            std::fs::write(
+                a.out.join(format!("{name}.kicad_pcb")),
+                ferroute_kicad::write_new_board(&res.board_after, a.seed),
+            )?;
+        }
         if a.suite == "dense" {
             out(&dense_detail(name, &res));
         }
