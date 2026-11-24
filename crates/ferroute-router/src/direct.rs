@@ -35,12 +35,17 @@ pub fn direct_links(
     let pads_by_net = board.pads_by_net();
     // Pads already joined through a stored copper pour need no link.
     let joined = if board.zones.is_empty() { Vec::new() } else { crate::pad_islands(board) };
+    let fills = ferroute_drc::zones::fill_polys(board);
     let mut out = Vec::new();
     for (n, pads) in pads_by_net.iter().enumerate().skip(1) {
         if pads.len() < 2 {
             continue;
         }
         let net = NetId(u32::try_from(n).unwrap_or(u32::MAX));
+        // Pads of a net with a pour reach the plane, never each other.
+        if fills.iter().any(|f| f.net == net && layers.contains(&f.layer)) {
+            continue;
+        }
         let cg = &geoms[usize::from(board.nets[n].class).min(geoms.len() - 1)];
         let mut cands: Vec<(u128, usize, usize, LayerId, Dir8)> = Vec::new();
         for (ia, &a) in pads.iter().enumerate() {

@@ -31,6 +31,10 @@ pub struct NetJob {
     pub tbox: IBox,
     /// Cost policy of this net (e.g. high-speed nets avoid vias and 90° bends).
     pub costs: Costs,
+    /// Islands already joined through the net's pour (its plane terminals are stub-less
+    /// terminals of these islands). When non-empty, every other island connects to the
+    /// plane only (a dog-bone), never to another pad island.
+    pub plane: Vec<usize>,
 }
 
 /// The lattice route of one net.
@@ -302,6 +306,21 @@ fn used_stub_heads(job: &NetJob, r: &NetRoute) -> Vec<(NodeIdx, Dir8)> {
         .collect()
 }
 
+/// Search sources of a plane net: the plane terminals (stub-less terminals of the islands
+/// joined through the pour); the search runs from the plane to the pad, so the dog-bone found
+/// is the cheapest one.
+fn plane_sources(job: &NetJob, connected: &[bool]) -> Vec<Endpoint> {
+    let mut out: Vec<Endpoint> = Vec::new();
+    for &isl in job.plane.iter().filter(|&&i| connected[i]) {
+        for t in job.islands[isl].iter().filter(|t| t.stub.is_none()) {
+            out.push(Endpoint { cost: 0.0, node: t.node, heading: None, forbid: 0 });
+        }
+    }
+    out.sort_unstable_by_key(|e| e.node);
+    out.dedup_by_key(|e| e.node);
+    out
+}
+
 /// Search sources for the next connection of a net: every lattice node of the tree built
 /// so far (with the departures that would create an acid trap forbidden) plus the
 /// terminals of connected islands (arriving with their stub heading).
@@ -394,7 +413,13 @@ fn route_one(
     }
     let mut route = NetRoute::default();
     let mut connected = vec![false; job.islands.len()];
-    connected[0] = true;
+    if job.plane.is_empty() {
+        connected[0] = true;
+    } else {
+        for &i in &job.plane {
+            connected[i] = true;
+        }
+    }
     let mut searches = 0u64;
     let mut used_stubs: Vec<u32> = Vec::new();
     // Stub headings at terminals whose stub is part of the route (copper leaves there).
@@ -468,8 +493,11 @@ fn route_one(
                     + if stub.is_via() { job.costs.via } else { 0.0 }
             })
         };
-        let sources =
-            tree_sources(grid, job, &connected, &route.paths, &stub_heads, &blocked, &penalty);
+        let sources = if !job.plane.is_empty() {
+            plane_sources(job, &connected)
+        } else {
+            tree_sources(grid, job, &connected, &route.paths, &stub_heads, &blocked, &penalty)
+        };
         // Targets: terminals of unconnected islands; the route must continue into the stub.
         let target = |n: NodeIdx| {
             term_of.get(&n).and_then(|v| {

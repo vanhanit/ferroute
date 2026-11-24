@@ -174,6 +174,9 @@ pub struct RouteStats {
     /// Of those vias, the ones inside an SMD pad (need filling and capping).
     #[serde(default)]
     pub via_in_pad: usize,
+    /// Pad-to-pad connections of nets with a pour whose plane was unreachable.
+    #[serde(default)]
+    pub plane_fallback_links: usize,
     /// 90° bends left in the emitted copper after the chamfer pass.
     pub right_angle_bends: usize,
     /// Avoidable bends next to same-net pads left in the emitted copper.
@@ -517,6 +520,7 @@ pub fn route_prepared(prep: &Prepared, cfg: &RouterConfig) -> Result<RouteOutcom
     let mut stubs: Vec<Stub> = Vec::new();
     let mut jobs: Vec<NetJob> = Vec::new();
     let mut failed: Vec<NetId> = Vec::new();
+    let mut plane_fallback_links = 0usize;
     for net in board.net_ids().skip(1) {
         if cfg.nets.as_ref().is_some_and(|v| !v.contains(&net)) {
             continue;
@@ -524,21 +528,8 @@ pub fn route_prepared(prep: &Prepared, cfg: &RouterConfig) -> Result<RouteOutcom
         let groups = &islands[net.idx()];
         let class = usize::from(board.nets[net.idx()].class).min(plan.classes.len() - 1);
         let cp = &plan.classes[class];
-        // The net's pour is one more island unless a pad island already touches it: the
-        // plane joins every pad that reaches it, so those pads need no trace between them.
         let on_plane = &island_on_plane[net.idx()];
-        let plane_terms = if groups.is_empty() {
-            Vec::new()
-        } else {
-            let centres: Vec<_> = groups.iter().flatten().map(|&p| board.pad_position(p)).collect();
-            plane::plane_terminals(grid, &legal[class], &cp.geom, net, &fills, &centres)
-        };
-        let plane_island = !plane_terms.is_empty() && !on_plane.iter().any(|&b| b);
-        if groups.len() + usize::from(plane_island) < 2 {
-            continue;
-        }
-        let mut term_groups: Vec<Vec<Terminal>> = Vec::with_capacity(groups.len());
-        for g in groups {
+        let group_terms = |stubs: &mut Vec<Stub>, g: &[PadId]| -> Vec<Terminal> {
             let mut ts = Vec::new();
             for &pad in g {
                 let first = stubs.len();
@@ -551,7 +542,7 @@ pub fn route_prepared(prep: &Prepared, cfg: &RouterConfig) -> Result<RouteOutcom
                     plan,
                     net,
                     pad,
-                    &mut stubs,
+                    stubs,
                 ));
                 // A direction already used by a direct link is not a break-out any more.
                 ts.retain(|t| {
@@ -569,40 +560,120 @@ pub fn route_prepared(prep: &Prepared, cfg: &RouterConfig) -> Result<RouteOutcom
                         plan,
                         net,
                         pad,
-                        &mut stubs,
+                        stubs,
                     ));
                 }
             }
-            if on_plane[term_groups.len()] {
-                ts.extend(plane_terms.iter().cloned());
+            ts
+        };
+        let push_job = |jobs: &mut Vec<NetJob>, term_groups: Vec<Vec<Terminal>>, plane| {
+            let tbox = term_groups
+                .iter()
+                .flatten()
+                .map(|t| {
+                    let (i, j, _) = grid.coords(t.node);
+                    (i, j, i, j)
+                })
+                .reduce(|a, b| (a.0.min(b.0), a.1.min(b.1), a.2.max(b.2), a.3.max(b.3)))
+                .unwrap_or((0, 0, 0, 0));
+            let costs = search::net_costs(&base_costs, &board.nets[net.idx()].constraints);
+            jobs.push(NetJob { net, class, islands: term_groups, tbox, costs, plane });
+        };
+        // Where to look for plane sites: around each pad's centre and, for pads wider than
+        // the search window (exposed pads), around their side midpoints, where break-outs
+        // of large pads leave.
+        let centres_of = |g: &[PadId]| -> Vec<ferroute_geom::Point> {
+            let reach = plane::WINDOW * grid.pitch;
+            g.iter()
+                .flat_map(|&p| {
+                    let (c, bb) = (board.pad_position(p), board.pad_hull(p).bbox());
+                    let mut v = vec![c];
+                    if (bb.max.x - bb.min.x).max(bb.max.y - bb.min.y) / 2 > reach {
+                        let (mx, my) = ((bb.min.x + bb.max.x) / 2, (bb.min.y + bb.max.y) / 2);
+                        v.extend([
+                            ferroute_geom::Point::new(bb.min.x, my),
+                            ferroute_geom::Point::new(bb.max.x, my),
+                            ferroute_geom::Point::new(mx, bb.min.y),
+                            ferroute_geom::Point::new(mx, bb.max.y),
+                        ]);
+                    }
+                    v
+                })
+                .collect()
+        };
+        let all_centres = centres_of(&groups.iter().flatten().copied().collect::<Vec<_>>());
+        let plane_terms = if groups.is_empty() {
+            Vec::new()
+        } else {
+            plane::plane_terminals(grid, &legal[class], &cp.geom, net, &fills, &all_centres)
+        };
+        if plane_terms.is_empty() {
+            // No pour to reach: the pads of the net connect among themselves.
+            if groups.len() < 2 {
+                continue;
             }
-            term_groups.push(ts);
-        }
-        if plane_island {
-            term_groups.push(plane_terms);
-        }
-        if term_groups.iter().any(Vec::is_empty) {
-            failed.push(net);
+            let term_groups: Vec<Vec<Terminal>> =
+                groups.iter().map(|g| group_terms(&mut stubs, g)).collect();
+            if term_groups.iter().any(Vec::is_empty) {
+                failed.push(net);
+                continue;
+            }
+            push_job(&mut jobs, term_groups, Vec::new());
             continue;
         }
-        let tbox = term_groups
-            .iter()
-            .flatten()
-            .map(|t| {
-                let (i, j, _) = grid.coords(t.node);
-                (i, j, i, j)
-            })
-            .reduce(|a, b| (a.0.min(b.0), a.1.min(b.1), a.2.max(b.2), a.3.max(b.3)))
-            .unwrap_or((0, 0, 0, 0));
-        let costs = search::net_costs(&base_costs, &board.nets[net.idx()].constraints);
-        jobs.push(NetJob { net, class, islands: term_groups, tbox, costs });
+        // A net with a pour: every pad island that does not touch the fill gets its own
+        // dog-bone to the plane (one job each: local negotiation, independent rip-up) and
+        // pads are never chained. Only islands that cannot reach the plane at all (nothing
+        // to land a via on, or walled in) link to the nearest island that can.
+        let mut unreachable: Vec<(usize, Vec<Terminal>)> = Vec::new();
+        let mut reachable: Vec<(usize, Vec<Terminal>)> = Vec::new();
+        for (gi, g) in groups.iter().enumerate().filter(|&(gi, _)| !on_plane[gi]) {
+            let pad_terms = group_terms(&mut stubs, g);
+            if pad_terms.is_empty() {
+                failed.push(net);
+                continue;
+            }
+            let terms =
+                plane::plane_terminals(grid, &legal[class], &cp.geom, net, &fills, &centres_of(g));
+            let from: Vec<_> = pad_terms.iter().map(|t| t.node).collect();
+            if plane::reaches(grid, &legal[class], net, &from, &terms) {
+                reachable.push((gi, pad_terms.clone()));
+                push_job(&mut jobs, vec![pad_terms, terms], vec![1]);
+            } else {
+                unreachable.push((gi, pad_terms));
+            }
+        }
+        // Each unreachable island links to the nearest islands that have a dog-bone (their
+        // terminals pooled as alternatives of one target island), or to the plane if none.
+        for (gi, terms) in unreachable {
+            let anchor = board.pad_position(groups[gi][0]);
+            let dist = |gj: usize| {
+                groups[gj]
+                    .iter()
+                    .map(|&p| (board.pad_position(p) - anchor).norm2())
+                    .min()
+                    .unwrap_or(u128::MAX)
+            };
+            reachable.sort_by_key(|(gj, _)| (dist(*gj), *gj));
+            let pool: Vec<Terminal> =
+                reachable.iter().take(8).flat_map(|(_, t)| t.iter().cloned()).collect();
+            plane_fallback_links += 1;
+            push_job(
+                &mut jobs,
+                vec![terms, if pool.is_empty() { plane_terms.clone() } else { pool }],
+                Vec::new(),
+            );
+        }
     }
     let mut order: Vec<usize> = (0..jobs.len()).collect();
     order.sort_by_key(|&j| {
         let b = jobs[j].tbox;
         let hpwl = (b.2 - b.0) + (b.3 - b.1);
+        // Dog-bones go last: signals claim their channels first, the dog-bones then take
+        // whatever interstices stay free and are the first to yield (one connection each).
+        let dogbone = !jobs[j].plane.is_empty();
         let rank = cfg.first.iter().position(|&n| n == jobs[j].net).unwrap_or(usize::MAX);
-        (rank, hpwl, splitmix64(cfg.seed ^ u64::from(jobs[j].net.0)))
+        (rank, dogbone, hpwl, splitmix64(cfg.seed ^ u64::from(jobs[j].net.0)))
     });
     let ncfg = NegotiationConfig {
         max_iterations: cfg.max_iterations,
@@ -745,6 +816,7 @@ pub fn route_prepared(prep: &Prepared, cfg: &RouterConfig) -> Result<RouteOutcom
             .filter(|v| v.kind == ferroute_board::ViaKind::Micro)
             .count(),
         via_in_pad,
+        plane_fallback_links,
         right_angle_bends,
         near_pad_bends,
         slivers,

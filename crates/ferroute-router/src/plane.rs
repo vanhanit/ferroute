@@ -7,11 +7,11 @@
 //! connected to the pour (the via, or the track ending inside the fill, touches it).
 
 use crate::access::Terminal;
-use crate::grid::Grid;
+use crate::grid::{Grid, NodeIdx, forward_slot};
 use crate::legality::{ClassGeom, ClassLegality, allows};
 use ferroute_board::{LayerId, NetId};
 use ferroute_drc::zones::FillPoly;
-use ferroute_geom::{Point, Rect};
+use ferroute_geom::{Dir8, Point, Rect};
 
 /// Lattice steps around a pad searched for plane sites (covers the BGA interstices).
 pub const WINDOW: i64 = 8;
@@ -76,4 +76,73 @@ pub fn plane_terminals(
 
 fn layer_index(grid: &Grid, l: LayerId) -> Option<u32> {
     grid.layers.iter().position(|&x| x == l).and_then(|p| u32::try_from(p).ok())
+}
+
+/// `true` when some terminal in `to` can be reached from a node in `from` over legal lattice
+/// nodes, edges and via sites alone (other nets' routes ignored): the pad has a dog-bone
+/// at all. Flood fill inside the window of [`WINDOW`] steps (plus a margin) around `from`.
+#[must_use]
+pub fn reaches(
+    grid: &Grid,
+    legal: &ClassLegality,
+    net: NetId,
+    from: &[NodeIdx],
+    to: &[Terminal],
+) -> bool {
+    use rustc_hash::FxHashSet;
+    let goal: FxHashSet<NodeIdx> = to.iter().map(|t| t.node).collect();
+    let (mut i0, mut j0, mut i1, mut j1) = (u32::MAX, u32::MAX, 0, 0);
+    for &n in from {
+        let (i, j, _) = grid.coords(n);
+        i0 = i0.min(i);
+        j0 = j0.min(j);
+        i1 = i1.max(i);
+        j1 = j1.max(j);
+    }
+    let m = u32::try_from(WINDOW).unwrap_or(8) + 4;
+    let (i0, j0) = (i0.saturating_sub(m), j0.saturating_sub(m));
+    let (i1, j1) = ((i1 + m).min(grid.nx - 1), (j1 + m).min(grid.ny - 1));
+    let mut seen: FxHashSet<NodeIdx> = from.iter().copied().collect();
+    let mut stack: Vec<NodeIdx> = from.to_vec();
+    let edge_ok = |a: NodeIdx, b: NodeIdx, d: Dir8| {
+        let st = match forward_slot(d) {
+            Some(s) => legal.edge_state(a, s),
+            None => match forward_slot(d.opposite()) {
+                Some(s) => legal.edge_state(b, s),
+                None => return false,
+            },
+        };
+        allows(st, net)
+    };
+    while let Some(n) = stack.pop() {
+        if goal.contains(&n) {
+            return true;
+        }
+        let (i, j, l) = grid.coords(n);
+        let mut next: Vec<NodeIdx> = Vec::with_capacity(12);
+        for d in Dir8::ALL {
+            let Some(q) = grid.step(n, d) else { continue };
+            let (qi, qj, _) = grid.coords(q);
+            if qi < i0 || qi > i1 || qj < j0 || qj > j1 {
+                continue;
+            }
+            if allows(legal.node[q as usize], net) && edge_ok(n, q, d) {
+                next.push(q);
+            }
+        }
+        if allows(legal.via[j as usize * grid.nx as usize + i as usize], net) {
+            for ll in (0..grid.nl()).filter(|&x| x != l) {
+                let q = grid.idx(i, j, ll);
+                if allows(legal.node[q as usize], net) {
+                    next.push(q);
+                }
+            }
+        }
+        for q in next {
+            if seen.insert(q) {
+                stack.push(q);
+            }
+        }
+    }
+    false
 }
