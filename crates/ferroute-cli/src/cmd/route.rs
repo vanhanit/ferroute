@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 //! `ferroute route`.
 
-use super::{load, out, render_opts};
+use super::{item_label, load, out, render_opts};
 use crate::length::parse_length;
 use anyhow::{Context, Result, bail};
 use ferroute_board::LayerSet;
@@ -95,6 +95,11 @@ pub struct RouteArgs {
     /// must be filled and capped (IPC-4761 type VII): an extra fabrication cost.
     #[arg(long)]
     pub allow_via_in_pad: bool,
+    /// Enable KiCad's native teardrops on every pad and via that gets new copper (also
+    /// `[routing] teardrops = true` in --rules). Only the teardrop property of those pads and
+    /// vias is written; KiCad creates the copper when zones are refilled.
+    #[arg(long)]
+    pub teardrops: bool,
     /// Keep copper pours as obstacles and never refill them (default: other-net pours yield
     /// to routed copper and their stored fill is recomputed around it).
     #[arg(long)]
@@ -117,11 +122,13 @@ pub fn run(a: &RouteArgs) -> Result<ExitCode> {
     let mut doc = kb.doc;
     let mut board = kb.board;
     let mut via_in_pad = a.allow_via_in_pad;
+    let mut teardrops = a.teardrops;
     if let Some(path) = &a.rules {
         let text =
             std::fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
         let rules = parse_rules(&text).with_context(|| format!("in {}", path.display()))?;
         via_in_pad |= rules.via_in_pad();
+        teardrops |= rules.teardrops();
         for w in rules.apply(&mut board)? {
             out(&format!("rules warning: {w}"));
         }
@@ -177,6 +184,8 @@ pub fn run(a: &RouteArgs) -> Result<ExitCode> {
     }
     doc.apply_edit(&res.policy_board, &res.edit, a.seed)
         .context("applying edit to the KiCad document")?;
+    let teardrop_nodes =
+        if teardrops { doc.enable_teardrops(&res.policy_board, &res.edit) } else { 0 };
     if a.output == a.input {
         let bak = a.input.with_extension("kicad_pcb.ferroute-bak");
         std::fs::copy(&a.input, &bak)
@@ -219,6 +228,11 @@ pub fn run(a: &RouteArgs) -> Result<ExitCode> {
             "via-in-pad: {via_in_pad_count} via(s) — require filled & capped vias (extra fabrication cost)"
         ));
     }
+    if teardrops {
+        out(&format!(
+            "teardrops: enabled on {teardrop_nodes} pad(s)/via(s); KiCad creates the copper on refill"
+        ));
+    }
     if !failed.is_empty() {
         out(&format!("unrouted nets: {}", failed.join(", ")));
     }
@@ -230,6 +244,10 @@ pub fn run(a: &RouteArgs) -> Result<ExitCode> {
     for i in &issues {
         out(&format!("rule not met: {i}"));
     }
+    let dfm = ferroute_drc::dfm::check(&res.board_after, &ferroute_drc::dfm::DfmConfig::default());
+    for i in &dfm {
+        out(&format!("dfm: {}", i.describe(&item_label(&res.board_after, i.item))));
+    }
     if let Some(p) = &a.report {
         let report = json!({
             "ferroute_version": env!("CARGO_PKG_VERSION"),
@@ -237,6 +255,7 @@ pub fn run(a: &RouteArgs) -> Result<ExitCode> {
             "metrics": m, "route": res.route, "place": res.place, "failed_nets": failed,
             "lns_rounds_run": res.rounds, "via_in_pad": via_in_pad_count,
             "rule_notes": res.rule_notes, "rule_issues": issues,
+            "teardrops": teardrops.then_some(teardrop_nodes), "dfm_issues": dfm,
             "drc": { "violations": res.drc.violations.len(), "connectivity": res.drc.connectivity },
         });
         std::fs::write(p, serde_json::to_string_pretty(&report)?)?;
@@ -314,6 +333,8 @@ mod tests {
         assert!(parse_rules("[routing]\nvia_in_pad = true").expect("on").via_in_pad());
         assert!(!parse_rules("[routing]\nvia_in_pad = false").expect("off").via_in_pad());
         assert!(parse_rules("[routing]\nvia_in_pads = true").is_err(), "typo rejected");
+        assert!(!parse_rules("[routing]").expect("empty table").teardrops());
+        assert!(parse_rules("[routing]\nteardrops = true").expect("on").teardrops());
     }
 
     #[test]

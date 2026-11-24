@@ -35,6 +35,7 @@ mod layers;
 mod outline;
 mod pad;
 mod read;
+mod teardrop;
 mod util;
 mod write;
 
