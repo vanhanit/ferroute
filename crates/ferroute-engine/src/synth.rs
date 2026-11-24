@@ -11,6 +11,37 @@ use ferroute_geom::Point;
 use ferroute_geom::rng::Rng;
 use serde::{Deserialize, Serialize};
 
+mod dense;
+pub use dense::dense_suite;
+
+/// A generated benchmark board plus the rules file needed to reproduce its constraints
+/// (differential pairs and matching groups exist only through rules in KiCad files).
+#[derive(Clone, Debug)]
+pub struct SynthBoard {
+    pub name: String,
+    pub seed: u64,
+    pub board: Board,
+    /// `[[pair]]`/`[[match]]` rules equivalent to the board's in-memory constraints.
+    pub rules_toml: Option<String>,
+}
+
+/// Boards of the named suite: `ci`/`full` (via [`suite`] + [`generate`]) or `dense`.
+#[must_use]
+pub fn suite_boards(name: &str) -> Vec<SynthBoard> {
+    if name == "dense" {
+        return dense_suite();
+    }
+    suite(name)
+        .into_iter()
+        .map(|spec| SynthBoard {
+            board: generate(&spec),
+            name: spec.name,
+            seed: spec.seed,
+            rules_toml: None,
+        })
+        .collect()
+}
+
 /// Parameters of a synthetic board.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct SynthSpec {
@@ -31,6 +62,9 @@ pub struct SynthSpec {
     /// Add a wide-class GND net touching many parts.
     pub power_net: bool,
     pub seed: u64,
+    /// Bottom strip (mm) of the board kept free of generated parts (for hand-placed extras).
+    #[serde(default)]
+    pub strip_mm: i64,
 }
 
 /// Named suites. `ci` is small enough for every PR; `full` is for nightly runs.
@@ -48,6 +82,7 @@ pub fn suite(name: &str) -> Vec<SynthSpec> {
         spacing_mm: 5,
         power_net: true,
         seed,
+        strip_mm: 0,
     };
     match name {
         "full" => vec![
@@ -68,12 +103,26 @@ pub fn suite(name: &str) -> Vec<SynthSpec> {
 /// Generates the board described by `spec`.
 #[must_use]
 pub fn generate(spec: &SynthSpec) -> Board {
+    generate_with(spec, &|_| Extras::default())
+}
+
+/// Constraints created by a [`generate_with`] hook.
+#[derive(Clone, Debug, Default)]
+pub struct Extras {
+    pub diff_pairs: Vec<ferroute_board::pairs::DiffPair>,
+    pub match_groups: Vec<ferroute_board::constraints::MatchGroup>,
+}
+
+/// [`generate`] plus a hook that adds hand-placed parts (in the `strip_mm` area) to the
+/// builder after the random parts; it returns the constraints on its nets.
+#[must_use]
+pub fn generate_with(spec: &SynthSpec, extras: &dyn Fn(&mut BoardBuilder) -> Extras) -> Board {
     let mut rng = Rng::new(spec.seed);
     let mut b = BoardBuilder::new(mm(spec.width_mm), mm(spec.height_mm), spec.layers.max(1));
     b.rules_mut().edge_clearance = 300_000;
     let sp = mm(spec.spacing_mm);
     let cols = ((mm(spec.width_mm) - sp) / sp).max(1);
-    let rows = ((mm(spec.height_mm) - sp) / sp).max(1);
+    let rows = ((mm(spec.height_mm - spec.strip_mm) - sp) / sp).max(1);
     let mut cells: Vec<(i64, i64)> =
         (0..rows).flat_map(|r| (0..cols).map(move |c| (c, r))).collect();
     // Fisher–Yates shuffle (seeded).
@@ -116,7 +165,10 @@ pub fn generate(spec: &SynthSpec) -> Board {
         b.smd2(&format!("R{}", k + 1), pos, rot, NetId::NONE, NetId::NONE);
         pin_count.push(2);
     }
+    let extra = extras(&mut b);
     let mut board = b.build();
+    board.diff_pairs = extra.diff_pairs;
+    board.match_groups = extra.match_groups;
     // Free pins (footprint, pad slot).
     let mut free: Vec<(usize, usize)> =
         pin_count.iter().enumerate().flat_map(|(f, &n)| (0..n).map(move |p| (f, p))).collect();

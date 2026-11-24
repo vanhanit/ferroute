@@ -249,3 +249,35 @@ proptest! {
         }
     }
 }
+
+#[test]
+fn copper_zones_with_fills_round_trip() {
+    use ferroute_board::{IslandRemoval, LayerSet, PadConnection, Zone, ZoneFill};
+    let mut b = load("demo_2layer.kicad_pcb").board;
+    b.zones.clear();
+    let net = b.net_by_name("GND").expect("GND");
+    let outline = Polygon::new(vec![
+        Point::new(mm(101.0), mm(101.0)),
+        Point::new(mm(129.0), mm(101.0)),
+        Point::new(mm(129.0), mm(119.0)),
+        Point::new(mm(101.0), mm(119.0)),
+    ]);
+    b.zones.push(Zone {
+        net,
+        layers: LayerSet::single(LayerId(1)),
+        outline: outline.clone(),
+        fills: vec![ZoneFill { layer: LayerId(1), polys: vec![outline.clone()] }],
+        clearance: 200_000,
+        min_thickness: 250_000,
+        priority: 0,
+        pad_connection: PadConnection::ThermalRelief,
+        islands: IslandRemoval::Always,
+        yields: false,
+    });
+    let back = reread(&b, 5);
+    assert_eq!(back.zones.len(), 1);
+    let z = &back.zones[0];
+    assert_eq!((z.net, z.layers, z.clearance), (net, LayerSet::single(LayerId(1)), 200_000));
+    assert_eq!(z.fills.len(), 1);
+    assert_eq!(norm_poly(&z.fills[0].polys[0]), norm_poly(&outline));
+}

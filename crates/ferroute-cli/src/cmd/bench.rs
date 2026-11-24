@@ -11,7 +11,7 @@ use std::process::ExitCode;
 
 #[derive(clap::Args, Debug)]
 pub struct GenArgs {
-    /// Synthetic suite to generate (`ci`, `full`, or `fixtures` for the hand-made testdata boards).
+    /// Synthetic suite to generate (`ci`, `full`, `dense`, or `fixtures` for the hand-made testdata boards).
     #[arg(long, default_value = "ci")]
     pub suite: String,
     /// Output directory.
@@ -35,14 +35,16 @@ pub fn gen_run(a: &GenArgs) -> Result<ExitCode> {
         }
         return Ok(ExitCode::SUCCESS);
     }
-    for spec in synth::suite(&a.suite) {
-        let board = synth::generate(&spec);
-        let pcb = a.out.join(format!("{}.kicad_pcb", spec.name));
-        std::fs::write(&pcb, ferroute_kicad::write_new_board(&board, spec.seed))?;
+    for sb in synth::suite_boards(&a.suite) {
+        let pcb = a.out.join(format!("{}.kicad_pcb", sb.name));
+        std::fs::write(&pcb, ferroute_kicad::write_new_board(&sb.board, sb.seed))?;
         std::fs::write(
             pcb.with_extension("kicad_pro"),
-            ferroute_kicad::project::write_project_json(&board),
+            ferroute_kicad::project::write_project_json(&sb.board),
         )?;
+        if let Some(rules) = &sb.rules_toml {
+            std::fs::write(pcb.with_extension("toml"), rules)?;
+        }
         out(&format!("wrote {}", pcb.display()));
     }
     Ok(ExitCode::SUCCESS)
@@ -50,7 +52,7 @@ pub fn gen_run(a: &GenArgs) -> Result<ExitCode> {
 
 #[derive(clap::Args, Debug)]
 pub struct BenchArgs {
-    /// Synthetic suite (`ci` or `full`).
+    /// Synthetic suite (`ci`, `full` or `dense`; `dense` skips the fixtures and the gate).
     #[arg(long, default_value = "ci")]
     pub suite: String,
     /// Also benchmark every .kicad_pcb in this directory.
@@ -67,16 +69,30 @@ pub struct BenchArgs {
     pub out: PathBuf,
     #[arg(long, default_value_t = 1)]
     pub seed: u64,
+    /// Run only the synthetic boards whose name contains this text (the fixtures are
+    /// skipped).
+    #[arg(long)]
+    pub only: Option<String>,
+    /// PathFinder iterations per route (default: the router's own; lower it for the
+    /// largest dense boards).
+    #[arg(long)]
+    pub iterations: Option<u32>,
+    /// Nudge → re-route rounds for failed nets (default: the pipeline's own).
+    #[arg(long)]
+    pub lns_rounds: Option<u32>,
 }
 
 /// Executes `ferroute bench`.
 pub fn run(a: &BenchArgs) -> Result<ExitCode> {
     std::fs::create_dir_all(&a.out)?;
     let mut boards = Vec::new();
-    for spec in synth::suite(&a.suite) {
-        boards.push((spec.name.clone(), synth::generate(&spec)));
+    for sb in synth::suite_boards(&a.suite) {
+        boards.push((sb.name, sb.board));
     }
-    if a.fixtures.is_dir() {
+    if let Some(only) = &a.only {
+        boards.retain(|(name, _)| name.contains(only.as_str()));
+    }
+    if a.suite != "dense" && a.only.is_none() && a.fixtures.is_dir() {
         let mut files: Vec<_> = std::fs::read_dir(&a.fixtures)?
             .filter_map(Result::ok)
             .map(|e| e.path())
@@ -101,7 +117,7 @@ pub fn run(a: &BenchArgs) -> Result<ExitCode> {
             boards.push((name, board));
         }
     }
-    let cfg = PipelineConfig {
+    let mut cfg = PipelineConfig {
         seed: a.seed,
         nudge: Some((
             MovePolicy::default(),
@@ -109,6 +125,12 @@ pub fn run(a: &BenchArgs) -> Result<ExitCode> {
         )),
         ..PipelineConfig::default()
     };
+    if let Some(n) = a.iterations {
+        cfg.router.max_iterations = n;
+    }
+    if let Some(n) = a.lns_rounds {
+        cfg.lns_rounds = n;
+    }
     let mut records = Vec::new();
     let fixed_cfg = PipelineConfig { nudge: None, ..cfg.clone() };
     for (name, board) in &boards {
@@ -120,6 +142,9 @@ pub fn run(a: &BenchArgs) -> Result<ExitCode> {
             &res.board_after,
             &render_opts(&res.board_after, &res.drc, title),
         )?;
+        if a.suite == "dense" {
+            out(&dense_detail(name, &res));
+        }
         let rec = BenchRecord { board: name.clone(), seed: a.seed, metrics: res.metrics };
         std::fs::write(a.out.join(format!("{name}.json")), serde_json::to_string_pretty(&rec)?)?;
         records.push(rec);
@@ -158,4 +183,24 @@ pub fn run(a: &BenchArgs) -> Result<ExitCode> {
         }
         Ok(ExitCode::from(1))
     }
+}
+
+/// One-board diagnostic for the dense suite: where the router fails.
+fn dense_detail(name: &str, res: &ferroute_engine::PipelineResult) -> String {
+    let b = &res.board_after;
+    let c = &res.drc.connectivity;
+    let mut s = format!(
+        "{name}: connections {}/{} missing {}, nets failed {}, gate rips {}, introduced {}, constraint issues {}\n",
+        c.connections_total - c.connections_missing,
+        c.connections_total,
+        c.connections_missing,
+        res.failed_nets.len(),
+        res.route.drc_gate_rips,
+        res.metrics.introduced_violations,
+        res.metrics.constraint_issues,
+    );
+    let names: Vec<&str> =
+        res.failed_nets.iter().take(40).map(|n| b.nets[n.idx()].name.as_str()).collect();
+    s.push_str(&format!("  failed nets: {}\n", names.join(" ")));
+    s
 }

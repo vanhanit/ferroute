@@ -311,6 +311,37 @@ fn keepout_node(board: &Board, k: &ferroute_board::Keepout, i: usize, ids: &mut 
     )
 }
 
+fn copper_zone_node(board: &Board, z: &ferroute_board::Zone, ids: &mut Ids) -> SExpr {
+    let layer_name = |l: ferroute_board::LayerId| {
+        board.copper_layers.get(l.0 as usize).map_or_else(String::new, |c| c.name.clone())
+    };
+    let names: Vec<SExpr> = z.layers.iter().map(|l| SExpr::quoted(layer_name(l))).collect();
+    let layer = if names.len() == 1 { node("layer", names) } else { node("layers", names) };
+    let mut v = vec![SExpr::sym("zone")];
+    if let Some(n) = board.nets.get(z.net.idx()) {
+        v.push(kq("net", n.name.clone()));
+    }
+    v.push(layer);
+    v.push(ids.next());
+    v.push(node("hatch", vec![SExpr::sym("edge"), SExpr::sym("0.5")]));
+    v.push(node("connect_pads", vec![kv("clearance", format_mm(z.clearance))]));
+    v.push(kv("min_thickness", format_mm(z.min_thickness)));
+    v.push(node(
+        "fill",
+        vec![
+            SExpr::sym("yes"),
+            kv("thermal_gap", "0.5"),
+            kv("thermal_bridge_width", "0.5"),
+            kv("island_removal_mode", "0"),
+        ],
+    ));
+    v.push(node("polygon", vec![polygon_pts(&z.outline)]));
+    for (layer, poly) in z.fill_polys() {
+        v.push(node("filled_polygon", vec![kq("layer", layer_name(layer)), polygon_pts(poly)]));
+    }
+    SExpr::List(v)
+}
+
 fn outline_poly(poly: &Polygon, ids: &mut Ids) -> SExpr {
     node(
         "gr_poly",
@@ -362,6 +393,9 @@ fn build(board: &Board, seed: u64) -> SExpr {
     }
     for (i, k) in board.keepouts.iter().enumerate() {
         root.push(keepout_node(board, k, i, &mut ids));
+    }
+    for z in &board.zones {
+        root.push(copper_zone_node(board, z, &mut ids));
     }
     root.push(kv("embedded_fonts", "no"));
     SExpr::List(root)
