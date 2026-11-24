@@ -35,6 +35,10 @@ pub struct NetJob {
     /// terminals of these islands). When non-empty, every other island connects to the
     /// plane only (a dog-bone), never to another pad island.
     pub plane: Vec<usize>,
+    /// Lattice nodes / canonical edges covered by fixed copper of the net itself (planned
+    /// area-array escapes): its routes must neither run over nor cross them.
+    pub fixed_nodes: Vec<NodeIdx>,
+    pub fixed_edges: Vec<(NodeIdx, NodeIdx)>,
 }
 
 /// The lattice route of one net.
@@ -301,7 +305,14 @@ fn used_stub_heads(job: &NetJob, r: &NetRoute) -> Vec<(NodeIdx, Dir8)> {
     job.islands
         .iter()
         .flatten()
-        .filter(|t| t.stub.is_some_and(|s| r.stubs.contains(&s)))
+        .filter(|t| match t.stub {
+            Some(s) => r.stubs.contains(&s),
+            // An escape end (stub-less, with a heading) in use: a path starts or ends there.
+            None => {
+                t.heading.is_some()
+                    && r.paths.iter().any(|p| p[0] == t.node || p[p.len() - 1] == t.node)
+            }
+        })
         .filter_map(|t| t.heading.map(|h| (t.node, h)))
         .collect()
 }
@@ -437,10 +448,20 @@ fn route_one(
         let mut got = Vec::new();
         for t in term_of.get(&n).map_or(&[][..], Vec::as_slice) {
             let Some(s) = t.stub else {
-                // A plane terminal: arriving there joins the pour, no copper to add.
-                if want(t.island) {
-                    got.push(t.island);
+                // A plane terminal: arriving there joins the pour, no copper to add. An
+                // escape end carries a heading: the other copper must not meet it at an
+                // acute angle (acid trap).
+                if !want(t.island) {
+                    continue;
                 }
+                if let Some(h) = t.heading {
+                    if crate::junction::forbidden_departures(mask) & crate::junction::bit(h) != 0 {
+                        continue;
+                    }
+                    mask |= crate::junction::bit(h);
+                    heads.push((n, h));
+                }
+                got.push(t.island);
                 continue;
             };
             if !want(t.island) || duplicates_breakout(stubs, used, Some(s)) {
@@ -471,7 +492,9 @@ fn route_one(
             .unwrap_or(job.tbox);
         // Break-outs in use are copper of this net: later paths must not run over them,
         // and a candidate stub whose area the tree already covers can no longer be used.
-        let (own_nodes, own_edges) = keepout_of(stubs, &used_stubs);
+        let (mut own_nodes, mut own_edges) = keepout_of(stubs, &used_stubs);
+        own_nodes.extend(job.fixed_nodes.iter().copied());
+        own_edges.extend(job.fixed_edges.iter().copied());
         let ctx = Ctx { own_nodes: &own_nodes, own_edges: &own_edges, ..base };
         let (tree_nodes, tree_edges) = tree_geometry(&route.paths);
         let blocked = |s: Option<u32>| {

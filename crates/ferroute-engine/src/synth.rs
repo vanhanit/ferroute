@@ -15,7 +15,7 @@ use ferroute_geom::{Point, Polygon};
 use serde::{Deserialize, Serialize};
 
 mod dense;
-pub use dense::dense_suite;
+pub use dense::{bga_256_4l, bga_484_6l, dense_suite, qfn_dense_2l};
 
 /// A generated benchmark board plus the rules file needed to reproduce its constraints
 /// (differential pairs and matching groups exist only through rules in KiCad files).

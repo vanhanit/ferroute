@@ -146,15 +146,51 @@ fn moves_between(policy_board: &Board, placed: &Board) -> Vec<FootprintMove> {
 
 /// Runs the pipeline.
 ///
+/// On boards with an area array the planned escapes ([`ferroute_router::escape`]) are a
+/// heuristic that usually raises completion but can also steer the negotiation into a
+/// worse local optimum (or a via pattern that splits a pour). The pass therefore runs with
+/// them first and, unless that pass is complete, once more without them; the better
+/// result wins (ties go to the plain pass). Boards without an area array run once.
+///
 /// # Errors
 /// Router errors (invalid board, impossible lattice).
 pub fn run(board: &Board, cfg: &PipelineConfig) -> Result<PipelineResult, RouteError> {
+    if cfg.router.escape {
+        let with = run_once(board, cfg)?;
+        if with.route.escape_balls == 0 {
+            // No array (or nothing planned): this pass is the plain pass.
+            return finish_refill(board, cfg, with);
+        }
+        let plain_cfg = PipelineConfig {
+            router: ferroute_router::RouterConfig { escape: false, ..cfg.router.clone() },
+            ..cfg.clone()
+        };
+        if !with.refill_disconnects && with.metrics.connections_missing == 0 {
+            return Ok(with);
+        }
+        let plain = run_plain(board, &plain_cfg)?;
+        // An escape pass whose refill would split a pour is not usable as it stands.
+        let better = !with.refill_disconnects && with.metrics.completion > plain.metrics.completion;
+        return Ok(if better { with } else { plain });
+    }
+    run_plain(board, cfg)
+}
+
+fn run_plain(board: &Board, cfg: &PipelineConfig) -> Result<PipelineResult, RouteError> {
     let first = run_once(board, cfg)?;
+    finish_refill(board, cfg, first)
+}
+
+/// INV-CONN-1: when refilling around the new copper would split a pour and disconnect
+/// pads of its net, keep the pours intact (obstacle mode) instead, and say so.
+fn finish_refill(
+    board: &Board,
+    cfg: &PipelineConfig,
+    first: PipelineResult,
+) -> Result<PipelineResult, RouteError> {
     if !first.refill_disconnects {
         return Ok(first);
     }
-    // INV-CONN-1: refilling around the new copper would split a pour and disconnect pads
-    // of its net. Keep the pours intact (obstacle mode) instead, and say so.
     let mut res = run_once(board, &PipelineConfig { refill_zones: false, ..cfg.clone() })?;
     res.rule_notes.push(
         "copper pours kept as obstacles: refill would disconnect a pour net (INV-CONN-1)"
