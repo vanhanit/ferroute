@@ -16,6 +16,7 @@ workspace = true
 [dependencies]
 serde.workspace = true
 smallvec = { workspace = true, features = ["serde"] }
+i_overlay = "9.2.0"
 
 [dev-dependencies]
 proptest.workspace = true

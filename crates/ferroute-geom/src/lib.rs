@@ -19,6 +19,7 @@
 //! cost heuristics, never for legality decisions.
 
 pub mod arc;
+pub mod boolean;
 pub mod detmath;
 pub mod rng;
 pub mod units;
