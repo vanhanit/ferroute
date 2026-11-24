@@ -10,7 +10,7 @@ use crate::util::{circumscribed_polygon, float, mm, same_angle};
 use ferroute_board::constraints::{Dielectric, Stackup};
 use ferroute_board::{
     Board, Drill, Footprint, FootprintId, IslandRemoval, Keepout, LayerId, LayerSet, Mobility, Net,
-    NetId, Origin, Pad, PadConnection, PadId, Placement, Side, Track, Via, Zone, ZoneFill,
+    NetId, Origin, Pad, PadConnection, PadId, Placement, Side, Track, Via, ViaKind, Zone, ZoneFill,
 };
 use ferroute_geom::{Angle, Coord, Point, Polygon, Rect, convex_hull, units::mm_to_nm};
 use std::collections::{BTreeMap, HashMap};
@@ -425,11 +425,20 @@ impl Reader {
             return Ok(());
         };
         let net = self.net_of(node);
+        // KiCad writes `blind` / `buried` / `micro` right after `(via`; through vias have none.
+        let kind = node
+            .items()
+            .unwrap_or(&[])
+            .iter()
+            .skip(1)
+            .find_map(|c| c.text().and_then(ViaKind::parse))
+            .unwrap_or_default();
         self.board.vias.push(Via {
             pos: at,
             diameter,
             drill,
             layers: LayerSet::span(a, b),
+            kind,
             net,
             locked: is_locked(node),
             origin: Origin::Existing,

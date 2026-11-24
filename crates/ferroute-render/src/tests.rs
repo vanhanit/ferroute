@@ -86,6 +86,7 @@ fn test_board() -> Board {
         pos: Point::new(12_000_000, 8_000_000),
         diameter: 600_000,
         drill: 300_000,
+        kind: ferroute_board::ViaKind::Through,
         layers: LayerSet::all(2),
         net: NetId(1),
         locked: false,

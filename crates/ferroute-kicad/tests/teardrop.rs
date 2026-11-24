@@ -32,6 +32,7 @@ fn fixture_edit() -> (ferroute_board::Board, BoardEdit, ferroute_kicad::KicadDoc
             pos: far,
             diameter: mm(0.6),
             drill: mm(0.3),
+            kind: ferroute_board::ViaKind::Through,
             layers: LayerSet::span(LayerId(0), LayerId(1)),
             net,
             locked: false,

@@ -14,6 +14,33 @@ pub struct NetClass {
     pub track_width: Coord,
     pub via_diameter: Coord,
     pub via_drill: Coord,
+    /// Microvia size (KiCad: net class `microvia_diameter`, default 0.3 mm).
+    #[serde(default = "default_microvia_diameter")]
+    pub microvia_diameter: Coord,
+    /// Microvia drill (KiCad: net class `microvia_drill`, default 0.1 mm).
+    #[serde(default = "default_microvia_drill")]
+    pub microvia_drill: Coord,
+}
+
+/// KiCad 10 net-class default microvia diameter (`DEFAULT_UVIA_DIAMETER`, 0.3 mm).
+pub const DEFAULT_MICROVIA_DIAMETER: Coord = 300_000;
+/// KiCad 10 net-class default microvia drill (`DEFAULT_UVIA_DRILL`, 0.1 mm).
+pub const DEFAULT_MICROVIA_DRILL: Coord = 100_000;
+
+const fn default_min_microvia_diameter() -> Coord {
+    200_000
+}
+
+const fn default_min_microvia_drill() -> Coord {
+    100_000
+}
+
+const fn default_microvia_diameter() -> Coord {
+    DEFAULT_MICROVIA_DIAMETER
+}
+
+const fn default_microvia_drill() -> Coord {
+    DEFAULT_MICROVIA_DRILL
 }
 
 impl Default for NetClass {
@@ -25,6 +52,8 @@ impl Default for NetClass {
             track_width: 250_000,
             via_diameter: 600_000,
             via_drill: 300_000,
+            microvia_diameter: DEFAULT_MICROVIA_DIAMETER,
+            microvia_drill: DEFAULT_MICROVIA_DRILL,
         }
     }
 }
@@ -43,6 +72,12 @@ pub struct DesignRules {
     pub min_track_width: Coord,
     pub min_via_diameter: Coord,
     pub min_via_drill: Coord,
+    /// Minimum microvia diameter (KiCad `min_microvia_diameter`, default 0.2 mm).
+    #[serde(default = "default_min_microvia_diameter")]
+    pub min_microvia_diameter: Coord,
+    /// Minimum microvia drill (KiCad `min_microvia_drill`, default 0.1 mm).
+    #[serde(default = "default_min_microvia_drill")]
+    pub min_microvia_drill: Coord,
     /// KiCad custom rules (`.kicad_dru`), in file order (later rules win).
     #[serde(default)]
     pub custom: Vec<crate::custom::CustomRule>,
@@ -59,6 +94,8 @@ impl Default for DesignRules {
             min_track_width: 0,
             min_via_diameter: 500_000,
             min_via_drill: 300_000,
+            min_microvia_diameter: default_min_microvia_diameter(),
+            min_microvia_drill: default_min_microvia_drill(),
             custom: Vec::new(),
         }
     }

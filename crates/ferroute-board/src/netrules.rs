@@ -35,6 +35,11 @@ pub struct StackupSpec {
 pub struct RoutingSpec {
     /// Allow vias inside SMD pads (needs filled and capped vias: extra fabrication cost).
     pub via_in_pad: Option<bool>,
+    /// Via kinds the router may create: any of `"through"`, `"blind"`, `"buried"`,
+    /// `"micro"` (default: `["through"]`). The non-through kinds need HDI fabrication.
+    pub via_types: Option<Vec<String>>,
+    /// Allow micro vias inside same-net SMD pads (filled and capped; extra cost).
+    pub micro_in_pad: Option<bool>,
     /// Switch on KiCad's native teardrops for every pad and via that gets new copper
     /// (KiCad generates the teardrop copper itself on refill).
     pub teardrops: Option<bool>,
@@ -228,6 +233,10 @@ pub enum RuleError {
     PairNets { index: usize },
     #[error("stackup: {field} must be a finite positive number")]
     Stackup { field: &'static str },
+    #[error("[routing] via_types: unknown via kind {0:?} (through, blind, buried, micro)")]
+    ViaType(String),
+    #[error("[routing] via_types must list at least one kind")]
+    ViaTypesEmpty,
 }
 
 fn positive(v: Option<f64>, index: usize, field: &'static str) -> Result<(), RuleError> {
@@ -298,6 +307,21 @@ impl RuleSet {
         self.routing.as_ref().and_then(|r| r.via_in_pad).unwrap_or(false)
     }
 
+    /// `[routing] via_types` / `micro_in_pad` as a [`crate::ViaPolicy`]; `None` when neither
+    /// is set (the caller's default applies).
+    #[must_use]
+    pub fn via_policy(&self) -> Option<crate::ViaPolicy> {
+        let r = self.routing.as_ref()?;
+        if r.via_types.is_none() && r.micro_in_pad.is_none() {
+            return None;
+        }
+        let mut p = r.via_types.as_ref().map_or_else(crate::ViaPolicy::default, |t| {
+            crate::ViaPolicy::from_names(t.iter().map(String::as_str)).unwrap_or_default()
+        });
+        p.micro_in_pad = r.micro_in_pad.unwrap_or(false);
+        Some(p)
+    }
+
     /// `[routing] teardrops` (`false` when absent).
     #[must_use]
     pub fn teardrops(&self) -> bool {
@@ -321,6 +345,13 @@ impl RuleSet {
                     return Err(RuleError::Stackup { field });
                 }
             }
+        }
+        if let Some(types) = self.routing.as_ref().and_then(|r| r.via_types.as_ref()) {
+            if types.is_empty() {
+                return Err(RuleError::ViaTypesEmpty);
+            }
+            crate::ViaPolicy::from_names(types.iter().map(String::as_str))
+                .map_err(RuleError::ViaType)?;
         }
         for (index, m) in self.matches.iter().enumerate() {
             m.skew(index)?;

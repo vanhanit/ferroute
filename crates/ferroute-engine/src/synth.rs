@@ -226,6 +226,7 @@ pub fn generate_with(spec: &SynthSpec, extras: &dyn Fn(&mut BoardBuilder) -> Ext
             track_width: 400_000,
             via_diameter: 700_000,
             via_drill: 350_000,
+            ..Default::default()
         });
         board.nets[g.idx()].class = 1;
         // GND on up to a quarter of the remaining free pins.

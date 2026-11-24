@@ -7,7 +7,7 @@ use crate::read::NetDialect;
 use crate::sexpr::SExpr;
 use crate::util::{float, format_angle, kq, kv, node, norm180, same_angle, uuid_for, xy_node};
 use crate::write::KICAD10_VERSION;
-use ferroute_board::{ArcTrack, Board, BoardEdit, Placement, Track, Via};
+use ferroute_board::{ArcTrack, Board, BoardEdit, Placement, Track, Via, ViaKind};
 use ferroute_geom::units::{format_mm, parse_mm};
 
 /// UUID kinds (domain separation for [`uuid_for`]).
@@ -216,11 +216,16 @@ pub(crate) fn via_node(
     };
     let n = board.copper_layers.len();
     let mut items = Vec::new();
-    // Through vias carry no type keyword; blind/buried vias keep KiCad's keywords.
+    // Through vias carry no type keyword; partial spans keep KiCad's keywords (`micro`
+    // when the via says so, else `blind` when one end is an outer layer, else `buried`).
     let through = lo.0 == 0 && usize::from(hi.0) + 1 == n;
     if !through {
         let outer = lo.0 == 0 || usize::from(hi.0) + 1 == n;
-        items.push(SExpr::sym(if outer { "blind" } else { "buried" }));
+        items.push(SExpr::sym(match v.kind {
+            ViaKind::Micro => "micro",
+            _ if outer => "blind",
+            _ => "buried",
+        }));
     }
     items.push(xy_node("at", v.pos));
     items.push(kv("size", format_mm(v.diameter)));

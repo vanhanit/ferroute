@@ -872,6 +872,7 @@ pub fn resolve(board: &mut Board) -> Vec<String> {
             clearance: need_c.max(base.clearance),
             via_diameter: need_via.max(base.via_diameter),
             via_drill: need_drill.max(base.via_drill),
+            ..base
         };
         let old_w = base.track_width;
         if derived.track_width > old_w {
@@ -1255,6 +1256,7 @@ mod tests {
             pos: ferroute_geom::Point::new(0, 0),
             diameter: 600_000,
             drill: 300_000,
+            kind: crate::ViaKind::Through,
             layers,
             net: n,
             locked: false,

@@ -52,6 +52,7 @@ fn rich_board() -> Board {
         pos: Point::new(mm(120.5), mm(112.25)),
         diameter: mm(0.6),
         drill: mm(0.3),
+        kind: ferroute_board::ViaKind::Through,
         layers: ferroute_board::LayerSet::span(LayerId(0), LayerId(1)),
         net: sda,
         locked: false,
@@ -96,6 +97,7 @@ fn rich_board() -> Board {
         track_width: mm(0.127),
         via_diameter: mm(0.45),
         via_drill: mm(0.2),
+        ..Default::default()
     });
     b.nets[sda.idx()].class = 2;
     b.rules.edge_clearance = mm(0.35);

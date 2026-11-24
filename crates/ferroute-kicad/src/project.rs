@@ -13,6 +13,7 @@
 //!   `min_through_hole_diameter`.
 
 use crate::KicadError;
+use ferroute_board::rules::{DEFAULT_MICROVIA_DIAMETER, DEFAULT_MICROVIA_DRILL};
 use ferroute_board::{Board, NetClass};
 use ferroute_geom::Coord;
 use ferroute_geom::units::{mm_to_nm, nm_to_mm};
@@ -60,6 +61,12 @@ pub fn read_project_rules(json: &str, board: &mut Board) -> Result<(), KicadErro
         if let Some(x) = mm_field(rules, "min_through_hole_diameter") {
             r.min_via_drill = x;
         }
+        if let Some(x) = mm_field(rules, "min_microvia_diameter") {
+            r.min_microvia_diameter = x;
+        }
+        if let Some(x) = mm_field(rules, "min_microvia_drill") {
+            r.min_microvia_drill = x;
+        }
     }
 
     let Some(ns) = root.get("net_settings").and_then(Value::as_object) else {
@@ -81,6 +88,9 @@ pub fn read_project_rules(json: &str, board: &mut Board) -> Result<(), KicadErro
         default.track_width = mm_field(e, "track_width").unwrap_or(default.track_width);
         default.via_diameter = mm_field(e, "via_diameter").unwrap_or(default.via_diameter);
         default.via_drill = mm_field(e, "via_drill").unwrap_or(default.via_drill);
+        default.microvia_diameter =
+            mm_field(e, "microvia_diameter").unwrap_or(default.microvia_diameter);
+        default.microvia_drill = mm_field(e, "microvia_drill").unwrap_or(default.microvia_drill);
     }
     let mut classes = vec![default.clone()];
     let mut priority: Vec<i64> = vec![i64::MAX];
@@ -95,6 +105,9 @@ pub fn read_project_rules(json: &str, board: &mut Board) -> Result<(), KicadErro
             track_width: mm_field(e, "track_width").unwrap_or(default.track_width),
             via_diameter: mm_field(e, "via_diameter").unwrap_or(default.via_diameter),
             via_drill: mm_field(e, "via_drill").unwrap_or(default.via_drill),
+            microvia_diameter: mm_field(e, "microvia_diameter")
+                .unwrap_or(default.microvia_diameter),
+            microvia_drill: mm_field(e, "microvia_drill").unwrap_or(default.microvia_drill),
         });
         priority.push(e.get("priority").and_then(Value::as_i64).unwrap_or(i64::MAX - 1));
     }
@@ -146,14 +159,22 @@ pub fn write_project_json(board: &Board) -> String {
         .iter()
         .enumerate()
         .map(|(i, c)| {
-            json!({
+            let mut j = json!({
                 "name": c.name,
                 "priority": if i == 0 { i64::from(i32::MAX) } else { i64::try_from(i).unwrap_or(0) - 1 },
                 "clearance": nm_to_mm(c.clearance),
                 "track_width": nm_to_mm(c.track_width),
                 "via_diameter": nm_to_mm(c.via_diameter),
                 "via_drill": nm_to_mm(c.via_drill),
-            })
+            });
+            // KiCad's defaults are implied; only deviations are written.
+            if c.microvia_diameter != DEFAULT_MICROVIA_DIAMETER {
+                j["microvia_diameter"] = json!(nm_to_mm(c.microvia_diameter));
+            }
+            if c.microvia_drill != DEFAULT_MICROVIA_DRILL {
+                j["microvia_drill"] = json!(nm_to_mm(c.microvia_drill));
+            }
+            j
         })
         .collect();
     let mut assign = Map::new();

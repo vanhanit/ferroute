@@ -215,7 +215,16 @@ impl BoardBuilder {
         origin: Origin,
     ) -> &mut Self {
         let layers = self.board.all_layers();
-        self.board.vias.push(Via { pos, diameter, drill, layers, net, locked: false, origin });
+        self.board.vias.push(Via {
+            pos,
+            diameter,
+            drill,
+            layers,
+            kind: crate::ViaKind::Through,
+            net,
+            locked: false,
+            origin,
+        });
         self
     }
 

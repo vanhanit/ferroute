@@ -397,13 +397,116 @@ impl ArcTrack {
     }
 }
 
-/// A via (through, blind or buried: spans `layers`).
+/// Kind of a via (KiCad `VIATYPE`).
+#[derive(
+    Copy, Clone, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize,
+)]
+#[serde(rename_all = "lowercase")]
+pub enum ViaKind {
+    /// Drilled through the whole board (no keyword in the `.kicad_pcb`).
+    #[default]
+    Through,
+    /// Outer layer to an inner layer (`blind`).
+    Blind,
+    /// Inner layer to inner layer (`buried`).
+    Buried,
+    /// Laser microvia between adjacent layers, starting at an outer layer (`micro`).
+    Micro,
+}
+
+impl ViaKind {
+    pub const ALL: [Self; 4] = [Self::Through, Self::Blind, Self::Buried, Self::Micro];
+
+    /// Lower-case name (`through`, `blind`, `buried`, `micro`).
+    #[must_use]
+    pub const fn name(self) -> &'static str {
+        match self {
+            Self::Through => "through",
+            Self::Blind => "blind",
+            Self::Buried => "buried",
+            Self::Micro => "micro",
+        }
+    }
+
+    /// Parses [`ViaKind::name`].
+    #[must_use]
+    pub fn parse(s: &str) -> Option<Self> {
+        Self::ALL.into_iter().find(|k| k.name() == s)
+    }
+}
+
+/// Which via kinds the router may create (default: through vias only). Blind, buried and
+/// micro vias need HDI fabrication (extra cost), hence opt-in.
+#[derive(Copy, Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ViaPolicy {
+    pub through: bool,
+    pub blind: bool,
+    pub buried: bool,
+    pub micro: bool,
+    /// Micro vias may sit inside same-net SMD pads (filled and capped).
+    pub micro_in_pad: bool,
+}
+
+impl Default for ViaPolicy {
+    fn default() -> Self {
+        Self { through: true, blind: false, buried: false, micro: false, micro_in_pad: false }
+    }
+}
+
+impl ViaPolicy {
+    /// `true` when only through vias are allowed.
+    #[must_use]
+    pub const fn through_only(&self) -> bool {
+        self.through && !self.blind && !self.buried && !self.micro
+    }
+
+    /// `true` when any non-through kind is allowed.
+    #[must_use]
+    pub const fn any_span(&self) -> bool {
+        self.blind || self.buried || self.micro
+    }
+
+    /// Whether `kind` may be created.
+    #[must_use]
+    pub const fn allows(&self, kind: ViaKind) -> bool {
+        match kind {
+            ViaKind::Through => self.through,
+            ViaKind::Blind => self.blind,
+            ViaKind::Buried => self.buried,
+            ViaKind::Micro => self.micro,
+        }
+    }
+
+    /// Builds a policy from kind names (`through`, `blind`, `buried`, `micro`).
+    ///
+    /// # Errors
+    /// Returns the offending name when it is not a via kind.
+    pub fn from_names<'a>(names: impl IntoIterator<Item = &'a str>) -> Result<Self, String> {
+        let mut p = Self { through: false, ..Self::default() };
+        for n in names {
+            match ViaKind::parse(n.trim()) {
+                Some(ViaKind::Through) => p.through = true,
+                Some(ViaKind::Blind) => p.blind = true,
+                Some(ViaKind::Buried) => p.buried = true,
+                Some(ViaKind::Micro) => p.micro = true,
+                None => return Err(n.to_owned()),
+            }
+        }
+        Ok(p)
+    }
+}
+
+/// A via (through, blind, buried or micro): `layers` is its authoritative copper span
+/// (contiguous copper layers); copper, hole and connectivity exist only on those layers.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Via {
     pub pos: Point,
     pub diameter: Coord,
     pub drill: Coord,
     pub layers: LayerSet,
+    /// Kind keyword of the via; defaults to [`ViaKind::Through`].
+    #[serde(default)]
+    pub kind: ViaKind,
     pub net: NetId,
     pub locked: bool,
     pub origin: Origin,
@@ -829,3 +932,6 @@ fn ferroute_geom_f64(c: Coord) -> f64 {
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod via_tests;

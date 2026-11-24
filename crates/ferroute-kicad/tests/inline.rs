@@ -275,6 +275,40 @@ fn project_patterns_and_inheritance() {
     assert_eq!(b.nets[0].class, 0);
 }
 
+#[test]
+fn project_microvia_sizes_default_inherit_and_roundtrip() {
+    let mut b = read(
+        r#"(footprint "L:X" (layer "F.Cu") (at 1 1) (pad "1" smd rect (at 0 0) (size 1 1) (layers "F.Cu") (net 1 "N1")))"#,
+    )
+    .board;
+    // Absent keys: KiCad's defaults (0.3 / 0.1 mm net class, 0.2 / 0.1 mm board minimums).
+    let c = &b.rules.classes[0];
+    assert_eq!((c.microvia_diameter, c.microvia_drill), (mm(0.3), mm(0.1)));
+    assert_eq!((b.rules.min_microvia_diameter, b.rules.min_microvia_drill), (mm(0.2), mm(0.1)));
+    let json = r#"{
+      "board": {"design_settings": {"rules": {"min_microvia_diameter": 0.15, "min_microvia_drill": 0.075}}},
+      "net_settings": {"classes": [
+          {"name": "Default", "microvia_diameter": 0.25, "microvia_drill": 0.09, "priority": 2147483647},
+          {"name": "Fine", "priority": 0, "microvia_drill": 0.08}]}}"#;
+    read_project_rules(json, &mut b).unwrap();
+    let r = &b.rules;
+    assert_eq!((r.min_microvia_diameter, r.min_microvia_drill), (mm(0.15), mm(0.075)));
+    assert_eq!((r.classes[0].microvia_diameter, r.classes[0].microvia_drill), (mm(0.25), mm(0.09)));
+    // A class inherits what it does not set from Default.
+    assert_eq!((r.classes[1].microvia_diameter, r.classes[1].microvia_drill), (mm(0.25), mm(0.08)));
+    // Written back only when different from KiCad's default; reading it restores them.
+    let written = ferroute_kicad::project::write_project_json(&b);
+    assert!(written.contains("microvia_diameter") && written.contains("microvia_drill"));
+    let mut again = read(
+        r#"(footprint "L:X" (layer "F.Cu") (at 1 1) (pad "1" smd rect (at 0 0) (size 1 1) (layers "F.Cu") (net 1 "N1")))"#,
+    )
+    .board;
+    read_project_rules(&written, &mut again).unwrap();
+    assert_eq!(again.rules.classes[1].microvia_drill, mm(0.08));
+    let plain = ferroute_kicad::project::write_project_json(&read("").board);
+    assert!(!plain.contains("microvia"), "defaults are implied: {plain}");
+}
+
 const L4: &str = r#"(layers (0 "F.Cu" signal) (1 "In1.Cu" signal) (2 "In2.Cu" signal) (31 "B.Cu" signal) (44 "Edge.Cuts" user))"#;
 
 fn stackup_src(setup: &str) -> String {
