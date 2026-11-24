@@ -110,7 +110,22 @@ jobs:
           git add Cargo.toml Cargo.lock CHANGELOG.md
           git commit -m "chore(release): ${TAG} [skip ci]"
           git tag -a "$TAG" -m "ferroute ${TAG}"
-          git push origin HEAD:main "$TAG"
+          # Branch and tag land together or not at all (--atomic). If main moved meanwhile,
+          # rebase the release commit onto it, re-tag and retry: a partial push once left an
+          # orphan v0.4.0 tag that blocked every later release.
+          for attempt in 1 2 3 4 5; do
+            if git push --atomic origin HEAD:main "$TAG"; then
+              exit 0
+            fi
+            echo "::warning::main moved; rebasing release commit (attempt ${attempt})"
+            git fetch origin main
+            git tag -d "$TAG"
+            git rebase origin/main
+            git tag -a "$TAG" -m "ferroute ${TAG}"
+            sleep $((attempt * 5))
+          done
+          echo "::error::could not push ${TAG} atomically"
+          exit 1
 
       - name: Keep release notes
         if: steps.next.outputs.released == 'true'
