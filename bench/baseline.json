@@ -270,6 +270,42 @@
         "constraint_issues": 0,
         "runtime_ms": 100.0
       }
+    },
+    {
+      "board": "diff_pair-fixed",
+      "seed": 1,
+      "metrics": {
+        "drc_clean": true,
+        "introduced_violations": 0,
+        "total_violations": 0,
+        "completion": 1.0,
+        "connections_total": 3,
+        "connections_missing": 0,
+        "wirelength_mm": 109.62038195145203,
+        "vias": 1,
+        "moved_footprints": 0,
+        "displacement_mm": 0.0,
+        "constraint_issues": 0,
+        "runtime_ms": 100.0
+      }
+    },
+    {
+      "board": "diff_pair",
+      "seed": 1,
+      "metrics": {
+        "drc_clean": true,
+        "introduced_violations": 0,
+        "total_violations": 0,
+        "completion": 1.0,
+        "connections_total": 3,
+        "connections_missing": 0,
+        "wirelength_mm": 109.62038195145203,
+        "vias": 1,
+        "moved_footprints": 0,
+        "displacement_mm": 0.0,
+        "constraint_issues": 0,
+        "runtime_ms": 100.0
+      }
     }
   ]
 }

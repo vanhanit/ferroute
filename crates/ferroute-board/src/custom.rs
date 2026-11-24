@@ -465,6 +465,13 @@ impl crate::DesignRules {
             .unwrap_or(0)
     }
 
+    /// Conservative `diff_pair_gap` minimum imposed by custom rules on pairs involving
+    /// `net` (0 when none).
+    #[must_use]
+    pub fn diff_pair_gap_for_net(&self, board: &Board, net: NetId) -> Coord {
+        self.bound_for_net(board, ConstraintKind::DiffPairGap, net, None, true).unwrap_or(0)
+    }
+
     /// `(min, max)` routed-length limits that apply to `net` (definite matches only).
     #[must_use]
     pub fn length_limits_for_net(

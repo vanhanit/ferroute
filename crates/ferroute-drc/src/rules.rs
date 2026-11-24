@@ -24,6 +24,13 @@ pub enum IssueKind {
     ViaCount { actual: u32, max: u32 },
     /// The impedance target cannot be reached by any width with this stack-up.
     Impedance { target_mohm: u32 },
+    /// A differential pair's coupled gap deviates from its target (±10 %) or is below the
+    /// clearance. `net` is the pair's positive net.
+    PairGap { pair: String, min_gap: Coord, max_gap: Coord, target: Coord },
+    /// A differential pair is routed as two independent nets (no coupled section at all).
+    PairNotCoupled { pair: String },
+    /// A differential pair has more uncoupled copper than allowed (per trace, nm).
+    PairUncoupled { pair: String, length: Coord, max: Coord },
 }
 
 impl IssueKind {
@@ -35,6 +42,8 @@ impl IssueKind {
             Self::Skew { .. } | Self::SkewDelay { .. } => "skew",
             Self::ViaCount { .. } => "vias",
             Self::Impedance { .. } => "impedance",
+            Self::PairGap { .. } => "pair-gap",
+            Self::PairUncoupled { .. } | Self::PairNotCoupled { .. } => "pair-uncoupled",
         }
     }
 }
@@ -76,6 +85,22 @@ impl ConstraintIssue {
             IssueKind::ViaCount { actual, max } => {
                 format!("net {net}: {actual} vias > allowed {max}")
             }
+            IssueKind::PairGap { pair, min_gap, max_gap, target } => format!(
+                "pair {pair}: coupled gap {}…{} mm vs target {} mm (±10 %)",
+                mm(*min_gap),
+                mm(*max_gap),
+                mm(*target)
+            ),
+            IssueKind::PairNotCoupled { pair } => {
+                format!("pair {pair}: routed as two independent nets (no coupled section)")
+            }
+            IssueKind::PairUncoupled { pair, length, max } => {
+                format!(
+                    "pair {pair}: uncoupled length {} mm > allowed {} mm",
+                    mm(*length),
+                    mm(*max)
+                )
+            }
             IssueKind::Impedance { target_mohm } => format!(
                 "net {net}: impedance {:.1} Ω unattainable with this stack-up",
                 f64::from(*target_mohm) / 1000.0
@@ -105,6 +130,46 @@ pub fn net_lengths(board: &Board) -> Vec<Coord> {
     }
     #[allow(clippy::cast_possible_truncation)]
     len.into_iter().map(|l| l.round() as Coord).collect()
+}
+
+/// Gap tolerance of coupled sections: ±10 % of the target, plus 2 nm of rounding.
+fn gap_ok(target: Coord, gap: Coord) -> bool {
+    (gap - target).abs() <= target / 10 + 2
+}
+
+/// Coupling constraints of one pair: constant gap on coupled sections (never below the
+/// clearance) and the uncoupled-length limit. Unrouted pairs have nothing to report.
+fn check_pair(board: &Board, pair: &ferroute_board::DiffPair) -> Vec<ConstraintIssue> {
+    let Some(m) = crate::pairs::pair_metrics(board, pair) else { return Vec::new() };
+    let mut out = Vec::new();
+    let name = pair.name(board);
+    if m.coupled == 0 {
+        out.push(ConstraintIssue { net: pair.p, kind: IssueKind::PairNotCoupled { pair: name } });
+        return out;
+    }
+    if let (Some(lo), Some(hi)) = (m.min_gap, m.max_gap) {
+        let clearance = board.rules.class_of(board, pair.p).clearance;
+        if lo < clearance || !gap_ok(pair.gap, lo) || !gap_ok(pair.gap, hi) {
+            out.push(ConstraintIssue {
+                net: pair.p,
+                kind: IssueKind::PairGap {
+                    pair: name.clone(),
+                    min_gap: lo,
+                    max_gap: hi,
+                    target: pair.gap,
+                },
+            });
+        }
+    }
+    if let Some(max) = pair.max_uncoupled
+        && m.uncoupled() > max
+    {
+        out.push(ConstraintIssue {
+            net: pair.p,
+            kind: IssueKind::PairUncoupled { pair: name, length: m.uncoupled(), max },
+        });
+    }
+    out
 }
 
 /// Checks every net's electrical constraints. Deterministic order: per net (width,
@@ -158,6 +223,9 @@ pub fn check_constraints(board: &Board) -> Vec<ConstraintIssue> {
                 kind: IssueKind::ViaCount { actual: vias[i], max },
             });
         }
+    }
+    for pair in &board.diff_pairs {
+        out.extend(check_pair(board, pair));
     }
     let delays = net_delays_fs(board);
     for g in match_groups(board) {
@@ -308,5 +376,52 @@ mod tests {
         assert!(text.contains("delay spread") && text.contains("> allowed 2.000 ps"), "{text}");
         board.match_groups = vec![group(ferroute_board::constraints::MatchBy::Delay, 20_000)];
         assert!(check_constraints(&board).is_empty());
+    }
+
+    #[test]
+    fn pair_gap_and_uncoupled_limits_are_reported() {
+        use ferroute_board::builder::{BoardBuilder, mm};
+        use ferroute_board::{DiffPair, LayerId, Track};
+        let mut b = BoardBuilder::new(mm(40), mm(40), 2);
+        let (p, n) = (b.net("D+"), b.net("D-"));
+        let mut board = b.build();
+        let t = |net, y: i64, x1: i64| Track {
+            start: ferroute_geom::Point::new(0, y),
+            end: ferroute_geom::Point::new(x1, y),
+            width: 250_000,
+            layer: LayerId(0),
+            net,
+            locked: false,
+            origin: Origin::Routed,
+        };
+        board.diff_pairs = vec![DiffPair {
+            p,
+            n,
+            gap: 200_000,
+            width: None,
+            max_uncoupled: Some(mm(1)),
+            skew_max: None,
+        }];
+        board.tracks = vec![t(p, 0, mm(10)), t(n, 450_000, mm(10))];
+        let kinds = |b: &Board| -> Vec<&'static str> {
+            check_constraints(b).iter().map(|i| i.kind.label()).collect()
+        };
+        assert!(!kinds(&board).contains(&"pair-gap"), "{:?}", kinds(&board));
+        // 5 % deviation is fine, 20 % is not; below the clearance is never fine.
+        board.tracks[1] = t(n, 460_000, mm(10));
+        assert!(!kinds(&board).contains(&"pair-gap"));
+        board.tracks[1] = t(n, 490_000, mm(10));
+        assert!(kinds(&board).contains(&"pair-gap"));
+        board.diff_pairs[0].gap = 150_000;
+        board.tracks[1] = t(n, 390_000, mm(10));
+        assert!(kinds(&board).contains(&"pair-gap"), "gap 140 µm < clearance 200 µm");
+        // Uncoupled: N runs 5 mm longer than P.
+        board.diff_pairs[0].gap = 200_000;
+        board.tracks[1] = t(n, 450_000, mm(15));
+        let issues = check_constraints(&board);
+        let un = issues.iter().find(|i| i.kind.label() == "pair-uncoupled").expect("uncoupled");
+        assert!(un.describe(&board).contains("D+/D-"));
+        board.diff_pairs[0].max_uncoupled = Some(mm(6));
+        assert!(!kinds(&board).contains(&"pair-uncoupled"));
     }
 }

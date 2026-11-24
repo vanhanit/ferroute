@@ -229,6 +229,9 @@ fn run_once(board: &Board, cfg: &PipelineConfig) -> Result<PipelineResult, Route
     // Length rules (length_min, match groups): meanders, each verified by the oracle.
     let mut rule_notes = rule_notes;
     rule_notes.extend(ferroute_router::tune::tune_lengths(&policy_board, &mut edit));
+    for w in &best.out.stats.uncoupled_pairs {
+        rule_notes.push(format!("pair {w} — routed as two independent nets"));
+    }
     let mut board_after = policy_board.clone();
     board_after.apply(&edit);
     let mut refill_disconnects = false;

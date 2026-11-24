@@ -23,14 +23,16 @@ pub struct GenArgs {
 pub fn gen_run(a: &GenArgs) -> Result<ExitCode> {
     std::fs::create_dir_all(&a.out)?;
     if a.suite == "fixtures" {
-        let board = synth::bus_match();
-        let pcb = a.out.join("bus_match.kicad_pcb");
-        std::fs::write(&pcb, ferroute_kicad::write_new_board(&board, 1))?;
-        std::fs::write(
-            pcb.with_extension("kicad_pro"),
-            ferroute_kicad::project::write_project_json(&board),
-        )?;
-        out(&format!("wrote {}", pcb.display()));
+        let fixtures = [("bus_match", synth::bus_match()), ("diff_pair", synth::diff_pair())];
+        for (name, board) in fixtures {
+            let pcb = a.out.join(format!("{name}.kicad_pcb"));
+            std::fs::write(&pcb, ferroute_kicad::write_new_board(&board, 1))?;
+            std::fs::write(
+                pcb.with_extension("kicad_pro"),
+                ferroute_kicad::project::write_project_json(&board),
+            )?;
+            out(&format!("wrote {}", pcb.display()));
+        }
         return Ok(ExitCode::SUCCESS);
     }
     for spec in synth::suite(&a.suite) {
@@ -83,7 +85,16 @@ pub fn run(a: &BenchArgs) -> Result<ExitCode> {
         files.sort();
         for f in files {
             let name = f.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default();
-            let board = load(&f)?.board;
+            let mut board = load(&f)?.board;
+            // Fixtures whose rules file declares differential pairs run with it (pairs
+            // exist only through rules); every other fixture runs rule-free as before.
+            let rules = a.fixtures.with_file_name("rules").join(format!("{name}.toml"));
+            if let Ok(text) = std::fs::read_to_string(&rules) {
+                let rs = super::route::parse_rules(&text)?;
+                if !rs.pairs.is_empty() {
+                    rs.apply(&mut board)?;
+                }
+            }
             // Fixtures run twice: with nudging and with placement fixed (what CI's KiCad
             // lane does), so a completion drop in either mode fails the gate.
             boards.push((format!("{name}-fixed"), board.clone()));

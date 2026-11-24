@@ -104,6 +104,88 @@ impl MatchRule {
     }
 }
 
+/// A differential pair (`[[pair]]`): two named nets, or `auto = true` to pair every net
+/// ending in `_P`/`_N`, `+`/`-` or `P`/`N` with its same-stem partner (optionally limited
+/// to `nets` globs on the positive net).
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PairRule {
+    /// Exactly two net names/globs (positive, negative) — or, with `auto`, a filter on
+    /// the positive net.
+    #[serde(default)]
+    pub nets: Vec<String>,
+    /// Alternative to `nets`: the positive net.
+    pub p: Option<String>,
+    /// Alternative to `nets`: the negative net.
+    pub n: Option<String>,
+    #[serde(default)]
+    pub auto: bool,
+    /// Edge-to-edge gap of the coupled sections (mm).
+    pub gap_mm: Option<f64>,
+    /// Trace width (mm); never below the nets' own rule widths.
+    pub width_mm: Option<f64>,
+    /// Differential impedance (Ω): solves the width (for a given gap) or the gap (for a
+    /// given width) from the stack-up.
+    pub zdiff_ohm: Option<f64>,
+    /// Longest uncoupled copper per trace (mm).
+    pub max_uncoupled_mm: Option<f64>,
+    /// Allowed intra-pair length skew (mm; default 0.1).
+    pub skew_mm: Option<f64>,
+}
+
+impl PairRule {
+    fn validate(&self, index: usize) -> Result<(), RuleError> {
+        for (v, field) in [
+            (self.gap_mm, "gap_mm"),
+            (self.width_mm, "width_mm"),
+            (self.zdiff_ohm, "zdiff_ohm"),
+            (self.max_uncoupled_mm, "max_uncoupled_mm"),
+            (self.skew_mm, "skew_mm"),
+        ] {
+            if v.is_some_and(|x| !(x.is_finite() && x > 0.0)) {
+                return Err(RuleError::PairValue { index, field });
+            }
+        }
+        let named = match (&self.p, &self.n) {
+            (Some(_), Some(_)) => self.nets.is_empty(),
+            (None, None) => self.nets.len() == 2,
+            _ => false,
+        };
+        if named || self.auto { Ok(()) } else { Err(RuleError::PairNets { index }) }
+    }
+
+    /// The `(positive, negative)` net name patterns of an explicit pair.
+    fn names(&self) -> Option<(&str, &str)> {
+        match (&self.p, &self.n) {
+            (Some(p), Some(n)) => Some((p, n)),
+            _ if self.nets.len() == 2 => Some((&self.nets[0], &self.nets[1])),
+            _ => None,
+        }
+    }
+}
+
+/// Suffix conventions of positive/negative nets, tried in order.
+const PAIR_SUFFIXES: [(&str, &str); 3] = [("_P", "_N"), ("+", "-"), ("P", "N")];
+
+/// Same-stem `(positive, negative)` net pairs of `board`, in net order; `filter` (globs
+/// over the positive net's name) limits them when non-empty.
+fn auto_pairs(board: &Board, filter: &[String]) -> Vec<(NetId, NetId)> {
+    let mut out = Vec::new();
+    for (i, net) in board.nets.iter().enumerate().skip(1) {
+        if !filter.is_empty() && !filter.iter().any(|g| glob(g, &net.name)) {
+            continue;
+        }
+        for (sp, sn) in PAIR_SUFFIXES {
+            let Some(stem) = net.name.strip_suffix(sp).filter(|s| !s.is_empty()) else { continue };
+            if let Some(j) = board.net_by_name(&format!("{stem}{sn}")) {
+                out.push((NetId(u32::try_from(i).unwrap_or(u32::MAX)), j));
+                break;
+            }
+        }
+    }
+    out
+}
+
 /// A complete rules file.
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -116,6 +198,8 @@ pub struct RuleSet {
     pub rules: Vec<NetRule>,
     #[serde(default, rename = "match")]
     pub matches: Vec<MatchRule>,
+    #[serde(default, rename = "pair")]
+    pub pairs: Vec<PairRule>,
 }
 
 /// Rejected rule value.
@@ -133,6 +217,12 @@ pub enum RuleError {
     MatchSkewBoth { index: usize },
     #[error("match rule {index}: by = \"length\" takes skew_mm, by = \"delay\" takes skew_ps")]
     MatchSkewUnit { index: usize },
+    #[error("pair rule {index}: {field} must be a finite positive number")]
+    PairValue { index: usize, field: &'static str },
+    #[error(
+        "pair rule {index}: name exactly two nets (`nets = [p, n]` or `p`/`n`) or set auto = true"
+    )]
+    PairNets { index: usize },
     #[error("stackup: {field} must be a finite positive number")]
     Stackup { field: &'static str },
 }
@@ -226,6 +316,7 @@ impl RuleSet {
         for (index, m) in self.matches.iter().enumerate() {
             m.skew(index)?;
         }
+        self.pairs.iter().enumerate().try_for_each(|(i, r)| r.validate(i))?;
         self.rules.iter().enumerate().try_for_each(|(i, r)| r.validate(i))
     }
 
@@ -287,6 +378,84 @@ impl RuleSet {
         }
     }
 
+    /// Resolves the `[[pair]]` rules into `board.diff_pairs` (and one match group per pair
+    /// for its intra-pair skew). A net belongs to at most one pair; the first rule wins.
+    fn apply_pairs(&self, board: &mut Board, warnings: &mut Vec<String>) {
+        use crate::constraints::{LineKind, PairFixed, diff_pair_geometry, required_width};
+        use crate::pairs::{DEFAULT_PAIR_SKEW, DiffPair};
+        for (index, r) in self.pairs.iter().enumerate() {
+            let found: Vec<(NetId, NetId)> = if r.auto {
+                auto_pairs(board, &r.nets)
+            } else {
+                let find = |pat: &str| {
+                    (1..board.nets.len())
+                        .find(|&n| glob(pat, &board.nets[n].name))
+                        .map(|n| NetId(u32::try_from(n).unwrap_or(u32::MAX)))
+                };
+                match r.names().map(|(p, n)| (find(p), find(n))) {
+                    Some((Some(p), Some(n))) if p != n => vec![(p, n)],
+                    _ => {
+                        warnings.push(format!("pair rule {index} matched no two distinct nets"));
+                        continue;
+                    }
+                }
+            };
+            if found.is_empty() {
+                warnings.push(format!("pair rule {index} matched no net pair"));
+            }
+            for (p, n) in found {
+                if board.diff_pairs.iter().any(|d| d.contains(p) || d.contains(n)) {
+                    continue;
+                }
+                let clearance = board.rules.class_of(board, p).clearance;
+                let base_w = required_width(board, p).max(required_width(board, n));
+                let (w, g) = (r.width_mm.map(mm_to_nm), r.gap_mm.map(mm_to_nm));
+                let s = &board.stackup;
+                let solved = r.zdiff_ohm.and_then(|z| {
+                    let fixed = match (g, w) {
+                        (Some(g), _) => PairFixed::Gap(g),
+                        (None, w) => PairFixed::Width(w.unwrap_or(base_w).max(base_w)),
+                    };
+                    let t = s.copper_thickness.first().copied().unwrap_or(35_000);
+                    let er = f64::from(s.epsilon_r_milli) / 1000.0;
+                    let r = diff_pair_geometry(
+                        z,
+                        LineKind::Microstrip,
+                        fixed,
+                        s.outer_dielectric,
+                        t,
+                        er,
+                    );
+                    if r.is_none() {
+                        warnings.push(format!(
+                            "pair rule {index}: zdiff_ohm {z} unattainable with this stack-up"
+                        ));
+                    }
+                    r
+                });
+                let (width, gap) = match solved {
+                    Some((sw, sg)) => (Some(sw.max(w.unwrap_or(0))), sg),
+                    None => (w, g.unwrap_or(clearance)),
+                };
+                board.diff_pairs.push(DiffPair {
+                    p,
+                    n,
+                    gap: gap.max(clearance),
+                    width,
+                    max_uncoupled: r.max_uncoupled_mm.map(mm_to_nm),
+                    skew_max: Some(r.skew_mm.map_or(DEFAULT_PAIR_SKEW, mm_to_nm)),
+                });
+                let d = &board.diff_pairs[board.diff_pairs.len() - 1];
+                board.match_groups.push(MatchGroup {
+                    name: format!("diffpair:{}", d.name(board)),
+                    skew_max: d.skew(),
+                    by: MatchBy::Length,
+                    nets: vec![p.min(n), p.max(n)],
+                });
+            }
+        }
+    }
+
     /// Validates, then applies the stack-up and every rule to `board`. Returns warnings
     /// (e.g. rules that matched no net) — never silently ignored.
     ///
@@ -328,6 +497,7 @@ impl RuleSet {
             }
         }
         self.apply_matches(board, &mut warnings);
+        self.apply_pairs(board, &mut warnings);
         Ok(warnings)
     }
 }
@@ -567,5 +737,103 @@ mod tests {
             ..RuleSet::default()
         };
         assert_eq!(neg.validate(), Err(RuleError::Stackup { field: "board_thickness_mm" }));
+    }
+
+    fn pair_rule(f: impl FnOnce(&mut PairRule)) -> RuleSet {
+        let mut r = PairRule::default();
+        f(&mut r);
+        RuleSet { pairs: vec![r], ..RuleSet::default() }
+    }
+
+    #[test]
+    fn explicit_pair_rule_builds_pair_and_skew_group() {
+        let mut b = board();
+        let rs = pair_rule(|r| {
+            r.nets = vec!["USB_D+".into(), "USB_D-".into()];
+            r.gap_mm = Some(0.2);
+            r.width_mm = Some(0.25);
+            r.max_uncoupled_mm = Some(5.0);
+        });
+        assert!(rs.apply(&mut b).expect("valid").is_empty());
+        let d = &b.diff_pairs[0];
+        assert_eq!((d.gap, d.width, d.max_uncoupled), (200_000, Some(250_000), Some(5_000_000)));
+        assert_eq!(d.skew(), crate::pairs::DEFAULT_PAIR_SKEW);
+        assert_eq!(b.match_groups.len(), 1);
+        assert_eq!(b.match_groups[0].nets.len(), 2);
+        // The gap never drops below the clearance.
+        let mut b = board();
+        pair_rule(|r| {
+            r.p = Some("USB_D+".into());
+            r.n = Some("USB_D-".into());
+            r.gap_mm = Some(0.01);
+        })
+        .apply(&mut b)
+        .expect("valid");
+        assert_eq!(b.diff_pairs[0].gap, b.rules.classes[0].clearance);
+    }
+
+    #[test]
+    fn auto_pairs_use_suffix_conventions_and_first_rule_wins() {
+        let mut bb = BoardBuilder::new(mm(30), mm(20), 2);
+        for n in ["A_P", "A_N", "B+", "B-", "CP", "CN", "SIG", "LONE_P", "P", "N"] {
+            bb.net(n);
+        }
+        let mut b = bb.build();
+        let rs = pair_rule(|r| r.auto = true);
+        rs.apply(&mut b).expect("valid");
+        let names: Vec<String> = b.diff_pairs.iter().map(|d| d.name(&b)).collect();
+        assert_eq!(names, ["A_P/A_N", "B+/B-", "CP/CN"]);
+        // Already-paired nets are not paired again by a later rule.
+        let again = RuleSet {
+            pairs: vec![PairRule {
+                nets: vec!["A_P".into(), "A_N".into()],
+                gap_mm: Some(0.5),
+                ..PairRule::default()
+            }],
+            ..RuleSet::default()
+        };
+        again.apply(&mut b).expect("valid");
+        assert_eq!(b.diff_pairs.len(), 3);
+    }
+
+    #[test]
+    fn zdiff_solves_width_or_gap_and_bad_rules_are_rejected() {
+        let mut b = board();
+        pair_rule(|r| {
+            r.nets = vec!["USB_D+".into(), "USB_D-".into()];
+            r.zdiff_ohm = Some(90.0);
+            r.gap_mm = Some(0.2);
+        })
+        .apply(&mut b)
+        .expect("valid");
+        let w = b.diff_pairs[0].width.expect("solved width");
+        assert!(w > 0 && b.diff_pairs[0].gap == 200_000, "{w}");
+        let mut b2 = board();
+        pair_rule(|r| {
+            r.nets = vec!["USB_D+".into(), "USB_D-".into()];
+            r.zdiff_ohm = Some(90.0);
+            r.width_mm = Some(0.3);
+        })
+        .apply(&mut b2)
+        .expect("valid");
+        assert!(b2.diff_pairs[0].gap >= b2.rules.classes[0].clearance);
+        assert_eq!(
+            pair_rule(|r| r.nets = vec!["only-one".into()]).validate(),
+            Err(RuleError::PairNets { index: 0 })
+        );
+        assert_eq!(
+            pair_rule(|r| {
+                r.auto = true;
+                r.skew_mm = Some(-1.0);
+            })
+            .validate(),
+            Err(RuleError::PairValue { index: 0, field: "skew_mm" })
+        );
+        let mut b3 = board();
+        let w = pair_rule(|r| r.nets = vec!["NOPE".into(), "USB_D+".into()])
+            .apply(&mut b3)
+            .expect("valid");
+        assert_eq!(w.len(), 1);
+        assert!(b3.diff_pairs.is_empty());
     }
 }

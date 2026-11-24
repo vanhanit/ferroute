@@ -302,6 +302,16 @@ fn replan(
     cur_gate: Gate,
     hood: &[NetId],
 ) -> Result<Option<Accepted>, RouteError> {
+    // Coupled pairs stay as built: re-routing one net alone would break the coupling.
+    let coupled = |n: NetId| {
+        ferroute_board::pairs::pair_of(board, n)
+            .is_some_and(|p| cur.stats.coupled_pairs.contains(&p.name(board)))
+    };
+    let hood: Vec<NetId> = hood.iter().copied().filter(|&n| !coupled(n)).collect();
+    let hood = hood.as_slice();
+    if hood.is_empty() {
+        return Ok(None);
+    }
     let fixed = fixed_board(board, &cur.edit, hood);
     for order in orders(board, cur, hood) {
         let sub = RouterConfig {

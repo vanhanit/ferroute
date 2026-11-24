@@ -88,6 +88,17 @@ fn bus_match_routes_are_clean_of_slivers_and_right_angles() {
 }
 
 #[test]
+fn diff_pair_routes_coupled_and_clean() {
+    let rules = ["--rules", "testdata/rules/diff_pair.toml", "--strict-rules"];
+    let b = route("diff_pair", &rules);
+    check("pair-fixed", &b, (0, 0, 0));
+    assert!(ferroute_drc::quality::acute_angles(&b).is_empty());
+    // With nudging the pair is re-coupled after any placement change; rules still hold.
+    let mv = ["--rules", "testdata/rules/diff_pair.toml", "--allow-move", "--strict-rules"];
+    check("pair-move", &route("diff_pair", &mv), (0, 0, 0));
+}
+
+#[test]
 fn synthetic_ci_suite_is_clean_of_slivers_and_right_angles() {
     for spec in ferroute_engine::synth::suite("ci") {
         let board = ferroute_engine::synth::generate(&spec);

@@ -5,8 +5,8 @@
 //! connect pins of *nearby* parts (realistic locality, so boards are routable), a fraction
 //! of parts is locked, and an optional power net spans the board.
 
-use ferroute_board::builder::{BoardBuilder, mm};
-use ferroute_board::{Board, Mobility, NetClass, NetId};
+use ferroute_board::builder::{BoardBuilder, PadSpec, mm};
+use ferroute_board::{Board, Mobility, NetClass, NetId, PadShape, Side};
 use ferroute_geom::Point;
 use ferroute_geom::rng::Rng;
 use serde::{Deserialize, Serialize};
@@ -207,6 +207,43 @@ pub fn bus_match() -> Board {
     for (k, &(n, x, y)) in parts.iter().enumerate() {
         b.smd2(&format!("R{}", k + 1), Point::new(mm(x), mm(y)), 0.0, nets[n], nets[5]);
     }
+    b.build()
+}
+
+/// Hand-designed fixture for coupled differential pairs: a locked 1×3 header (GND, `USB_D+`,
+/// `USB_D-`) feeds an SOIC-8-like part 30 mm away whose pair pins sit 1.27 mm apart, 12 mm
+/// lower, behind a no-track keep-out, so the pair needs two 45° bends and a pad-spacing
+/// change at each end (rules in `testdata/rules/diff_pair.toml`: gap 0.2 mm, width 0.25 mm,
+/// skew 0.1 mm).
+#[must_use]
+pub fn diff_pair() -> Board {
+    let mut b = BoardBuilder::new(mm(50), mm(34), 2);
+    let names = ["GND", "USB_D+", "USB_D-", "VCC"];
+    let n: Vec<NetId> = names.iter().map(|x| b.net(x)).collect();
+    let j1 = b.header("J1", Point::new(mm(5), mm(8)), 0.0, &[n[0], n[1], n[2]]);
+    b.mobility(j1, Mobility::Locked);
+    let pad = |num: usize, x: i64, y: i64, net: NetId| PadSpec {
+        number: num.to_string(),
+        local_pos: Point::new(x, y),
+        shape: PadShape::Rect { w: 1_550_000, h: 600_000 },
+        drill: None,
+        net,
+    };
+    let rows = [-1_905_000, -635_000, 635_000, 1_905_000];
+    let left = [n[3], n[1], n[2], n[0]];
+    let mut pads: Vec<PadSpec> = rows
+        .iter()
+        .zip(left)
+        .enumerate()
+        .map(|(i, (&y, net))| pad(i + 1, -2_700_000, y, net))
+        .collect();
+    pads.extend(rows.iter().enumerate().map(|(i, &y)| pad(i + 5, 2_700_000, y, NetId::NONE)));
+    b.footprint("U1", Point::new(mm(38), mm(24)), 0.0, Side::Front, &pads);
+    b.keepout(
+        ferroute_geom::Rect::new(Point::new(mm(16), mm(5)), Point::new(mm(24), mm(17))),
+        true,
+        true,
+    );
     b.build()
 }
 

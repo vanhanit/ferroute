@@ -16,6 +16,7 @@
 pub mod access;
 pub mod chamfer;
 pub mod detour;
+pub mod diffpair;
 pub mod direct;
 pub mod emit;
 pub mod grid;
@@ -24,6 +25,7 @@ pub mod legality;
 pub mod lns;
 pub mod meander;
 pub mod negotiate;
+pub mod pairgeom;
 pub mod plan;
 pub mod search;
 pub mod smooth;
@@ -165,6 +167,13 @@ pub struct RouteStats {
     pub lns_accepted: u32,
     /// Sum of detour excess (mm) of the returned outcome.
     pub detour_excess_mm: f64,
+    /// Differential pairs routed as coupled units (`P/N` names).
+    #[serde(default)]
+    pub coupled_pairs: Vec<String>,
+    /// Pairs the router could not couple and left to the ordinary single-net router
+    /// (`P/N: reason`); reported, never hidden.
+    #[serde(default)]
+    pub uncoupled_pairs: Vec<String>,
 }
 
 /// Wall-clock timings (not deterministic; excluded from reproducibility checks).
@@ -311,17 +320,32 @@ pub fn route_once(board: &Board, cfg: &RouterConfig) -> Result<RouteOutcome, Rou
         return Err(RouteError::GridTooLarge(grid.len()));
     }
     let t0 = Instant::now();
-    // Direct pad-to-pad links first; they become fixed copper of their nets.
+    // Differential pairs first, as coupled units; their copper is fixed for everything else.
+    let stage = diffpair::route_pairs(board, &grid.layers, pitch, cfg.nets.as_deref());
+    let board_pairs = &board.diff_pairs;
+    let pair_tracks = stage.tracks();
+    let pair_nets = stage.nets(board);
+    let mut pre = board.clone();
+    pre.tracks.extend(
+        pair_tracks.iter().map(|t| ferroute_board::Track {
+            origin: ferroute_board::Origin::Existing,
+            ..t.clone()
+        }),
+    );
+    let board = &pre;
+    // Direct pad-to-pad links next; they become fixed copper of their nets.
     let links = direct::direct_links(
         board,
         &Obstacles::from_board(board),
         &plan::class_geoms(&board.rules),
         &grid.layers,
     );
-    // Only the requested nets get links (the rest is fixed copper of the caller).
+    // Only the requested nets get links (the rest is fixed copper of the caller); coupled
+    // pairs are already connected.
     let links: Vec<direct::Link> = links
         .into_iter()
         .filter(|l| cfg.nets.as_ref().is_none_or(|v| v.contains(&l.track.net)))
+        .filter(|l| !pair_nets.contains(&l.track.net))
         .collect();
     let original = board;
     let mut work = board.clone();
@@ -491,6 +515,8 @@ pub fn route_once(board: &Board, cfg: &RouterConfig) -> Result<RouteOutcome, Rou
         }
         bad.sort_unstable();
         bad.dedup();
+        // Only nets of this pass can be ripped (the pair stage's copper is verified apart).
+        bad.retain(|n| per_net.iter().any(|e| e.0 == *n));
         if bad.is_empty() {
             break;
         }
@@ -510,7 +536,7 @@ pub fn route_once(board: &Board, cfg: &RouterConfig) -> Result<RouteOutcome, Rou
     let edit = vias::relocate_vias(original, &edit, cfg.via_in_pad);
     let edit = straighten::straighten(original, &edit);
     // No trace bends 90°: every right angle becomes two 45° bends where exactly legal.
-    let edit = chamfer::chamfer(original, &edit);
+    let mut edit = chamfer::chamfer(original, &edit);
     let gate_ms = t2.elapsed().as_secs_f64() * 1e3;
     failed.extend(per_net.iter().filter(|e| !e.3).map(|e| e.0));
     failed.sort_unstable();
@@ -526,6 +552,9 @@ pub fn route_once(board: &Board, cfg: &RouterConfig) -> Result<RouteOutcome, Rou
             edit.new_vias.iter().filter(|v| after.via_in_pad(v).is_some()).count(),
         )
     };
+    // Coupled pairs are emitted exactly as built: the gridless passes above only saw them
+    // as fixed obstacles (they are Existing copper of `original`).
+    edit.new_tracks.splice(0..0, pair_tracks);
     let stats = RouteStats {
         pitch,
         grid: (grid.nx, grid.ny, grid.nl()),
@@ -549,6 +578,12 @@ pub fn route_once(board: &Board, cfg: &RouterConfig) -> Result<RouteOutcome, Rou
         lns_rounds_run: 0,
         lns_accepted: 0,
         detour_excess_mm: 0.0,
+        coupled_pairs: stage.coupled.iter().map(|c| board_pairs[c.pair].name(original)).collect(),
+        uncoupled_pairs: stage
+            .uncoupled
+            .iter()
+            .map(|(k, why)| format!("{}: {why}", board_pairs[*k].name(original)))
+            .collect(),
     };
     Ok(RouteOutcome {
         edit,

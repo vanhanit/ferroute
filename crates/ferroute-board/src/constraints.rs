@@ -692,6 +692,15 @@ pub fn resolve(board: &mut Board) -> Vec<String> {
         let v = board.rules.max_custom_min(crate::custom::ConstraintKind::HoleClearance);
         board.rules.hole_clearance = board.rules.hole_clearance.max(v);
     }
+    // KiCad custom `diff_pair_gap` rules raise the target gap of matching pairs.
+    for k in 0..board.diff_pairs.len() {
+        let (p, n) = (board.diff_pairs[k].p, board.diff_pairs[k].n);
+        let g = board
+            .rules
+            .diff_pair_gap_for_net(board, p)
+            .max(board.rules.diff_pair_gap_for_net(board, n));
+        board.diff_pairs[k].gap = board.diff_pairs[k].gap.max(g);
+    }
     for i in 1..board.nets.len() {
         let net = NetId(u32::try_from(i).unwrap_or(u32::MAX));
         if !board.rules.custom.is_empty() {
@@ -701,7 +710,9 @@ pub fn resolve(board: &mut Board) -> Vec<String> {
             c.length_max = hi.map_or(c.length_max, |m| Some(c.length_max.map_or(m, |o| o.min(m))));
         }
         let base = board.rules.class_of(board, net).clone();
-        let need_w = required_width(board, net).max(board.rules.min_width_for_net(board, net));
+        let need_w = required_width(board, net)
+            .max(board.rules.min_width_for_net(board, net))
+            .max(crate::pairs::pair_min_width(board, net));
         let need_c = board.rules.max_clearance_for_net(board, net);
         let need_drill = base.via_drill.max(board.rules.min_hole_for_net(board, net));
         let need_via =

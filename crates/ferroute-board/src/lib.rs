@@ -17,8 +17,10 @@ pub mod builder;
 pub mod constraints;
 pub mod custom;
 pub mod netrules;
+pub mod pairs;
 pub mod rules;
 pub mod text;
+pub use pairs::DiffPair;
 pub use rules::{DesignRules, NetClass};
 pub use text::glob;
 
@@ -551,6 +553,9 @@ pub struct Board {
     /// Explicit length-matching groups (on top of the legacy per-net `match_group` fields).
     #[serde(default)]
     pub match_groups: Vec<constraints::MatchGroup>,
+    /// Differential pairs routed as coupled units.
+    #[serde(default)]
+    pub diff_pairs: Vec<pairs::DiffPair>,
 }
 
 /// Errors from [`Board::validate`].
