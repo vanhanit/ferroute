@@ -216,3 +216,62 @@ fn incremental_cost_equals_full_cost_bit_for_bit() {
         assert_eq!(model.cost_cached(&mut cc), model.cost(&cur), "state after step {step}");
     }
 }
+
+/// R1 has its pads swapped relative to its targets (A target right, B target left).
+fn swapped() -> Board {
+    let mut b = BoardBuilder::new(mm(40), mm(30), 2);
+    let a = b.net("A");
+    let c = b.net("B");
+    let jb = b.header("JB", pt10(100, 150), 0.0, &[c]);
+    let ja = b.header("JA", pt10(300, 150), 0.0, &[a]);
+    b.mobility(jb, Mobility::Locked);
+    b.mobility(ja, Mobility::Locked);
+    b.smd2("R1", pt10(200, 150), 0.0, a, c);
+    b.build()
+}
+
+#[test]
+fn rotation_untangles_swapped_pads_on_grid_and_in_bounds() {
+    let mut board = swapped();
+    apply_policy(&mut board, &MovePolicy { max_displacement: mm(3), ..MovePolicy::default() });
+    let r = optimize(&board, &PlaceConfig { seed: 5, ..PlaceConfig::default() });
+    let m = r.moves.iter().find(|m| board.footprint(m.footprint).reference == "R1").expect("R1");
+    assert_eq!(m.to.rot.sub(m.from.rot).quadrant(), Some(2), "{m:?}");
+    assert!(r.after.wire_mm < r.before.wire_mm, "{:?} -> {:?}", r.before, r.after);
+    assert_eq!((m.to.pos.x % 100_000, m.to.pos.y % 100_000), (0, 0));
+    edit_of(&r).check_invariants(&board).expect("INV-EDIT-1");
+    assert!(r.moves.iter().all(|m| board.footprint(m.footprint).reference == "R1"));
+}
+
+#[test]
+fn rotation_disabled_never_rotates() {
+    let mut board = swapped();
+    apply_policy(
+        &mut board,
+        &MovePolicy { max_displacement: mm(3), allow_rotation: false, ..MovePolicy::default() },
+    );
+    let r = optimize(&board, &PlaceConfig { seed: 5, ..PlaceConfig::default() });
+    assert!(r.moves.iter().all(|m| m.to.rot == m.from.rot));
+}
+
+/// A neighbour right above R1 blocks the pure +90° rotation; a shift repairs it.
+#[test]
+fn colliding_rotation_is_repaired_by_a_shift() {
+    let mut b = BoardBuilder::new(mm(40), mm(30), 2);
+    let n: Vec<_> = (0..4).map(|i| b.net(&format!("N{i}"))).collect();
+    b.smd2("R1", pt10(200, 150), 0.0, n[0], n[1]);
+    b.smd2("R2", pt10(200, 162), 0.0, n[2], n[3]);
+    let mut board = b.build();
+    apply_policy(&mut board, &MovePolicy { max_displacement: mm(5), ..MovePolicy::default() });
+    let pf = Prefilter::new(&board);
+    let cur: Vec<Placement> = board.footprints.iter().map(|f| f.placement).collect();
+    let fid = FootprintId(0);
+    let pure = Placement { pos: cur[0].pos, rot: cur[0].rot.add(Angle::from_degrees(90.0)) };
+    assert!(!legal_with(&board, &pf, &cur, fid, pure), "setup: pure rotation must collide");
+    let got = rotate_and_repair(&board, &pf, &cur, fid, Angle::from_degrees(90.0), 100_000)
+        .expect("repair");
+    assert_eq!(got.rot, pure.rot);
+    assert_ne!(got.pos, pure.pos);
+    assert!(legal_with(&board, &pf, &cur, fid, got));
+    assert_eq!((got.pos.x % 100_000, got.pos.y % 100_000), (0, 0));
+}

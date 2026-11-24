@@ -578,6 +578,58 @@ pub fn legal_with(
     true
 }
 
+/// Furthest repair shift (in grid steps) along each of the eight compass directions.
+const REPAIR_STEPS: i64 = 24;
+/// Repair directions, tried nearest-first per step in this fixed order.
+const REPAIR_DIRS: [(i64, i64); 8] =
+    [(1, 0), (-1, 0), (0, 1), (0, -1), (1, 1), (-1, 1), (1, -1), (-1, -1)];
+
+/// Rotates `fid` by `delta` about the centre of its pad bounding box (so a part whose
+/// origin is far from its pads stays roughly where it was) and returns the new placement.
+/// A pure rotation that is illegal is repaired by shifting: candidate anchors are scanned
+/// in a fixed star pattern (eight compass directions, step by step) of absolute grid points around the
+/// rotated anchor, nearest first, and the first legal one wins. Displacement is always
+/// bounded against the ORIGINAL position by [`legal_with`]. Deterministic; `None` if no
+/// legal rotated placement exists nearby.
+#[must_use]
+fn rotate_and_repair(
+    board: &Board,
+    pf: &Prefilter,
+    cur: &[Placement],
+    fid: FootprintId,
+    delta: Angle,
+    grid: Coord,
+) -> Option<Placement> {
+    let fp = board.footprint(fid);
+    let old = cur[fid.idx()];
+    let pads: Vec<Point> = fp.pads.iter().map(|&p| board.pad(p).local_pos).collect();
+    let centre = Rect::from_points(&pads).map_or(Point::ORIGIN, |r| {
+        Point::new(r.min.x + (r.max.x - r.min.x) / 2, r.min.y + (r.max.y - r.min.y) / 2)
+    });
+    let rot = old.rot.add(delta);
+    // Keep the pad-box centre fixed: pos' = pos + R_old(c) - R_new(c).
+    let shift = centre.rotated(old.rot) - centre.rotated(rot);
+    let mut base = Placement { pos: old.pos + shift, rot };
+    if shift != Point::ORIGIN {
+        let g = grid.max(1);
+        base.pos = Point::new(snap(base.pos.x, g), snap(base.pos.y, g));
+    }
+    if legal_with(board, pf, cur, fid, base) {
+        return Some(base);
+    }
+    let g = grid.max(1);
+    let anchor = Point::new(snap(base.pos.x, g), snap(base.pos.y, g));
+    for k in 1..=REPAIR_STEPS {
+        for (ux, uy) in REPAIR_DIRS {
+            let cand = Placement { pos: anchor + Point::new(ux * k * g, uy * k * g), rot };
+            if legal_with(board, pf, cur, fid, cand) {
+                return Some(cand);
+            }
+        }
+    }
+    None
+}
+
 fn chain(
     board: &Board,
     cfg: &PlaceConfig,
@@ -609,8 +661,18 @@ fn chain(
         let Mobility::Movable { max_displacement, allow_rotation } = fp.mobility else { continue };
         let mut cand = cur[fid.idx()];
         if allow_rotation && rng.below(8) == 0 {
-            cand.rot =
-                cand.rot.add(Angle::from_degrees(if rng.below(2) == 0 { 90.0 } else { -90.0 }));
+            let delta = match rng.below(3) {
+                0 => 90.0,
+                1 => -90.0,
+                _ => 180.0,
+            };
+            let Some(c) =
+                rotate_and_repair(board, pf, &cur, fid, Angle::from_degrees(delta), cfg.grid)
+            else {
+                proposed += 1;
+                continue;
+            };
+            cand = c;
         } else {
             // Window shrinks with temperature (coarse → fine).
             #[allow(clippy::cast_precision_loss, clippy::cast_possible_truncation)]
