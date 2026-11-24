@@ -81,10 +81,26 @@ pub fn direct_links(
             }
         }
         for (_, ia, ib, layer, d) in cands {
-            if !uf.union(u32::try_from(ia).unwrap_or(0), u32::try_from(ib).unwrap_or(0)) {
+            let (a, b) = (pads[ia], pads[ib]);
+            // Links of different nets must never conflict with each other (each was only
+            // checked against fixed obstacles): conservative per-net clearance bound.
+            let hull = Hull::capsule(board.pad_position(a), board.pad_position(b), cg.track_radius);
+            let conflicts = out.iter().any(|o: &Link| {
+                o.track.net != net
+                    && o.track.layer == layer
+                    && hull.clearance_violated(
+                        &o.track.hull(),
+                        board
+                            .rules
+                            .max_clearance_for_net(board, net)
+                            .max(board.rules.max_clearance_for_net(board, o.track.net)),
+                    )
+            });
+            if conflicts
+                || !uf.union(u32::try_from(ia).unwrap_or(0), u32::try_from(ib).unwrap_or(0))
+            {
                 continue;
             }
-            let (a, b) = (pads[ia], pads[ib]);
             out.push(Link {
                 track: Track {
                     start: board.pad_position(a),
@@ -111,6 +127,59 @@ mod tests {
     fn links_for(board: &Board) -> Vec<Link> {
         let obs = Obstacles::from_board(board);
         direct_links(board, &obs, &class_geoms(&board.rules), &[LayerId(0), LayerId(1)])
+    }
+
+    /// 2×2 block of round through-hole pads: GND on one diagonal, VCC on the other. Both
+    /// diagonal links are individually legal but they cross.
+    fn crossing_board() -> Board {
+        use ferroute_board::builder::PadSpec;
+        use ferroute_board::{PadShape, Side};
+        let mut b = BoardBuilder::new(mm(20), mm(20), 2);
+        let (g, v) = (b.net("GND"), b.net("VCC"));
+        let pad = |num: &str, x: i64, y: i64, net| PadSpec {
+            number: num.into(),
+            local_pos: ferroute_geom::Point::new(x, y),
+            shape: PadShape::Circle { diameter: 600_000 },
+            drill: Some(300_000),
+            net,
+        };
+        let pads = [
+            pad("1", 0, 0, g),
+            pad("2", 1_000_000, 1_000_000, g),
+            pad("3", 1_000_000, 0, v),
+            pad("4", 0, 1_000_000, v),
+        ];
+        b.footprint("U1", pt10(100, 100), 0.0, Side::Front, &pads);
+        let mut board = b.build();
+        board.rules.classes[0].clearance = 100_000;
+        board.rules.classes[0].track_width = 100_000;
+        board
+    }
+
+    #[test]
+    fn links_of_different_nets_never_conflict() {
+        let board = crossing_board();
+        let l = links_for(&board);
+        assert!(!l.is_empty());
+        for (i, x) in l.iter().enumerate() {
+            for y in &l[i + 1..] {
+                if x.track.net != y.track.net && x.track.layer == y.track.layer {
+                    let cl = board.clearance_between(x.track.net, y.track.net);
+                    assert!(!x.track.hull().clearance_violated(&y.track.hull(), cl), "{x:?} {y:?}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn crossing_link_candidates_route_and_terminate_clean() {
+        let board = crossing_board();
+        let out = crate::route(&board, &crate::RouterConfig::default()).expect("route");
+        assert_eq!(out.stats.drc_gate_rips, 0);
+        let mut after = board;
+        after.apply(&out.edit);
+        let rep = ferroute_drc::check(&after, &ferroute_drc::DrcConfig::default());
+        assert_eq!(rep.introduced().count(), 0, "{:?}", rep.violations);
     }
 
     #[test]

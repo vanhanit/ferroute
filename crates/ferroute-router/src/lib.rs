@@ -342,7 +342,7 @@ pub fn route_once(board: &Board, cfg: &RouterConfig) -> Result<RouteOutcome, Rou
     );
     // Only the requested nets get links (the rest is fixed copper of the caller); coupled
     // pairs are already connected.
-    let links: Vec<direct::Link> = links
+    let mut links: Vec<direct::Link> = links
         .into_iter()
         .filter(|l| cfg.nets.as_ref().is_none_or(|v| v.contains(&l.track.net)))
         .filter(|l| !pair_nets.contains(&l.track.net))
@@ -488,6 +488,7 @@ pub fn route_once(board: &Board, cfg: &RouterConfig) -> Result<RouteOutcome, Rou
             })
             .collect();
     let mut gate_rips = 0usize;
+    let mut link_rips: Vec<NetId> = Vec::new();
     loop {
         let edit = assemble(&per_net, &links);
         let mut after = original.clone();
@@ -516,18 +517,38 @@ pub fn route_once(board: &Board, cfg: &RouterConfig) -> Result<RouteOutcome, Rou
         bad.sort_unstable();
         bad.dedup();
         // Only nets of this pass can be ripped (the pair stage's copper is verified apart).
-        bad.retain(|n| per_net.iter().any(|e| e.0 == *n));
+        bad.retain(|n| {
+            per_net.iter().any(|e| e.0 == *n) || links.iter().any(|l| l.track.net == *n)
+        });
         if bad.is_empty() {
             break;
         }
         tracing::error!(?bad, "DRC gate removed routed nets (router/oracle disagreement)");
+        let mut removed = false;
         for e in &mut per_net {
-            if bad.contains(&e.0) {
+            if bad.contains(&e.0) && (e.3 || !e.1.is_empty() || !e.2.is_empty()) {
                 e.1.clear();
                 e.2.clear();
                 e.3 = false;
                 gate_rips += 1;
+                removed = true;
             }
+        }
+        // A net's direct pad-to-pad links are part of its copper too.
+        let before = links.len();
+        links.retain(|l| {
+            let rip = bad.contains(&l.track.net);
+            if rip {
+                link_rips.push(l.track.net);
+            }
+            !rip
+        });
+        removed |= links.len() != before;
+        if !removed {
+            // Nothing left to rip: stop instead of spinning. The pipeline's final oracle gate
+            // still refuses any output with an introduced violation.
+            tracing::error!(?bad, "DRC gate cannot remove the remaining violations");
+            break;
         }
     }
     // Gridless clean-up of the emitted copper (guarded by the oracle inside).
@@ -539,6 +560,7 @@ pub fn route_once(board: &Board, cfg: &RouterConfig) -> Result<RouteOutcome, Rou
     let mut edit = chamfer::chamfer(original, &edit);
     let gate_ms = t2.elapsed().as_secs_f64() * 1e3;
     failed.extend(per_net.iter().filter(|e| !e.3).map(|e| e.0));
+    failed.extend(link_rips.iter().copied());
     failed.sort_unstable();
     failed.dedup();
     let (right_angle_bends, near_pad_bends, slivers, via_jogs, via_in_pad) = {
