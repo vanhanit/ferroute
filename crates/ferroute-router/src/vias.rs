@@ -136,7 +136,7 @@ fn via_legal(
     let clr_same = base.clearance_between(via.net, via.net);
     let reach = st.reach.max(rules.hole_to_hole).max(clr_same) + 1;
     let window = Rect::new(via.pos, via.pos).inflate(via.diameter / 2 + reach);
-    for k in st.grid.query(window, &st.boxes) {
+    for k in st.query_items(window) {
         let it = &st.items[k as usize];
         if same(it.net) {
             if Some(it.item) == inside {
@@ -180,7 +180,7 @@ fn via_legal(
         }
     }
     let wide = Rect::new(via.pos, via.pos).inflate(via.diameter / 2 + reach);
-    for k in st.hole_grid.query(wide, &st.hole_boxes) {
+    for k in st.query_holes(wide) {
         let h = &st.holes[k as usize];
         if hole.clearance_violated(&h.hull, rules.hole_to_hole)
             || (!same(h.net) && hull.clearance_violated(&h.hull, rules.hole_clearance))
@@ -323,17 +323,35 @@ fn incident_chains(st: &Statics<'_>, cur: &BoardEdit, via: &Via) -> Option<[Chai
     (a.layer != b.layer).then_some([a, b])
 }
 
-/// Tries to move via `k` of `cur`; returns the improved edit.
-fn relocate_one(board: &Board, cur: &BoardEdit, k: usize, via_in_pad: bool) -> Option<BoardEdit> {
+/// Tries to move via `k` of `cur`; returns the improved edit. `st` is built from the whole
+/// of `cur`; via `k` is hidden from it for the duration of the call.
+fn relocate_one(
+    board: &Board,
+    cur: &BoardEdit,
+    k: usize,
+    via_in_pad: bool,
+    st: &mut Statics<'_>,
+) -> Option<BoardEdit> {
     let via = &cur.new_vias[k];
     if via.origin != Origin::Routed || via.locked || via.net == NetId::NONE {
         return None;
     }
-    let mut without = cur.clone();
-    without.new_vias.remove(k);
-    let st = Statics::new(board, &without);
+    st.hide_via(k);
+    let r = relocate_hidden(board, cur, k, via_in_pad, st);
+    st.unhide();
+    r
+}
+
+fn relocate_hidden(
+    board: &Board,
+    cur: &BoardEdit,
+    k: usize,
+    via_in_pad: bool,
+    st: &Statics<'_>,
+) -> Option<BoardEdit> {
+    let via = &cur.new_vias[k];
     let mut dynamic = Dynamic::of(&cur.new_tracks);
-    let [mut c0, mut c1] = incident_chains(&st, cur, via)?;
+    let [mut c0, mut c1] = incident_chains(st, cur, via)?;
     let own: Vec<u32> = c0.ids.iter().chain(&c1.ids).copied().collect();
     let now = |c: &Chain| score(board, c, None, &c.pts, None, 0);
     let current = {
@@ -341,7 +359,7 @@ fn relocate_one(board: &Board, cur: &BoardEdit, k: usize, via_in_pad: bool) -> O
         let loc = |c: &Chain| {
             let s = now(c);
             let sl = st.slivers(&dynamic, c, c.ids.len(), c.ids.len(), &c.pts)
-                + sliver_count(&st, c, &hull, &c.pts);
+                + sliver_count(st, c, &hull, &c.pts);
             (u64::from(sl), u64::from(s.1), u64::from(s.2), u64::from(s.3), s.4)
         };
         total([&c0, &c1], [&c0.pts, &c1.pts], [loc(&c0), loc(&c1)], via.pos, via.diameter)
@@ -364,7 +382,7 @@ fn relocate_one(board: &Board, cur: &BoardEdit, k: usize, via_in_pad: bool) -> O
     cands.sort_by_key(|&(p, id)| (p, id.is_none()));
     for (p, pad) in cands {
         let moved = Via { pos: p, ..via.clone() };
-        if !via_legal(&st, &dynamic, &moved, &own, pad.map(ItemRef::Pad)) {
+        if !via_legal(st, &dynamic, &moved, &own, pad.map(ItemRef::Pad)) {
             continue;
         }
         let hull = moved.hull();
@@ -373,8 +391,8 @@ fn relocate_one(board: &Board, cur: &BoardEdit, k: usize, via_in_pad: bool) -> O
             pad.is_some_and(|id| c.pts[0] == p && board.pad(id).layers.contains(c.layer))
         };
         let (o0, o1) = (
-            rebuilds(&st, &dynamic, &c0, p, &hull, collapse(&c0)),
-            rebuilds(&st, &dynamic, &c1, p, &hull, collapse(&c1)),
+            rebuilds(st, &dynamic, &c0, p, &hull, collapse(&c0)),
+            rebuilds(st, &dynamic, &c1, p, &hull, collapse(&c1)),
         );
         for a in &o0 {
             for b in &o1 {
@@ -414,11 +432,14 @@ pub fn relocate_vias(base: &Board, edit: &BoardEdit, via_in_pad: bool) -> BoardE
         let mut count = jogging.len();
         let jogging: BTreeSet<Point> = jogging.into_iter().map(|j| j.at).collect();
         let mut changed = false;
+        // The static index is rebuilt only when a via actually moves.
+        let mut shared: Option<Statics<'_>> = None;
         for k in 0..cur.new_vias.len() {
             if !jogging.contains(&cur.new_vias[k].pos) {
                 continue;
             }
-            if let Some(next) = relocate_one(board, &cur, k, via_in_pad) {
+            let st = shared.get_or_insert_with(|| Statics::new(board, &cur));
+            if let Some(next) = relocate_one(board, &cur, k, via_in_pad, st) {
                 // A move may also disturb the via at the far end of a chain: keep it only
                 // if the board as a whole jogs less.
                 let now = jogs_of(&next).len();
@@ -426,6 +447,7 @@ pub fn relocate_vias(base: &Board, edit: &BoardEdit, via_in_pad: bool) -> BoardE
                     cur = next;
                     count = now;
                     changed = true;
+                    shared = None;
                 }
             }
         }

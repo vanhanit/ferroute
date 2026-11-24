@@ -5,8 +5,6 @@ use crate::grid::{Grid, NodeIdx, forward_slot};
 use crate::legality::{ClassLegality, allows};
 use ferroute_board::NetId;
 use ferroute_geom::Dir8;
-use std::cmp::Reverse;
-use std::collections::BinaryHeap;
 
 /// Cost weights (in units of one orthogonal lattice step).
 #[derive(Copy, Clone, Debug, PartialEq)]
@@ -212,12 +210,197 @@ impl Arrival {
     }
 }
 
+/// Per-node search record. A record is valid only while its `stamp` equals the current
+/// search generation, so scratch memory is never cleared between searches.
+#[derive(Copy, Clone)]
+struct Rec {
+    cost: f32,
+    parent: u32,
+    stamp: u32,
+    /// Memoised track congestion of the node (independent of the parent node).
+    cong: f32,
+    arrive: Arrival,
+    closed: bool,
+    has_cong: bool,
+}
+
+impl Rec {
+    const FRESH: Self = Self {
+        cost: f32::INFINITY,
+        parent: u32::MAX,
+        stamp: 0,
+        cong: 0.0,
+        arrive: Arrival(8),
+        closed: false,
+        has_cong: false,
+    };
+}
+
+/// Reusable per-thread A* memory (results never depend on its previous contents).
+#[derive(Default)]
+struct Scratch {
+    generation: u32,
+    recs: Vec<Rec>,
+    /// Memoised via-site congestion per window column `(j - j0) * w + (i - i0)`.
+    vstamp: Vec<u32>,
+    vcong: Vec<f32>,
+    heap: MinHeap,
+}
+
+/// 4-ary min-heap of packed `(cost bits << 32 | local index)` keys. Keys are unique per
+/// `(cost, node)` pair, so the pop sequence equals that of any other correct min-heap.
+#[derive(Default)]
+struct MinHeap {
+    v: Vec<u64>,
+}
+
+impl MinHeap {
+    fn clear(&mut self) {
+        self.v.clear();
+    }
+
+    fn push(&mut self, x: u64) {
+        let mut i = self.v.len();
+        self.v.push(x);
+        while i > 0 {
+            let p = (i - 1) / 4;
+            if self.v[p] <= x {
+                break;
+            }
+            self.v[i] = self.v[p];
+            i = p;
+        }
+        self.v[i] = x;
+    }
+
+    fn pop(&mut self) -> Option<u64> {
+        let last = self.v.pop()?;
+        if self.v.is_empty() {
+            return Some(last);
+        }
+        let top = self.v[0];
+        let n = self.v.len();
+        let mut i = 0;
+        loop {
+            let c = 4 * i + 1;
+            if c >= n {
+                break;
+            }
+            let mut m = c;
+            for k in c + 1..(c + 4).min(n) {
+                if self.v[k] < self.v[m] {
+                    m = k;
+                }
+            }
+            if self.v[m] >= last {
+                break;
+            }
+            self.v[i] = self.v[m];
+            i = m;
+        }
+        self.v[i] = last;
+        Some(top)
+    }
+}
+
+/// Largest record array kept alive between searches.
+const KEEP_RECS: usize = 1 << 22;
+
+thread_local! {
+    static SCRATCH: std::cell::RefCell<Scratch> = std::cell::RefCell::new(Scratch::default());
+}
+
+/// Reservation offsets with their linear index deltas for the interior fast path.
+struct Offs<'a> {
+    list: &'a [(i32, i32)],
+    lin: Vec<i64>,
+    r: u32,
+}
+
+impl<'a> Offs<'a> {
+    fn new(list: &'a [(i32, i32)], nx: u32) -> Self {
+        let lin =
+            list.iter().map(|&(di, dj)| i64::from(dj) * i64::from(nx) + i64::from(di)).collect();
+        let r =
+            list.iter().map(|&(a, b)| a.unsigned_abs().max(b.unsigned_abs())).max().unwrap_or(0);
+        Self { list, lin, r }
+    }
+
+    /// Whether the whole ball around planar `(i, j)` lies inside the grid.
+    fn interior(&self, g: &Grid, i: u32, j: u32) -> bool {
+        i >= self.r && j >= self.r && i + self.r < g.nx && j + self.r < g.ny
+    }
+}
+
+impl Ctx<'_> {
+    /// [`Ctx::sum_occ`] with an interior fast path (no per-offset bounds checks).
+    fn sum_occ_fast(&self, o: &Offs<'_>, i: u32, j: u32, l: u32) -> f32 {
+        let g = self.grid;
+        if !o.interior(g, i, j) {
+            return self.sum_occ(i, j, l, o.list);
+        }
+        let c = g.idx(i, j, l) as usize;
+        let mut s = 0u32;
+        for &d in &o.lin {
+            #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+            {
+                s += u32::from(self.nb[(c as i64 + d) as usize]);
+            }
+        }
+        s += u32::from(self.occ[c]) + u32::from(self.sextra[c]);
+        #[allow(clippy::cast_precision_loss)]
+        let f = s as f32;
+        f
+    }
+
+    /// [`Ctx::sum_hole`] with an interior fast path.
+    fn sum_hole_fast(&self, o: &Offs<'_>, i: u32, j: u32) -> f32 {
+        let g = self.grid;
+        if !o.interior(g, i, j) {
+            return self.sum_hole(i, j);
+        }
+        let c = j as usize * g.nx as usize + i as usize;
+        let mut s = 0u32;
+        for &d in &o.lin {
+            #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+            {
+                s += u32::from(self.hole_occ[(c as i64 + d) as usize]);
+            }
+        }
+        #[allow(clippy::cast_precision_loss)]
+        let f = s as f32;
+        f
+    }
+}
+
 /// Finds a least-cost path from any source to any target, restricted to `ctx.region`
 /// (all layers). `target(n)` returns `Some(heading)` for target nodes, where `heading`
 /// is the direction the route must continue with (bend costs and the no-acute-turn rule
 /// apply to it). Headings are carried through vias, so a via in line with a straight
 /// trace is cheaper than one that also bends. Returns the node sequence source → target.
+///
+/// Search memory is reused per thread (generation-stamped, never cleared); the result is a
+/// pure function of the arguments.
 pub fn astar(
+    ctx: &Ctx<'_>,
+    sources: &[Endpoint],
+    target: &dyn Fn(NodeIdx) -> Option<TargetInfo>,
+    target_box: IBox,
+) -> Option<Vec<NodeIdx>> {
+    SCRATCH.with(|cell| {
+        let mut sc = cell.borrow_mut();
+        let r = astar_in(&mut sc, ctx, sources, target, target_box);
+        if sc.recs.len() > KEEP_RECS {
+            let generation = sc.generation;
+            *sc = Scratch { generation, ..Scratch::default() };
+        }
+        r
+    })
+}
+
+#[allow(clippy::too_many_lines)]
+fn astar_in(
+    sc: &mut Scratch,
     ctx: &Ctx<'_>,
     sources: &[Endpoint],
     target: &dyn Fn(NodeIdx) -> Option<TargetInfo>,
@@ -227,7 +410,26 @@ pub fn astar(
     let (i0, j0, i1, j1) = ctx.region;
     let (w, h) = (i1 - i0 + 1, j1 - j0 + 1);
     let nl = g.nl();
-    let size = w as usize * h as usize * nl as usize;
+    let columns = w as usize * h as usize;
+    let size = columns * nl as usize;
+    if sc.generation == u32::MAX {
+        for r in &mut sc.recs {
+            r.stamp = 0;
+        }
+        sc.vstamp.iter_mut().for_each(|s| *s = 0);
+        sc.generation = 0;
+    }
+    sc.generation += 1;
+    let generation = sc.generation;
+    if sc.recs.len() < size {
+        sc.recs.resize(size, Rec::FRESH);
+    }
+    if sc.vstamp.len() < columns {
+        sc.vstamp.resize(columns, 0);
+        sc.vcong.resize(columns, 0.0);
+    }
+    sc.heap.clear();
+    let Scratch { recs, vstamp, vcong, heap, .. } = sc;
     let local = |n: NodeIdx| -> Option<usize> {
         let (i, j, l) = g.coords(n);
         if i < i0 || i > i1 || j < j0 || j > j1 {
@@ -240,44 +442,54 @@ pub fn astar(
         let (i, r) = (x % w, x / w);
         g.idx(i + i0, r % h + j0, r / h)
     };
-    let mut cost = vec![f32::INFINITY; size];
-    let mut parent = vec![u32::MAX; size];
-    let mut arrive = vec![Arrival::new(None, false); size];
-    let mut closed = vec![false; size];
-    let mut heap: BinaryHeap<Reverse<(u32, u32)>> = BinaryHeap::new();
+    let touch = |recs: &mut [Rec], x: usize| {
+        let r = &mut recs[x];
+        if r.stamp != generation {
+            *r = Rec { stamp: generation, ..Rec::FRESH };
+        }
+    };
+    let key = |c: f32, lx: usize| -> u64 {
+        (u64::from(c.to_bits()) << 32) | u64::from(u32::try_from(lx).unwrap_or(u32::MAX))
+    };
     let mut src_forbid: rustc_hash::FxHashMap<usize, u8> = rustc_hash::FxHashMap::default();
     for s in sources {
         if let Some(ls) = local(s.node) {
             *src_forbid.entry(ls).or_default() |= s.forbid;
-        }
-        if let Some(ls) = local(s.node)
-            && s.cost < cost[ls]
-        {
-            cost[ls] = s.cost;
-            arrive[ls] = Arrival::new(s.heading, false);
-            let (i, j, _) = g.coords(s.node);
-            // A source that is also a target finishes with zero length: its priority must
-            // still include the target's finishing cost (e.g. a kinked stub's penalty).
-            let finish = target(s.node).map_or(0.0, |t| t.cost);
-            heap.push(Reverse((
-                (s.cost + finish + octile(i, j, target_box)).to_bits(),
-                u32::try_from(ls).unwrap_or(u32::MAX),
-            )));
+            touch(recs, ls);
+            if s.cost < recs[ls].cost {
+                recs[ls].cost = s.cost;
+                recs[ls].arrive = Arrival::new(s.heading, false);
+                let (i, j, _) = g.coords(s.node);
+                // A source that is also a target finishes with zero length: its priority must
+                // still include the target's finishing cost (e.g. a kinked stub's penalty).
+                let finish = target(s.node).map_or(0.0, |t| t.cost);
+                heap.push(key(s.cost + finish + octile(i, j, target_box), ls));
+            }
         }
     }
     let costs = ctx.costs;
-    while let Some(Reverse((_, lx))) = heap.pop() {
-        let lx = lx as usize;
-        if closed[lx] {
+    let k_offs = Offs::new(ctx.k_offs, g.nx);
+    let rv_offs = Offs::new(ctx.rv_offs, g.nx);
+    let rh_offs = Offs::new(ctx.rh_offs, g.nx);
+    let has_own = !ctx.own_nodes.is_empty() || !ctx.own_edges.is_empty();
+    while let Some(packed) = heap.pop() {
+        let lx = (packed & 0xffff_ffff) as usize;
+        if recs[lx].closed {
             continue;
         }
-        closed[lx] = true;
-        let n = global(lx);
+        recs[lx].closed = true;
+        let (i, j, l) = {
+            let x = u32::try_from(lx).unwrap_or(u32::MAX);
+            let (c, r) = (x % w, x / w);
+            (c + i0, r % h + j0, r / h)
+        };
+        let n = g.idx(i, j, l);
         // A source that is also a target (zero-length connection, e.g. two pad stubs on
         // one lattice node) only counts if the target's heading is a legal departure.
+        let parent_lx = recs[lx].parent;
         let zero_len_ok = |t: TargetInfo| {
             let hd = t.heading;
-            parent[lx] != u32::MAX
+            parent_lx != u32::MAX
                 || hd.is_none_or(|h| {
                     src_forbid.get(&lx).copied().unwrap_or(0) & (1 << h.index()) == 0
                 })
@@ -285,54 +497,66 @@ pub fn astar(
         if target(n).is_some_and(zero_len_ok) {
             let mut path = vec![n];
             let mut cur = lx;
-            while parent[cur] != u32::MAX {
-                cur = parent[cur] as usize;
+            while recs[cur].parent != u32::MAX {
+                cur = recs[cur].parent as usize;
                 path.push(global(cur));
             }
             path.reverse();
             return Some(path);
         }
-        let (i, j, l) = g.coords(n);
-        let base = cost[lx];
-        let arr = arrive[lx];
+        let base = recs[lx].cost;
+        let arr = recs[lx].arrive;
         let forbid =
-            if parent[lx] == u32::MAX { src_forbid.get(&lx).copied().unwrap_or(0) } else { 0 };
-        let mut relax =
-            |m: NodeIdx, step: f32, next: Arrival, heap: &mut BinaryHeap<Reverse<(u32, u32)>>| {
-                let Some(lm) = local(m) else { return };
-                if closed[lm] {
-                    return;
+            if parent_lx == u32::MAX { src_forbid.get(&lx).copied().unwrap_or(0) } else { 0 };
+        let relax = |recs: &mut [Rec],
+                     heap: &mut MinHeap,
+                     lm: usize,
+                     m: NodeIdx,
+                     (mi, mj): (u32, u32),
+                     step: f32,
+                     next: Arrival| {
+            // Entering a target: charge the turn into its required heading.
+            let exit = match target(m) {
+                Some(t) => {
+                    let turn = match t.heading {
+                        Some(hd) => match turn_cost(&costs, next.heading(), hd) {
+                            Some(x) if next.via() && x > 0.0 => x + costs.via_turn,
+                            Some(x) => x,
+                            None => return,
+                        },
+                        None => 0.0,
+                    };
+                    turn + t.cost
                 }
-                // Entering a target: charge the turn into its required heading.
-                let exit = match target(m) {
-                    Some(t) => {
-                        let turn = match t.heading {
-                            Some(hd) => match turn_cost(&costs, next.heading(), hd) {
-                                Some(x) if next.via() && x > 0.0 => x + costs.via_turn,
-                                Some(x) => x,
-                                None => return,
-                            },
-                            None => 0.0,
-                        };
-                        turn + t.cost
-                    }
-                    None => 0.0,
-                };
-                let c = base + step + exit;
-                if c < cost[lm] {
-                    cost[lm] = c;
-                    parent[lm] = u32::try_from(lx).unwrap_or(u32::MAX);
-                    arrive[lm] = next;
-                    let (mi, mj, _) = g.coords(m);
-                    heap.push(Reverse((
-                        (c + octile(mi, mj, target_box)).to_bits(),
-                        u32::try_from(lm).unwrap_or(u32::MAX),
-                    )));
-                }
+                None => 0.0,
             };
+            let c = base + step + exit;
+            if c < recs[lm].cost {
+                recs[lm].cost = c;
+                recs[lm].parent = u32::try_from(lx).unwrap_or(u32::MAX);
+                recs[lm].arrive = next;
+                heap.push(key(c + octile(mi, mj, target_box), lm));
+            }
+        };
         for d in Dir8::ALL {
-            let Some(m) = g.step(n, d) else { continue };
-            if ctx.own_nodes.contains(&m) || ctx.own_edges.contains(&(n.min(m), n.max(m))) {
+            let (di, dj) = d.delta();
+            let (ni, nj) = (i64::from(i) + i64::from(di), i64::from(j) + i64::from(dj));
+            if ni < i64::from(i0) || nj < i64::from(j0) || ni > i64::from(i1) || nj > i64::from(j1)
+            {
+                // Outside the grid or the search window: never relaxed.
+                continue;
+            }
+            #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+            let (mi, mj) = (ni as u32, nj as u32);
+            let m = g.idx(mi, mj, l);
+            let lm = ((l * h + (mj - j0)) * w + (mi - i0)) as usize;
+            touch(recs, lm);
+            if recs[lm].closed {
+                continue;
+            }
+            if has_own
+                && (ctx.own_nodes.contains(&m) || ctx.own_edges.contains(&(n.min(m), n.max(m))))
+            {
                 continue;
             }
             if forbid & (1 << d.index()) != 0
@@ -345,33 +569,46 @@ pub fn astar(
             if arr.via() && bend > 0.0 {
                 bend += costs.via_turn;
             }
-            let (mi, mj, _) = g.coords(m);
-            let mut cong = ctx.sum_occ(mi, mj, l, ctx.k_offs);
+            if !recs[lm].has_cong {
+                recs[lm].cong = ctx.sum_occ_fast(&k_offs, mi, mj, l);
+                recs[lm].has_cong = true;
+            }
+            let mut cong = recs[lm].cong;
             let len = if d.is_diagonal() {
-                let (di, dj) = d.delta();
-                let s1 = g.idx(i.wrapping_add_signed(di), j, l);
-                let s2 = g.idx(i, j.wrapping_add_signed(dj), l);
+                let s1 = g.idx(mi, j, l);
+                let s2 = g.idx(i, mj, l);
                 cong += f32::from(ctx.occ[s1 as usize]) + f32::from(ctx.occ[s2 as usize]);
                 std::f32::consts::SQRT_2
             } else {
                 1.0
             };
             let step = len * (1.0 + ctx.hist[m as usize]) * (1.0 + ctx.pres_fac * cong) + bend;
-            relax(m, step, Arrival::new(Some(d), false), &mut heap);
+            relax(recs, heap, lm, m, (mi, mj), step, Arrival::new(Some(d), false));
         }
-        if !arr.via() && nl > 1 && allows(ctx.leg.via[g.planar(n) as usize], ctx.net) {
-            let mut cong = ctx.sum_hole(i, j);
-            for ll in 0..nl {
-                cong += ctx.sum_occ(i, j, ll, ctx.rv_offs);
+        if !arr.via() && nl > 1 && allows(ctx.leg.via[(j * g.nx + i) as usize], ctx.net) {
+            let col = ((j - j0) * w + (i - i0)) as usize;
+            if vstamp[col] != generation {
+                let mut cong = ctx.sum_hole_fast(&rh_offs, i, j);
+                for ll in 0..nl {
+                    cong += ctx.sum_occ_fast(&rv_offs, i, j, ll);
+                }
+                vstamp[col] = generation;
+                vcong[col] = cong;
             }
+            let cong = vcong[col];
             for ll in (0..nl).filter(|&x| x != l) {
                 let m = g.idx(i, j, ll);
                 if !allows(ctx.leg.node[m as usize], ctx.net) || ctx.own_nodes.contains(&m) {
                     continue;
                 }
+                let lm = ((ll * h + (j - j0)) * w + (i - i0)) as usize;
+                touch(recs, lm);
+                if recs[lm].closed {
+                    continue;
+                }
                 let step = costs.via * (1.0 + ctx.hist[m as usize]) * (1.0 + ctx.pres_fac * cong);
                 // The heading survives the via: turning right after it costs a bend.
-                relax(m, step, Arrival::new(arr.heading(), true), &mut heap);
+                relax(recs, heap, lm, m, (i, j), step, Arrival::new(arr.heading(), true));
             }
         }
     }
@@ -436,5 +673,81 @@ mod tests {
         assert_eq!(turn_cost(&c, Some(Dir8::E), Dir8::N), Some(1.0));
         assert_eq!(turn_cost(&c, Some(Dir8::E), Dir8::NW), None);
         assert_eq!(stub_penalty(&c, 1, true), 20.3);
+    }
+
+    /// Search memory is reused per thread: results must not depend on what ran before, and
+    /// the heap must pop in key order.
+    #[test]
+    fn scratch_reuse_and_heap_do_not_change_results() {
+        use crate::legality::{ClassLegality, FREE};
+        use ferroute_board::LayerId;
+        use ferroute_geom::{Point, Rect};
+        let grid = Grid::covering(
+            Rect::new(Point::new(0, 0), Point::new(30_000, 30_000)),
+            1_000,
+            vec![LayerId(0), LayerId(1)],
+        );
+        let len = grid.len();
+        let leg = ClassLegality {
+            node: vec![FREE; len],
+            edge: vec![FREE; len * 4],
+            via: vec![FREE; grid.plane()],
+        };
+        let zeros16 = vec![0u16; len];
+        let zeros_plane = vec![0u16; grid.plane()];
+        let hist = vec![0.0f32; len];
+        let (k, rv, rh) = (ball(1), ball(1), ball(1));
+        let none_nodes = rustc_hash::FxHashSet::default();
+        let none_edges = rustc_hash::FxHashSet::default();
+        let ctx = |region: IBox| Ctx {
+            grid: &grid,
+            leg: &leg,
+            occ: &zeros16,
+            nb: &zeros16,
+            sextra: &zeros16,
+            own_nodes: &none_nodes,
+            own_edges: &none_edges,
+            hole_occ: &zeros_plane,
+            hist: &hist,
+            pres_fac: 1.0,
+            costs: base(),
+            net: NetId(3),
+            region,
+            k_offs: &k,
+            rv_offs: &rv,
+            rh_offs: &rh,
+        };
+        let (a, b) = (grid.idx(2, 3, 0), grid.idx(20, 11, 1));
+        let src = [Endpoint { node: a, heading: None, forbid: 0, cost: 0.0 }];
+        let target = move |n: NodeIdx| (n == b).then_some(TargetInfo { heading: None, cost: 0.0 });
+        let tbox = (20, 11, 20, 11);
+        let first = astar(&ctx((0, 0, 30, 30)), &src, &target, tbox).expect("path");
+        // A bigger and a smaller search in between leave stale records behind.
+        let other = Endpoint { node: grid.idx(1, 1, 1), heading: None, forbid: 0, cost: 0.0 };
+        let far = grid.idx(29, 29, 0);
+        let tfar = move |n: NodeIdx| (n == far).then_some(TargetInfo { heading: None, cost: 0.0 });
+        assert!(astar(&ctx((0, 0, 30, 30)), &[other], &tfar, (29, 29, 29, 29)).is_some());
+        assert!(astar(&ctx((0, 0, 8, 8)), &[other], &tfar, (29, 29, 29, 29)).is_none());
+        let again = astar(&ctx((0, 0, 30, 30)), &src, &target, tbox).expect("path");
+        assert_eq!(first, again);
+        assert_eq!((first[0], first[first.len() - 1]), (a, b));
+
+        let mut h = MinHeap::default();
+        let mut x = 0x9E37_79B9_7F4A_7C15u64;
+        let mut keys = Vec::new();
+        for _ in 0..2000 {
+            x = x.wrapping_mul(6_364_136_223_846_793_005).wrapping_add(1_442_695_040_888_963_407);
+            keys.push(x >> 20);
+            h.push(x >> 20);
+            if keys.len() % 3 == 0 {
+                keys.sort_unstable();
+                assert_eq!(h.pop(), Some(keys.remove(0)));
+            }
+        }
+        keys.sort_unstable();
+        for k in keys {
+            assert_eq!(h.pop(), Some(k));
+        }
+        assert_eq!(h.pop(), None);
     }
 }

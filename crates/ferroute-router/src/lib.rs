@@ -282,7 +282,9 @@ pub fn pad_islands_with_planes(board: &Board) -> (Vec<Vec<Vec<PadId>>>, Vec<Vec<
 /// # Errors
 /// [`RouteError`] for invalid boards or impossible lattices.
 pub fn route(board: &Board, cfg: &RouterConfig) -> Result<RouteOutcome, RouteError> {
-    let mut best = route_once(board, cfg)?;
+    // Lattice, links and legality do not depend on the net order: built once for all rounds.
+    let prep = prepare(board, cfg)?;
+    let mut best = route_prepared(&prep, cfg)?;
     let mut best_q = detour::quality(board, &best);
     let mut run = 0u32;
     for _ in 0..cfg.order_rounds {
@@ -294,7 +296,7 @@ pub fn route(board: &Board, cfg: &RouterConfig) -> Result<RouteOutcome, RouteErr
         run += 1;
         let extra: Vec<NetId> = cfg.first.iter().copied().filter(|n| !first.contains(n)).collect();
         first.extend(extra);
-        let cand = route_once(board, &RouterConfig { first, ..cfg.clone() })?;
+        let cand = route_prepared(&prep, &RouterConfig { first, ..cfg.clone() })?;
         let q = detour::quality(board, &cand);
         if q.improves_on(&best_q) {
             best = cand;
@@ -315,11 +317,41 @@ pub fn route(board: &Board, cfg: &RouterConfig) -> Result<RouteOutcome, RouteErr
     Ok(best)
 }
 
+/// The part of a routing pass that depends only on the board and the board-level settings
+/// (`pitch`, `layers`, `nets`, `accel`) — not on the net order: lattice, pair stage, direct
+/// links and the exact legality tables. Reusable across passes that differ only in order.
+#[derive(Debug)]
+pub struct Prepared {
+    grid: Grid,
+    plan: Plan,
+    pitch: Coord,
+    stage: diffpair::PairStage,
+    pair_tracks: Vec<ferroute_board::Track>,
+    /// The input board with the pair stage's copper added (`original` of the pass).
+    pre: Board,
+    /// `pre` plus the direct links.
+    work: Board,
+    links: Vec<direct::Link>,
+    taken: Vec<(PadId, ferroute_geom::Dir8)>,
+    obs: Obstacles,
+    legal: Vec<ClassLegality>,
+    accel_name: String,
+    legality_ms: f64,
+}
+
 /// One routing pass with the net order given by `cfg.first`, then HPWL and seed.
 ///
 /// # Errors
 /// [`RouteError`] for invalid boards or impossible lattices.
 pub fn route_once(board: &Board, cfg: &RouterConfig) -> Result<RouteOutcome, RouteError> {
+    route_prepared(&prepare(board, cfg)?, cfg)
+}
+
+/// Builds the order-independent part of a routing pass (see [`Prepared`]).
+///
+/// # Errors
+/// [`RouteError`] for invalid boards or impossible lattices.
+pub fn prepare(board: &Board, cfg: &RouterConfig) -> Result<Prepared, RouteError> {
     board.validate().map_err(|e| RouteError::InvalidBoard(e.to_string()))?;
     let layers: Vec<_> = (0..board.layer_count())
         .map(ferroute_board::LayerId)
@@ -342,7 +374,6 @@ pub fn route_once(board: &Board, cfg: &RouterConfig) -> Result<RouteOutcome, Rou
     let t0 = Instant::now();
     // Differential pairs first, as coupled units; their copper is fixed for everything else.
     let stage = diffpair::route_pairs(board, &grid.layers, pitch, cfg.nets.as_deref());
-    let board_pairs = &board.diff_pairs;
     let pair_tracks = stage.tracks();
     let pair_nets = stage.nets(board);
     let mut pre = board.clone();
@@ -362,12 +393,11 @@ pub fn route_once(board: &Board, cfg: &RouterConfig) -> Result<RouteOutcome, Rou
     );
     // Only the requested nets get links (the rest is fixed copper of the caller); coupled
     // pairs are already connected.
-    let mut links: Vec<direct::Link> = links
+    let links: Vec<direct::Link> = links
         .into_iter()
         .filter(|l| cfg.nets.as_ref().is_none_or(|v| v.contains(&l.track.net)))
         .filter(|l| !pair_nets.contains(&l.track.net))
         .collect();
-    let original = board;
     let mut work = board.clone();
     work.tracks.extend(links.iter().map(|l| ferroute_board::Track {
         origin: ferroute_board::Origin::Existing,
@@ -391,7 +421,48 @@ pub fn route_once(board: &Board, cfg: &RouterConfig) -> Result<RouteOutcome, Rou
         }
     }
     let legality_ms = t0.elapsed().as_secs_f64() * 1e3;
+    Ok(Prepared {
+        grid,
+        plan,
+        pitch,
+        stage,
+        pair_tracks,
+        pre,
+        work,
+        links,
+        taken,
+        obs,
+        legal,
+        accel_name,
+        legality_ms,
+    })
+}
 
+/// Routes with the prepared tables; `cfg` must agree with the one given to [`prepare`] on
+/// `pitch`, `layers`, `nets` and `accel` (net order, costs and iteration limits are free).
+///
+/// # Errors
+/// [`RouteError`] for invalid boards or impossible lattices.
+#[allow(clippy::too_many_lines)]
+pub fn route_prepared(prep: &Prepared, cfg: &RouterConfig) -> Result<RouteOutcome, RouteError> {
+    let Prepared {
+        grid,
+        plan,
+        pitch,
+        stage,
+        pair_tracks,
+        pre: original,
+        work: board,
+        taken,
+        obs,
+        legal,
+        accel_name,
+        legality_ms,
+        ..
+    } = prep;
+    let (pitch, legality_ms) = (*pitch, *legality_ms);
+    let board_pairs = &original.diff_pairs;
+    let mut links = prep.links.clone();
     // Jobs.
     let base_costs = Costs {
         via: cfg.via_cost,
@@ -419,7 +490,7 @@ pub fn route_once(board: &Board, cfg: &RouterConfig) -> Result<RouteOutcome, Rou
             Vec::new()
         } else {
             let centres: Vec<_> = groups.iter().flatten().map(|&p| board.pad_position(p)).collect();
-            plane::plane_terminals(&grid, &legal[class], &cp.geom, net, &fills, &centres)
+            plane::plane_terminals(grid, &legal[class], &cp.geom, net, &fills, &centres)
         };
         let plane_island = !plane_terms.is_empty() && !on_plane.iter().any(|&b| b);
         if groups.len() + usize::from(plane_island) < 2 {
@@ -432,11 +503,11 @@ pub fn route_once(board: &Board, cfg: &RouterConfig) -> Result<RouteOutcome, Rou
                 let first = stubs.len();
                 ts.extend(pad_terminals(
                     board,
-                    &grid,
-                    &obs,
+                    grid,
+                    obs,
                     &legal[class],
                     cp,
-                    &plan,
+                    plan,
                     net,
                     pad,
                     &mut stubs,
@@ -450,11 +521,11 @@ pub fn route_once(board: &Board, cfg: &RouterConfig) -> Result<RouteOutcome, Rou
                 if cfg.via_in_pad {
                     ts.extend(access::via_terminals(
                         board,
-                        &grid,
-                        &obs,
+                        grid,
+                        obs,
                         &legal[class],
                         cp,
-                        &plan,
+                        plan,
                         net,
                         pad,
                         &mut stubs,
@@ -501,16 +572,8 @@ pub fn route_once(board: &Board, cfg: &RouterConfig) -> Result<RouteOutcome, Rou
         margin: cfg.margin,
     };
     let t1 = Instant::now();
-    let (routes, nstats) = negotiate(
-        &grid,
-        &legal,
-        &plan,
-        &jobs,
-        &stubs,
-        &access::stub_conflicts(&stubs),
-        &ncfg,
-        &order,
-    );
+    let (routes, nstats) =
+        negotiate(grid, legal, plan, &jobs, &stubs, &access::stub_conflicts(&stubs), &ncfg, &order);
     let negotiation_ms = t1.elapsed().as_secs_f64() * 1e3;
 
     // Emit + final DRC gate.
@@ -520,7 +583,7 @@ pub fn route_once(board: &Board, cfg: &RouterConfig) -> Result<RouteOutcome, Rou
             .zip(&routes)
             .map(|(job, r)| {
                 let (t, v) =
-                    emit::emit(board, &grid, &stubs, job.net, &plan.classes[job.class].geom, r);
+                    emit::emit(board, grid, &stubs, job.net, &plan.classes[job.class].geom, r);
                 (job.net, t, v, r.complete)
             })
             .collect();
@@ -613,7 +676,7 @@ pub fn route_once(board: &Board, cfg: &RouterConfig) -> Result<RouteOutcome, Rou
     };
     // Coupled pairs are emitted exactly as built: the gridless passes above only saw them
     // as fixed obstacles (they are Existing copper of `original`).
-    edit.new_tracks.splice(0..0, pair_tracks);
+    edit.new_tracks.splice(0..0, pair_tracks.iter().cloned());
     let stats = RouteStats {
         pitch,
         grid: (grid.nx, grid.ny, grid.nl()),
@@ -631,7 +694,7 @@ pub fn route_once(board: &Board, cfg: &RouterConfig) -> Result<RouteOutcome, Rou
         via_jogs,
         wirelength_nm: edit.new_tracks.iter().map(|t| t.start.dist(t.end)).sum::<f64>() + 0.0,
         negotiation: nstats,
-        accel_backend: accel_name,
+        accel_backend: accel_name.clone(),
         drc_gate_rips: gate_rips,
         order_rounds_run: 0,
         lns_rounds_run: 0,

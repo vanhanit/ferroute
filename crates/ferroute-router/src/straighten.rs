@@ -196,6 +196,11 @@ pub(crate) struct Statics<'a> {
     pub(crate) reach: Coord,
     /// Stored copper-pour fills (other-net fills are obstacles).
     pub(crate) fills: Vec<ferroute_drc::zones::FillPoly<'a>>,
+    /// Index of the first edit via among `items` / `holes`.
+    via_item0: usize,
+    via_hole0: usize,
+    /// Edit via hidden from every query (see [`Statics::hide_via`]).
+    hidden: Option<(u32, u32)>,
 }
 
 /// The segment window being replaced and what is exempt from the same-net checks.
@@ -249,6 +254,7 @@ impl Chain {
 impl<'a> Statics<'a> {
     pub(crate) fn new(base: &'a Board, edit: &BoardEdit) -> Self {
         let mut items = copper_items(base);
+        let via_item0 = items.len();
         let nv = base.vias.len();
         for (k, v) in edit.new_vias.iter().enumerate() {
             let hull = v.hull();
@@ -291,20 +297,68 @@ impl<'a> Statics<'a> {
                 pads_at.entry(base.pad_position(id)).or_default().push(id);
             }
         }
-        for v in base.vias.iter().chain(&edit.new_vias) {
+        for v in &base.vias {
+            holes.push(Hole { hull: Hull::disk(v.pos, v.drill / 2), net: v.net });
+        }
+        let via_hole0 = holes.len();
+        for v in &edit.new_vias {
             holes.push(Hole { hull: Hull::disk(v.pos, v.drill / 2), net: v.net });
         }
         let hole_boxes: Vec<Rect> = holes.iter().map(|h| h.hull.bbox()).collect();
         let hole_grid = BucketGrid::new(&hole_boxes, CELL);
         let reach = base.rules.max_clearance().max(base.rules.hole_clearance);
         let fills = ferroute_drc::zones::obstacle_fills(base);
-        Self { base, items, boxes, grid, holes, hole_boxes, hole_grid, pads_at, reach, fills }
+        Self {
+            base,
+            items,
+            boxes,
+            grid,
+            holes,
+            hole_boxes,
+            hole_grid,
+            pads_at,
+            reach,
+            fills,
+            via_item0,
+            via_hole0,
+            hidden: None,
+        }
+    }
+
+    /// Hides edit via `k` from all queries: the same answers as a `Statics` built from an
+    /// edit without that via (item order inside a query may differ; every consumer is
+    /// order-independent).
+    pub(crate) fn hide_via(&mut self, k: usize) {
+        let id = |base: usize| u32::try_from(base + k).unwrap_or(u32::MAX);
+        self.hidden = Some((id(self.via_item0), id(self.via_hole0)));
+    }
+
+    pub(crate) fn unhide(&mut self) {
+        self.hidden = None;
+    }
+
+    /// Indices of static items whose box meets `r`.
+    pub(crate) fn query_items(&self, r: Rect) -> Vec<u32> {
+        let mut v = self.grid.query(r, &self.boxes);
+        if let Some((item, _)) = self.hidden {
+            v.retain(|&k| k != item);
+        }
+        v
+    }
+
+    /// Indices of holes whose box meets `r`.
+    pub(crate) fn query_holes(&self, r: Rect) -> Vec<u32> {
+        let mut v = self.hole_grid.query(r, &self.hole_boxes);
+        if let Some((_, hole)) = self.hidden {
+            v.retain(|&k| k != hole);
+        }
+        v
     }
 
     pub(crate) fn static_near(&self, a: Point, b: Point, margin: Coord) -> Vec<u32> {
         let mut v = Vec::new();
         for r in pieces(a, b, margin) {
-            v.extend(self.grid.query(r, &self.boxes));
+            v.extend(self.query_items(r));
         }
         v.sort_unstable();
         v.dedup();
@@ -321,7 +375,7 @@ impl<'a> Statics<'a> {
         }) {
             return true;
         }
-        self.grid.query(Rect::new(p, p).inflate(1), &self.boxes).into_iter().any(|k| {
+        self.query_items(Rect::new(p, p).inflate(1)).into_iter().any(|k| {
             let it = &self.items[k as usize];
             same_net(it.net, net)
                 && it.layers.contains(layer)
@@ -346,7 +400,7 @@ impl<'a> Statics<'a> {
     fn incident(&self, dynamic: &Dynamic, w: &Window<'_>, p: Point) -> Vec<Point> {
         let mut out = Vec::new();
         let at = Rect::new(p, p).inflate(1);
-        for k in self.grid.query(at, &self.boxes) {
+        for k in self.query_items(at) {
             let it = &self.items[k as usize];
             if matches!(it.item, ItemRef::Track(_))
                 && same_net(it.net, w.net)
@@ -423,7 +477,7 @@ impl<'a> Statics<'a> {
             let hc = base.rules.hole_clearance;
             let mut hv = Vec::new();
             for r in pieces(a, b, width / 2 + hc + 1) {
-                hv.extend(self.hole_grid.query(r, &self.hole_boxes));
+                hv.extend(self.query_holes(r));
             }
             hv.sort_unstable();
             hv.dedup();
@@ -651,7 +705,7 @@ impl<'a> Statics<'a> {
                     frozen.insert(k);
                     continue;
                 }
-                let hit = self.grid.query(bb.inflate(1), &self.boxes).into_iter().any(|m| {
+                let hit = self.query_items(bb.inflate(1)).into_iter().any(|m| {
                     let it = &self.items[m as usize];
                     same_net(it.net, net)
                         && it.layers.contains(layer)

@@ -13,11 +13,12 @@
 
 use crate::detour;
 use crate::plan::default_pitch;
-use crate::{RouteError, RouteOutcome, RouterConfig, route_once, splitmix64};
+use crate::{RouteError, RouteOutcome, RouterConfig, prepare, route_prepared, splitmix64};
 use ferroute_board::{ArcTrack, Board, BoardEdit, NetId, Origin, PadId, Track, Via};
 use ferroute_drc::{DrcConfig, check, quality};
 use ferroute_geom::rng::Rng;
 use ferroute_geom::{Coord, Point, Rect};
+use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeSet;
 
@@ -313,15 +314,16 @@ fn replan(
         return Ok(None);
     }
     let fixed = fixed_board(board, &cur.edit, hood);
-    for order in orders(board, cur, hood) {
-        let sub = RouterConfig {
-            nets: Some(hood.to_vec()),
-            first: order,
-            order_rounds: 0,
-            lns: LnsConfig { rounds: 0, ..cfg.lns },
-            ..cfg.clone()
-        };
-        let cand = route_once(&fixed, &sub)?;
+    let sub = RouterConfig {
+        nets: Some(hood.to_vec()),
+        order_rounds: 0,
+        lns: LnsConfig { rounds: 0, ..cfg.lns },
+        ..cfg.clone()
+    };
+    // Legality, lattice and direct links depend only on `fixed`: built once for all orders.
+    let prep = prepare(&fixed, &sub)?;
+    let eval = |order: &Vec<NetId>| -> Result<Option<Accepted>, RouteError> {
+        let cand = route_prepared(&prep, &RouterConfig { first: order.clone(), ..sub.clone() })?;
         let out_hood = |n: NetId| !hood.contains(&n);
         let mut edit = BoardEdit {
             moves: cur.edit.moves.clone(),
@@ -339,11 +341,11 @@ fn replan(
         failed.dedup();
         let m = measure(board, &edit, &failed);
         if !m.improves_on(cur_m) {
-            continue;
+            return Ok(None);
         }
-        let Some(g) = gate(board, &edit) else { continue };
+        let Some(g) = gate(board, &edit) else { return Ok(None) };
         if g.missing > cur_gate.missing || g.acute > cur_gate.acute {
-            continue;
+            return Ok(None);
         }
         let old_failed_in_hood = cur.failed.iter().filter(|n| hood.contains(n)).count();
         let mut out = cur.clone();
@@ -353,7 +355,20 @@ fn replan(
             .saturating_sub(hood.len().saturating_sub(old_failed_in_hood));
         out.stats.nets_failed = out.failed.len();
         out.stats.drc_gate_rips += cand.stats.drc_gate_rips;
-        return Ok(Some(Accepted { out, metrics: m, gate: g }));
+        Ok(Some(Accepted { out, metrics: m, gate: g }))
+    };
+    // Each order is an independent pure evaluation: chunks run in parallel, but the first
+    // accepted order *in sequence* wins, so the result never depends on the thread count.
+    let tries = orders(board, cur, hood);
+    let chunk = rayon::current_num_threads().max(1);
+    for batch in tries.chunks(chunk) {
+        let results: Vec<Result<Option<Accepted>, RouteError>> =
+            batch.par_iter().map(&eval).collect();
+        for r in results {
+            if let Some(acc) = r? {
+                return Ok(Some(acc));
+            }
+        }
     }
     Ok(None)
 }

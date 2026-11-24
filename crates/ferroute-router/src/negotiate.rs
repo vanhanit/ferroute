@@ -454,7 +454,12 @@ fn route_one(
             })
         };
         searches += 1;
-        let Some(path) = astar(&ctx, &sources, &target, tbox) else {
+        // The target set is fixed during one search: evaluate it once per terminal node
+        // (`target` is pure) instead of on every relaxation.
+        let tmap: FxHashMap<NodeIdx, TargetInfo> =
+            term_of.keys().filter_map(|&n| target(n).map(|t| (n, t))).collect();
+        let target_now = |n: NodeIdx| tmap.get(&n).copied();
+        let Some(path) = astar(&ctx, &sources, &target_now, tbox) else {
             break;
         };
         let (start, end) = (path[0], path[path.len() - 1]);
