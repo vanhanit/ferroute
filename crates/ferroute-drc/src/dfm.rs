@@ -14,7 +14,7 @@
 
 use crate::{BucketGrid, CopperItem, ItemRef, copper_items, idx};
 use ferroute_board::custom::{ItemCtx, ItemType};
-use ferroute_board::{Board, NetId, PadShape};
+use ferroute_board::{Board, NetId, PadShape, ViaKind};
 use ferroute_geom::units::format_mm;
 use ferroute_geom::{Coord, Hull, Point, Rect};
 use serde::{Deserialize, Serialize};
@@ -28,6 +28,11 @@ pub struct DfmConfig {
     pub max_aspect_milli: u32,
     /// Minimum plated drill diameter (nm).
     pub min_drill: Coord,
+    /// Maximum aspect ratio of a microvia in thousandths (1 000 = 1:1; the dielectric it
+    /// crosses divided by its drill).
+    pub max_aspect_micro_milli: u32,
+    /// Minimum microvia (laser) drill diameter (nm).
+    pub min_micro_drill: Coord,
     /// Minimum copper edge to NPTH hole edge distance (nm).
     pub npth_clearance: Coord,
 }
@@ -38,6 +43,8 @@ impl Default for DfmConfig {
             min_annular: 130_000,
             max_aspect_milli: 10_000,
             min_drill: 200_000,
+            max_aspect_micro_milli: 1_000,
+            min_micro_drill: 100_000,
             npth_clearance: 250_000,
         }
     }
@@ -143,43 +150,76 @@ pub fn check(board: &Board, cfg: &DfmConfig) -> Vec<DfmIssue> {
             cfg.min_annular
         }
     };
-    let mut hole = |item: ItemRef, at: Point, drill: Coord, ring: Option<(Coord, Coord)>, t| {
-        if let Some((actual, required)) = ring.filter(|&(a, r)| a < r) {
-            out.push(DfmIssue { kind: DfmKind::AnnularRing { actual, required }, item, at });
-        }
-        if drill < cfg.min_drill {
-            out.push(DfmIssue {
-                kind: DfmKind::MinDrill { actual: drill, required: cfg.min_drill },
-                item,
-                at,
-            });
-        }
-        if aspect_exceeds(t, drill, cfg.max_aspect_milli) {
-            out.push(DfmIssue {
-                kind: DfmKind::AspectRatio {
-                    actual_milli: aspect_milli(t, drill),
-                    max_milli: cfg.max_aspect_milli,
-                },
-                item,
-                at,
-            });
-        }
-    };
+    let mut hole =
+        |item: ItemRef, at: Point, drill: Coord, ring: Option<(Coord, Coord)>, t, micro: bool| {
+            let (min_drill, max_aspect) = if micro {
+                (cfg.min_micro_drill, cfg.max_aspect_micro_milli)
+            } else {
+                (cfg.min_drill, cfg.max_aspect_milli)
+            };
+            if let Some((actual, required)) = ring.filter(|&(a, r)| a < r) {
+                out.push(DfmIssue { kind: DfmKind::AnnularRing { actual, required }, item, at });
+            }
+            if drill < min_drill {
+                out.push(DfmIssue {
+                    kind: DfmKind::MinDrill { actual: drill, required: min_drill },
+                    item,
+                    at,
+                });
+            }
+            if aspect_exceeds(t, drill, max_aspect) {
+                out.push(DfmIssue {
+                    kind: DfmKind::AspectRatio {
+                        actual_milli: aspect_milli(t, drill),
+                        max_milli: max_aspect,
+                    },
+                    item,
+                    at,
+                });
+            }
+        };
     for id in board.pad_ids() {
         let pad = board.pad(id);
         let Some(d) = pad.drill.filter(|d| d.plated) else { continue };
         let ring = pad_min_dimension(&pad.shape)
             .map(|m| ((m - d.diameter) / 2, required_ring(pad.net, ItemType::Pad)));
-        hole(ItemRef::Pad(id), board.pad_position(id), d.diameter, ring, full);
+        hole(ItemRef::Pad(id), board.pad_position(id), d.diameter, ring, full, false);
     }
     let spans = i64::from(board.layer_count().saturating_sub(1)).max(1);
     for (i, v) in board.vias.iter().enumerate() {
         let n = i64::try_from(v.layers.iter().count()).unwrap_or(1).saturating_sub(1).max(1);
         let ring = ((v.diameter - v.drill) / 2, required_ring(v.net, ItemType::Via));
-        hole(ItemRef::Via(idx(i)), v.pos, v.drill, Some(ring), full * n / spans);
+        // Through-style vias scale the board thickness with the gaps they span; typed
+        // blind / buried / micro vias use the real dielectrics they cross when known.
+        let depth = if v.kind == ViaKind::Through {
+            full * n / spans
+        } else {
+            span_depth(board, v).unwrap_or(full * n / spans)
+        };
+        hole(ItemRef::Via(idx(i)), v.pos, v.drill, Some(ring), depth, v.kind == ViaKind::Micro);
     }
     out.extend(npth_copper(board, cfg));
     out
+}
+
+/// Dielectric (plus inner copper) thickness a non-through via crosses, from the stack-up
+/// detail; `None` when the board file gave none.
+fn span_depth(board: &Board, v: &ferroute_board::Via) -> Option<Coord> {
+    let ids: Vec<_> = v.layers.iter().collect();
+    let (lo, hi) = (ids.first()?.0, ids.last()?.0);
+    let st = &board.stackup;
+    if st.dielectrics.is_empty() {
+        return None;
+    }
+    let diel: Coord = st
+        .dielectrics
+        .iter()
+        .filter(|d| d.between.0.0 >= lo && d.between.1.0 <= hi)
+        .map(|d| d.thickness)
+        .sum();
+    let inner: Coord =
+        (lo + 1..hi).filter_map(|l| st.copper_thickness.get(usize::from(l)).copied()).sum();
+    Some(diel + inner)
 }
 
 fn npth_copper(board: &Board, cfg: &DfmConfig) -> Vec<DfmIssue> {
@@ -308,6 +348,39 @@ mod tests {
             kinds(&board, &cfg),
             vec![DfmKind::AspectRatio { actual_milli: 20_000, max_milli: 10_000 }]
         );
+    }
+
+    #[test]
+    fn microvia_has_its_own_drill_minimum_and_aspect_limit() {
+        use ferroute_board::{LayerId, LayerSet, ViaKind};
+        let mut b = BoardBuilder::new(mm(20), mm(20), 4);
+        let n = b.net("N");
+        b.via(pt10(100, 100), 300_000, 100_000, n, Origin::Routed);
+        let mut board = b.build();
+        board.stackup.board_thickness = 1_600_000;
+        board.vias[0].kind = ViaKind::Micro;
+        board.vias[0].layers = LayerSet::span(LayerId(0), LayerId(1));
+        let cfg = DfmConfig { min_annular: 0, ..DfmConfig::default() };
+        // 0.1 mm laser drill is fine for a microvia; one gap = 1.6/3 mm → 5.33:1 > 1:1
+        // without real dielectric data.
+        assert_eq!(
+            kinds(&board, &cfg),
+            vec![DfmKind::AspectRatio { actual_milli: 5_333, max_milli: 1_000 }]
+        );
+        // With the dielectric known (0.1 mm prepreg) the microvia is 1:1.
+        board.stackup.dielectrics = vec![ferroute_board::constraints::Dielectric {
+            thickness: 100_000,
+            epsilon_r_milli: 4_000,
+            between: (LayerId(0), LayerId(1)),
+        }];
+        assert!(kinds(&board, &cfg).is_empty());
+        let strict = DfmConfig { max_aspect_micro_milli: 800, ..cfg };
+        assert_eq!(
+            kinds(&board, &strict),
+            vec![DfmKind::AspectRatio { actual_milli: 1_000, max_milli: 800 }]
+        );
+        board.vias[0].drill = 80_000;
+        assert!(kinds(&board, &strict).iter().any(|k| matches!(k, DfmKind::MinDrill { .. })));
     }
 
     #[test]

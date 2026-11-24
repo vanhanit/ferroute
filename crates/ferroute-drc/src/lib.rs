@@ -19,7 +19,9 @@
 //! via size, and connectivity (unrouted connections + completion ratio).
 
 use ferroute_board::custom::{ConstraintKind, ItemCtx, ItemType};
-use ferroute_board::{Board, FootprintId, LayerId, LayerSet, NetId, Origin, PadId, Side};
+use ferroute_board::{
+    Board, FootprintId, LayerId, LayerSet, NetId, Origin, PadId, Side, Via, ViaKind,
+};
 use ferroute_geom::{Coord, Hull, Point, Rect};
 use rayon::prelude::*;
 use rustc_hash::FxHashMap;
@@ -82,6 +84,9 @@ pub enum ViolationKind {
     ViaDrill,
     /// Via / pad annular ring narrower than a custom `annular_width` rule.
     AnnularWidth,
+    /// A via whose copper span does not fit its kind (e.g. a micro via over more than two
+    /// adjacent layers, a blind via with both ends on outer layers).
+    ViaSpan,
 }
 
 /// Reference to a board item.
@@ -508,6 +513,8 @@ fn check_edges(board: &Board, items: &[CopperItem]) -> Vec<Violation> {
 struct Hole {
     item: ItemRef,
     hull: Hull,
+    /// Copper layers the hole passes through (a blind via's hole ends at its span).
+    layers: LayerSet,
     net: NetId,
     introduced: bool,
 }
@@ -522,6 +529,7 @@ fn holes(board: &Board, items: &[CopperItem]) -> Vec<Hole> {
             v.push(Hole {
                 item: ItemRef::Pad(id),
                 hull: Hull::disk(board.pad_position(id), d.diameter / 2),
+                layers: board.all_layers(),
                 net: pad.net,
                 introduced: moved,
             });
@@ -532,6 +540,7 @@ fn holes(board: &Board, items: &[CopperItem]) -> Vec<Hole> {
         v.push(Hole {
             item: ItemRef::Via(u32::try_from(i).unwrap_or(u32::MAX)),
             hull: Hull::disk(via.pos, via.drill / 2),
+            layers: via.layers,
             net: via.net,
             introduced: via.origin == Origin::Routed,
         });
@@ -568,7 +577,10 @@ fn check_holes(board: &Board, items: &[CopperItem]) -> Vec<Violation> {
         let reach = r.hole_clearance.max(r.max_custom_min(ConstraintKind::HoleClearance));
         for k in cg.query(h.hull.bbox().inflate(reach + 1), &cb) {
             let it = &items[k as usize];
-            if it.item == h.item || (it.net == h.net && it.net != NetId::NONE) {
+            if it.item == h.item
+                || (it.net == h.net && it.net != NetId::NONE)
+                || !it.layers.intersects(h.layers)
+            {
                 continue;
             }
             let req = if r.custom.is_empty() {
@@ -711,11 +723,26 @@ fn check_sizes(board: &Board) -> Vec<Violation> {
         if let Some(l) = v.layers.iter().next() {
             ctx = ctx.on(l);
         }
-        let (min_d, min_drill) = if custom {
+        let (min_d, min_drill) = if v.kind == ViaKind::Micro {
+            // Microvias are laser drilled: they have their own (smaller) minimum sizes.
+            (r.min_microvia_diameter, r.min_microvia_drill)
+        } else if custom {
             (r.min_via_diameter_for(board, &ctx), r.min_hole_size_for(board, &ctx))
         } else {
             (r.min_via_diameter, r.min_via_drill)
         };
+        if !span_fits_kind(v, board.layer_count()) {
+            out.push(Violation {
+                kind: ViolationKind::ViaSpan,
+                a: ItemRef::Via(idx(i)),
+                b: None,
+                layer: None,
+                at: v.pos,
+                actual: 0.0,
+                required: 0,
+                introduced: v.origin == Origin::Routed,
+            });
+        }
         if v.diameter < min_d {
             out.push(size_violation(
                 ViolationKind::ViaDiameter,
@@ -752,6 +779,23 @@ fn check_sizes(board: &Board) -> Vec<Violation> {
         }
     }
     out
+}
+
+/// `true` when the copper span of `v` is valid for its kind on a board of `layers` copper
+/// layers: through = every layer; blind = one outer end, not through; buried = no outer
+/// layer; micro = two adjacent layers, one of them outer.
+fn span_fits_kind(v: &Via, layers: u8) -> bool {
+    let ids: Vec<LayerId> = v.layers.iter().collect();
+    let (Some(&lo), Some(&hi)) = (ids.first(), ids.last()) else { return false };
+    let contiguous = usize::from(hi.0 - lo.0) + 1 == ids.len();
+    let (first, last) = (lo.0 == 0, hi.0 + 1 == layers);
+    contiguous
+        && match v.kind {
+            ViaKind::Through => true, // legacy boards may omit the keyword of partial spans
+            ViaKind::Blind => first != last,
+            ViaKind::Buried => !first && !last,
+            ViaKind::Micro => (first || last) && ids.len() == 2,
+        }
 }
 
 fn size_violation(
@@ -794,3 +838,6 @@ pub fn summary(report: &DrcReport) -> FxHashMap<ViolationKind, usize> {
 mod custom_tests;
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod via_span_tests;

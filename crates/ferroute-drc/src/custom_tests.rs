@@ -95,6 +95,7 @@ fn width_and_annular_rules() {
         pos: pt10(150, 100),
         diameter: 600_000,
         drill: 300_000,
+        kind: ferroute_board::ViaKind::Through,
         layers: LayerSet::all(2),
         net: a,
         locked: false,
