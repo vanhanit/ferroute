@@ -34,6 +34,7 @@ fn demo_edit(b: &Board) -> BoardEdit {
     let gnd = b.net_by_name("GND").unwrap();
     BoardEdit {
         new_arcs: Vec::new(),
+        zone_fills: Vec::new(),
         moves: vec![
             mv("R1", 2.5, -1.25, 45.0), // arbitrary angle
             mv("R3", 0.0, 0.0, 180.0),  // 90 -> 180, same place
@@ -288,6 +289,7 @@ fn legacy_numeric_dialect_edit() {
     let r1 = fp_id(&board, "R1");
     let edit = BoardEdit {
         new_arcs: Vec::new(),
+        zone_fills: Vec::new(),
         moves: vec![FootprintMove {
             footprint: r1,
             from: board.footprint(r1).placement,

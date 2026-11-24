@@ -8,8 +8,8 @@ use crate::pad::{build_shape, offset_shape, shape_offset};
 use crate::sexpr::SExpr;
 use crate::util::{circumscribed_polygon, float, mm, same_angle};
 use ferroute_board::{
-    Board, Drill, Footprint, FootprintId, Keepout, LayerId, LayerSet, Mobility, Net, NetId, Origin,
-    Pad, PadConnection, PadId, Placement, Side, Track, Via, Zone, ZoneFill,
+    Board, Drill, Footprint, FootprintId, IslandRemoval, Keepout, LayerId, LayerSet, Mobility, Net,
+    NetId, Origin, Pad, PadConnection, PadId, Placement, Side, Track, Via, Zone, ZoneFill,
 };
 use ferroute_geom::{Angle, Coord, Point, Polygon, Rect, convex_hull, units::mm_to_nm};
 use std::collections::{BTreeMap, HashMap};
@@ -236,6 +236,22 @@ impl Reader {
                 None => fills.push(ZoneFill { layer, polys: vec![poly] }),
             }
         }
+        let islands = match node.child("fill") {
+            Some(f) => match f.child("island_removal_mode").and_then(|c| c.atom(1)) {
+                Some("1") => IslandRemoval::Never,
+                Some("2") => {
+                    let mm2: f64 = f
+                        .child("island_area_min")
+                        .and_then(|c| c.atom(1))
+                        .and_then(|t| t.parse().ok())
+                        .unwrap_or(10.0);
+                    #[allow(clippy::cast_possible_truncation)]
+                    IslandRemoval::BelowArea((mm2 * 1e12).round() as i128)
+                }
+                _ => IslandRemoval::Always,
+            },
+            None => IslandRemoval::Always,
+        };
         let zone = Zone {
             net,
             layers,
@@ -245,6 +261,8 @@ impl Reader {
             min_thickness,
             priority,
             pad_connection,
+            islands,
+            yields: false,
         };
         if zone.is_unfilled() {
             let name = self.nets.get(net.idx()).map_or("", |n| n.name.as_str());

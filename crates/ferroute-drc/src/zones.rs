@@ -7,6 +7,7 @@
 
 use crate::connectivity::CONTACT_TOLERANCE;
 use crate::{BucketGrid, CopperItem, ItemRef, Violation, ViolationKind};
+use ferroute_board::custom::{ItemCtx, ItemType};
 use ferroute_board::{Board, LayerId, NetId};
 use ferroute_geom::{Coord, Polygon, Rect};
 use rayon::prelude::*;
@@ -47,17 +48,42 @@ pub fn fill_polys(board: &Board) -> Vec<FillPoly<'_>> {
     out
 }
 
-/// Required gap between a fill and an item of net `other`: the larger of the zone's own
-/// clearance and the board's pair clearance.
+/// The fills that are obstacles and are clearance-checked: those of zones that do not
+/// yield (a yielding zone is refilled around routed copper, see [`crate::refill`]).
+#[must_use]
+pub fn obstacle_fills(board: &Board) -> Vec<FillPoly<'_>> {
+    let mut f = fill_polys(board);
+    f.retain(|p| !board.zones[p.zone as usize].yields);
+    f
+}
+
+/// Required gap between copper of net `zone_net` poured on `layer` and an item of net
+/// `other`: the larger of the zone's own clearance and the rules engine value (net classes
+/// plus `.kicad_dru` custom rules; the other item's kind is unknown, so kind-dependent rules
+/// apply conservatively). The DRC and the refill both use this — one definition.
+#[must_use]
+pub fn zone_clearance(
+    board: &Board,
+    zone_net: NetId,
+    zone_clearance: Coord,
+    layer: LayerId,
+    other: NetId,
+) -> Coord {
+    let a = ItemCtx { net: Some(zone_net), kind: Some(ItemType::Zone), layer: Some(layer) };
+    let b = ItemCtx { net: Some(other), kind: None, layer: Some(layer) };
+    zone_clearance.max(board.rules.clearance_for(board, &a, &b))
+}
+
+/// Required gap between fill `f` and an item of net `other` (see [`zone_clearance`]).
 #[must_use]
 pub fn required_clearance(board: &Board, f: &FillPoly<'_>, other: NetId) -> Coord {
-    f.clearance.max(board.clearance_between(f.net, other))
+    zone_clearance(board, f.net, f.clearance, f.layer, other)
 }
 
 /// Fill-vs-copper clearance and short violations (other-net copper only).
 #[must_use]
 pub fn check_fills(board: &Board, items: &[CopperItem]) -> Vec<Violation> {
-    let fills = fill_polys(board);
+    let fills = obstacle_fills(board);
     if fills.is_empty() || items.is_empty() {
         return Vec::new();
     }

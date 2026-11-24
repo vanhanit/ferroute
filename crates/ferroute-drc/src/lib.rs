@@ -27,6 +27,7 @@ use serde::{Deserialize, Serialize};
 
 pub mod connectivity;
 pub mod quality;
+pub mod refill;
 pub mod rules;
 pub mod zones;
 pub use connectivity::{Connectivity, Unconnected};

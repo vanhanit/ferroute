@@ -244,6 +244,54 @@ pub(crate) fn via_node(
     Ok(node("via", items))
 }
 
+/// Replaces the `(filled_polygon ...)` children of the zones named by `edit.zone_fills`
+/// (indices into `Board::zones`, i.e. top-level copper zones in file order). Nothing else in
+/// the zone nodes is touched.
+fn apply_zone_fills(root: &mut SExpr, board: &Board, edit: &BoardEdit) -> Result<(), KicadError> {
+    if edit.zone_fills.is_empty() {
+        return Ok(());
+    }
+    let nodes: Vec<usize> = root
+        .items()
+        .unwrap_or(&[])
+        .iter()
+        .enumerate()
+        .filter(|(_, c)| c.head() == Some("zone") && c.child("keepout").is_none())
+        .map(|(i, _)| i)
+        .collect();
+    if nodes.len() != board.zones.len() {
+        return Err(KicadError::Format(
+            "board does not match this document (copper zone count differs)".into(),
+        ));
+    }
+    for (zi, fills) in &edit.zone_fills {
+        let at_node = *nodes
+            .get(*zi as usize)
+            .ok_or_else(|| KicadError::Format("fill edit of an unknown zone".into()))?;
+        let mut fresh = Vec::new();
+        for f in fills {
+            let name = layer_name(board, f.layer)?;
+            for p in &f.polys {
+                let pts = p.pts.iter().map(|&q| xy_node("xy", q)).collect();
+                fresh.push(node(
+                    "filled_polygon",
+                    vec![kq("layer", name.clone()), node("pts", pts)],
+                ));
+            }
+        }
+        let zone = root
+            .items_mut()
+            .and_then(|v| v.get_mut(at_node))
+            .and_then(SExpr::items_mut)
+            .ok_or_else(|| KicadError::Format("zone node index out of range".into()))?;
+        let first = zone.iter().position(|c| c.head() == Some("filled_polygon"));
+        zone.retain(|c| c.head() != Some("filled_polygon"));
+        let at = first.unwrap_or(zone.len());
+        zone.splice(at..at, fresh);
+    }
+    Ok(())
+}
+
 impl KicadDocument {
     pub(crate) fn new(
         root: SExpr,
@@ -306,7 +354,8 @@ impl KicadDocument {
 
     /// Applies `edit` (computed against `board_before`) to the tree: rewrites the `(at)` of
     /// moved footprints (and rotates pad/text angles by the same delta as KiCad does) and
-    /// appends new segments, arcs and vias (in that order). No other node is modified. Output is deterministic in
+    /// appends new segments, arcs and vias (in that order) and replaces the
+    /// `(filled_polygon ...)` children of zones in `edit.zone_fills`. No other node is modified. Output is deterministic in
     /// `(document, edit, seed)`.
     ///
     /// # Errors
@@ -363,6 +412,7 @@ impl KicadDocument {
                 .ok_or_else(|| KicadError::Format("footprint node index out of range".into()))?;
             move_footprint(fp, m.to)?;
         }
+        apply_zone_fills(&mut edited, board_before, edit)?;
         self.root = edited;
         if !new_nodes.is_empty() {
             let at = self.insertion_index();

@@ -142,6 +142,7 @@ pub fn run(c: &IpcCommand) -> Result<ExitCode> {
                 rules: rules.clone(),
                 strict_rules: false,
                 allow_via_in_pad: *allow_via_in_pad,
+                no_refill_zones: false,
             };
             let code = route_run(&args)?;
             client.revert_document(doc).context("RevertDocument (reload)")?;

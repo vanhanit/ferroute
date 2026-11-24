@@ -30,6 +30,8 @@ fn board(connect: PadConnection) -> (Board, NetId, NetId, NetId) {
         min_thickness: 250_000,
         priority: 0,
         pad_connection: connect,
+        islands: Default::default(),
+        yields: false,
     });
     (board, gnd, a, bn)
 }

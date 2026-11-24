@@ -297,7 +297,7 @@ impl<'a> Statics<'a> {
         let hole_boxes: Vec<Rect> = holes.iter().map(|h| h.hull.bbox()).collect();
         let hole_grid = BucketGrid::new(&hole_boxes, CELL);
         let reach = base.rules.max_clearance().max(base.rules.hole_clearance);
-        let fills = ferroute_drc::zones::fill_polys(base);
+        let fills = ferroute_drc::zones::obstacle_fills(base);
         Self { base, items, boxes, grid, holes, hole_boxes, hole_grid, pads_at, reach, fills }
     }
 

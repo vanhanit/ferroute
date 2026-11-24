@@ -318,6 +318,7 @@ fn replan(
             new_tracks: cur.edit.new_tracks.iter().filter(|t| out_hood(t.net)).cloned().collect(),
             new_arcs: cur.edit.new_arcs.iter().filter(|t| out_hood(t.net)).cloned().collect(),
             new_vias: cur.edit.new_vias.iter().filter(|t| out_hood(t.net)).cloned().collect(),
+            zone_fills: Vec::new(),
         };
         edit.new_tracks.extend(cand.edit.new_tracks.iter().cloned());
         edit.new_arcs.extend(cand.edit.new_arcs.iter().cloned());

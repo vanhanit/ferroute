@@ -31,6 +31,8 @@ fn board(layers: &[u8]) -> Board {
         min_thickness: 250_000,
         priority: 0,
         pad_connection: PadConnection::ThermalRelief,
+        islands: Default::default(),
+        yields: false,
     });
     board
 }

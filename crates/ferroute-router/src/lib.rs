@@ -628,6 +628,7 @@ fn assemble(per_net: &[NetCopper], links: &[direct::Link]) -> BoardEdit {
             .chain(per_net.iter().flat_map(|e| e.1.iter().cloned()))
             .collect(),
         new_vias: per_net.iter().flat_map(|e| e.2.iter().cloned()).collect(),
+        zone_fills: Vec::new(),
     }
 }
 

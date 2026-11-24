@@ -95,6 +95,10 @@ pub struct RouteArgs {
     /// must be filled and capped (IPC-4761 type VII): an extra fabrication cost.
     #[arg(long)]
     pub allow_via_in_pad: bool,
+    /// Keep copper pours as obstacles and never refill them (default: other-net pours yield
+    /// to routed copper and their stored fill is recomputed around it).
+    #[arg(long)]
+    pub no_refill_zones: bool,
 }
 
 /// Parses a rules file (`[stackup]` + `[[net]]` tables).
@@ -161,6 +165,7 @@ pub fn run(a: &RouteArgs) -> Result<ExitCode> {
             )
         }),
         lns_rounds: a.lns_rounds,
+        refill_zones: !a.no_refill_zones,
         ..PipelineConfig::default()
     };
     let res = run_pipeline(&board, &cfg).context("routing")?;

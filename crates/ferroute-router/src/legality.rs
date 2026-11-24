@@ -192,7 +192,7 @@ impl Obstacles {
                 no_vias: k.no_vias,
             });
         }
-        let fills: Vec<FillObs> = ferroute_drc::zones::fill_polys(board)
+        let fills: Vec<FillObs> = ferroute_drc::zones::obstacle_fills(board)
             .iter()
             .map(|f| FillObs {
                 poly: f.poly.clone(),

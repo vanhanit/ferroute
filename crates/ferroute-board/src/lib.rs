@@ -459,7 +459,20 @@ pub struct ZoneFill {
     pub polys: Vec<Polygon>,
 }
 
-/// A copper pour. Only the stored fill is treated as copper (never refilled here).
+/// KiCad's `(island_removal_mode N)`: what happens to fill pieces connected to nothing.
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum IslandRemoval {
+    /// Mode 0 (KiCad default): always remove unconnected islands.
+    #[default]
+    Always,
+    /// Mode 1: keep every island.
+    Never,
+    /// Mode 2: remove unconnected islands smaller than this area (nm²).
+    BelowArea(i128),
+}
+
+/// A copper pour. The stored fill is the copper; ferroute refills it after routing only
+/// when `yields` is set (see `ferroute_drc::refill`).
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Zone {
     pub net: NetId,
@@ -471,6 +484,14 @@ pub struct Zone {
     pub min_thickness: Coord,
     pub priority: u32,
     pub pad_connection: PadConnection,
+    /// Unconnected-island policy used when the fill is recomputed.
+    #[serde(default)]
+    pub islands: IslandRemoval,
+    /// The pipeline will refill this zone around other-net copper: its stored fill is then
+    /// no obstacle for the router and is not clearance-checked (it is replaced before the
+    /// final DRC). Never read from or written to a file.
+    #[serde(default)]
+    pub yields: bool,
 }
 
 impl Zone {
@@ -725,6 +746,12 @@ impl Board {
         self.tracks.extend(edit.new_tracks.iter().cloned());
         self.arcs.extend(edit.new_arcs.iter().cloned());
         self.vias.extend(edit.new_vias.iter().cloned());
+        for (zi, fills) in &edit.zone_fills {
+            if let Some(z) = self.zones.get_mut(*zi as usize) {
+                z.fills.clone_from(fills);
+                z.yields = false;
+            }
+        }
     }
 }
 
@@ -746,6 +773,9 @@ pub struct BoardEdit {
     #[serde(default)]
     pub new_arcs: Vec<ArcTrack>,
     pub new_vias: Vec<Via>,
+    /// Recomputed fills `(index into Board::zones, all fills of that zone)`.
+    #[serde(default)]
+    pub zone_fills: Vec<(u32, Vec<ZoneFill>)>,
 }
 
 impl BoardEdit {
@@ -773,6 +803,9 @@ impl BoardEdit {
                 }
                 _ => return Err(format!("{} is not movable but was moved", fp.reference)),
             }
+        }
+        if self.zone_fills.iter().any(|(zi, _)| *zi as usize >= board.zones.len()) {
+            return Err("fill edit of an unknown zone".into());
         }
         if self.new_tracks.iter().any(|t| t.origin != Origin::Routed)
             || self.new_arcs.iter().any(|a| a.origin != Origin::Routed)

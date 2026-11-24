@@ -9,7 +9,9 @@
 //! 4. large-neighbourhood rounds: re-nudge with failed nets up-weighted and re-route,
 //!    keeping the best candidate,
 //! 5. length tuning (meanders) for `length_min` / length-matching rules,
-//! 6. the deterministic DRC oracle as the final acceptance gate.
+//! 6. copper-pour refill: stored zone fills are recomputed around the new copper
+//!    ([`ferroute_drc::refill`]); until then other-net fills yield to the router,
+//! 7. the deterministic DRC oracle as the final acceptance gate.
 //!
 //! Also hosts the synthetic board generator ([`synth`]) and benchmark scoring
 //! ([`score`]) used by the CI regression gate.
@@ -36,6 +38,14 @@ pub struct PipelineConfig {
     pub lns_rounds: u32,
     /// HPWL weight multiplier for nets that failed in the previous round.
     pub failed_net_weight: f64,
+    /// Refill copper pours after routing: other-net fills then yield to routed copper
+    /// instead of being obstacles (`--no-refill-zones` keeps them as obstacles).
+    #[serde(default = "default_true")]
+    pub refill_zones: bool,
+}
+
+const fn default_true() -> bool {
+    true
 }
 
 impl Default for PipelineConfig {
@@ -46,6 +56,7 @@ impl Default for PipelineConfig {
             nudge: None,
             lns_rounds: 2,
             failed_net_weight: 6.0,
+            refill_zones: true,
         }
     }
 }
@@ -74,6 +85,8 @@ pub struct Metrics {
 /// Full pipeline result.
 #[derive(Clone, Debug)]
 pub struct PipelineResult {
+    /// Internal: the refill split a pour net (the pipeline then re-runs without refill).
+    pub refill_disconnects: bool,
     /// The input board with the movability policy applied (edit invariants are checked
     /// against this board).
     pub policy_board: Board,
@@ -126,6 +139,29 @@ fn moves_between(policy_board: &Board, placed: &Board) -> Vec<FootprintMove> {
 /// # Errors
 /// Router errors (invalid board, impossible lattice).
 pub fn run(board: &Board, cfg: &PipelineConfig) -> Result<PipelineResult, RouteError> {
+    let first = run_once(board, cfg)?;
+    if !first.refill_disconnects {
+        return Ok(first);
+    }
+    // INV-CONN-1: refilling around the new copper would split a pour and disconnect pads
+    // of its net. Keep the pours intact (obstacle mode) instead, and say so.
+    let mut res = run_once(board, &PipelineConfig { refill_zones: false, ..cfg.clone() })?;
+    res.rule_notes.push(
+        "copper pours kept as obstacles: refill would disconnect a pour net (INV-CONN-1)"
+            .to_owned(),
+    );
+    Ok(res)
+}
+
+fn missing_per_net(c: &ferroute_drc::Connectivity) -> std::collections::BTreeMap<NetId, usize> {
+    let mut m = std::collections::BTreeMap::new();
+    for u in &c.unconnected {
+        *m.entry(u.net).or_insert(0) += 1;
+    }
+    m
+}
+
+fn run_once(board: &Board, cfg: &PipelineConfig) -> Result<PipelineResult, RouteError> {
     let t0 = Instant::now();
     let mut policy_board = board.clone();
     if let Some((policy, _)) = &cfg.nudge {
@@ -138,6 +174,9 @@ pub fn run(board: &Board, cfg: &PipelineConfig) -> Result<PipelineResult, RouteE
                 ferroute_board::Mobility::Fixed
             };
         }
+    }
+    for z in &mut policy_board.zones {
+        z.yields = cfg.refill_zones && !z.is_unfilled();
     }
     // Per-net electrical rules → derived widths, before anything routes (INV-RULE-1).
     let rule_notes = ferroute_board::constraints::resolve(&mut policy_board);
@@ -185,13 +224,37 @@ pub fn run(board: &Board, cfg: &PipelineConfig) -> Result<PipelineResult, RouteE
         moves: best.moves.clone(),
         new_tracks: best.out.edit.new_tracks.clone(),
         new_vias: best.out.edit.new_vias.clone(),
+        zone_fills: Vec::new(),
     };
     // Length rules (length_min, match groups): meanders, each verified by the oracle.
     let mut rule_notes = rule_notes;
     rule_notes.extend(ferroute_router::tune::tune_lengths(&policy_board, &mut edit));
-    debug_assert!(edit.check_invariants(&policy_board).is_ok());
     let mut board_after = policy_board.clone();
     board_after.apply(&edit);
+    let mut refill_disconnects = false;
+    if cfg.refill_zones {
+        let only_conn = DrcConfig {
+            copper: false,
+            edge: false,
+            holes: false,
+            keepouts: false,
+            courtyards: false,
+            sizes: false,
+            ..DrcConfig::default()
+        };
+        let before = missing_per_net(&ferroute_drc::check(&board_after, &only_conn).connectivity);
+        let refill = ferroute_drc::refill::refill_zones(&board_after);
+        rule_notes.extend(refill.notes);
+        edit.zone_fills = refill.fills;
+        board_after
+            .apply(&BoardEdit { zone_fills: edit.zone_fills.clone(), ..BoardEdit::default() });
+        for z in &mut board_after.zones {
+            z.yields = false;
+        }
+        let after = missing_per_net(&ferroute_drc::check(&board_after, &only_conn).connectivity);
+        refill_disconnects = after.iter().any(|(n, &c)| c > before.get(n).copied().unwrap_or(0));
+    }
+    debug_assert!(edit.check_invariants(&policy_board).is_ok());
     let drc = ferroute_drc::check(&board_after, &DrcConfig::default());
     let introduced = drc.introduced().count();
     let constraint_issues = ferroute_drc::rules::check_constraints(&board_after);
@@ -216,6 +279,7 @@ pub fn run(board: &Board, cfg: &PipelineConfig) -> Result<PipelineResult, RouteE
         runtime_ms: t0.elapsed().as_secs_f64() * 1e3,
     };
     Ok(PipelineResult {
+        refill_disconnects,
         policy_board,
         edit,
         board_after,
@@ -459,5 +523,114 @@ mod bus_match_tests {
             assert!(spread(&[d1p, d1n]) <= mm(1) / 10, "{tag}");
             assert!(spread(&[d0p, d0n, d1p, d1n, clk]) <= mm(1) / 2, "{tag}");
         }
+    }
+}
+
+#[cfg(test)]
+mod refill_tests {
+    use super::*;
+    use ferroute_board::builder::{BoardBuilder, mm, pt10};
+    use ferroute_board::{IslandRemoval, LayerId, LayerSet, PadConnection, Zone, ZoneFill};
+    use ferroute_geom::Polygon;
+
+    fn rect(x0: i64, y0: i64, x1: i64, y1: i64) -> Polygon {
+        Polygon::new(vec![pt10(x0, y0), pt10(x1, y0), pt10(x1, y1), pt10(x0, y1)])
+    }
+
+    /// `S` joins R1 (x 5 mm) to R2 (x 25 mm) on F.Cu only, but a GND pour fills the whole
+    /// board height between x 11 and 19 mm: the only corridor.
+    fn blocked_board() -> Board {
+        let mut b = BoardBuilder::new(mm(30), mm(20), 2);
+        let (s, q, q2, gnd) = (b.net("S"), b.net("Q"), b.net("Q2"), b.net("GND"));
+        b.smd2("R1", pt10(50, 100), 0.0, q, s);
+        b.smd2("R2", pt10(250, 100), 0.0, s, q2);
+        b.smd2("G1", pt10(150, 30), 0.0, gnd, NetId::NONE);
+        let mut board = b.build();
+        let poly = rect(110, 5, 190, 195);
+        board.zones.push(Zone {
+            net: gnd,
+            layers: LayerSet::single(LayerId(0)),
+            outline: poly.clone(),
+            fills: vec![ZoneFill { layer: LayerId(0), polys: vec![poly] }],
+            clearance: 300_000,
+            min_thickness: 250_000,
+            priority: 0,
+            pad_connection: PadConnection::Solid,
+            islands: IslandRemoval::Always,
+            yields: false,
+        });
+        board
+    }
+
+    fn cfg(refill: bool) -> PipelineConfig {
+        PipelineConfig {
+            refill_zones: refill,
+            router: RouterConfig {
+                accel: ferroute_router::Accel::Cpu,
+                layers: Some(LayerSet::single(LayerId(0))),
+                ..RouterConfig::default()
+            },
+            ..PipelineConfig::default()
+        }
+    }
+
+    #[test]
+    fn refill_never_disconnects_a_pour_net() {
+        // A second GND pad at the bottom: the pour is what joins the two GND pads, so a
+        // signal cut across it would split GND (INV-CONN-1). The engine must keep GND
+        // connected (pour as obstacle) and report the fallback.
+        let mut board = blocked_board();
+        let gnd = board.net_by_name("GND").expect("gnd");
+        let fp = {
+            let mut bb = BoardBuilder::new(mm(30), mm(20), 2);
+            for n in ["S", "Q", "Q2", "GND"] {
+                bb.net(n);
+            }
+            bb.smd2("G2", pt10(150, 170), 0.0, NetId(4), NetId::NONE);
+            bb.build()
+        };
+        let mut pad = fp.pads[0].clone();
+        pad.footprint =
+            ferroute_board::FootprintId(u32::try_from(board.footprints.len()).expect("fp"));
+        pad.net = gnd;
+        let mut foot = fp.footprints[0].clone();
+        foot.pads = vec![ferroute_board::PadId(u32::try_from(board.pads.len()).expect("pad"))];
+        board.pads.push(pad);
+        board.footprints.push(foot);
+        let missing = |r: &PipelineResult| {
+            r.drc.connectivity.unconnected.iter().filter(|u| u.net == gnd).count()
+        };
+        let input = ferroute_drc::check(&board, &DrcConfig::default());
+        assert_eq!(input.connectivity.unconnected.iter().filter(|u| u.net == gnd).count(), 0);
+        let r = run(&board, &cfg(true)).expect("run");
+        assert_eq!(missing(&r), 0, "GND stays joined through its pour");
+        assert!(r.metrics.drc_clean);
+        assert!(
+            r.rule_notes.iter().any(|n| n.contains("refill would disconnect")),
+            "{:?}",
+            r.rule_notes
+        );
+    }
+
+    #[test]
+    fn a_pour_over_the_only_corridor_yields_when_refill_is_enabled() {
+        let board = blocked_board();
+        let keep = run(&board, &cfg(false)).expect("run");
+        assert!(keep.metrics.drc_clean);
+        assert!(keep.metrics.connections_missing > 0, "pour blocks the corridor");
+        assert!(keep.edit.zone_fills.is_empty());
+        let r = run(&board, &cfg(true)).expect("run");
+        assert!(r.metrics.drc_clean, "{:?}", r.drc.introduced().collect::<Vec<_>>());
+        assert_eq!(r.metrics.connections_missing, 0, "routes through the pour");
+        assert!(r.metrics.completion > keep.metrics.completion);
+        assert_eq!(r.edit.zone_fills.len(), 1);
+        assert!(r.board_after.zones.iter().all(|z| !z.yields));
+        r.edit.check_invariants(&r.policy_board).expect("INV-EDIT-1");
+        // The pour was cut in two; the half without the GND pad is gone.
+        let regions = ferroute_geom::boolean::regions_of(&r.board_after.zones[0].fills[0].polys);
+        assert_eq!(regions.len(), 1, "{regions:?}");
+        assert!(r.drc.is_clean(), "{:#?}", r.drc.violations);
+        let again = run(&board, &cfg(true)).expect("run");
+        assert_eq!(r.edit, again.edit, "deterministic");
     }
 }
