@@ -219,7 +219,7 @@ Completion and DRC come first; within that, every result must look hand-tuned:
 | 20 | Electrical models: IPC-2152 current curve fits, Hammerstad–Jensen microstrip (+ solder mask), stripline offset, edge-coupled differential and coplanar impedance; validate against published tables | Lead | P2 |
 | 20b | Electrical-model follow-ups: verified Kirschning–Jansen (or Wadell) coupled microstrip (today IPC-2141A coupling approximation), narrow-strip stripline (w/(b−t) < 0.35 returns None → reported as unattainable), offset stripline, solder-mask correction, thickness for coupled stripline | Lead | from #20 |
 | 21 | Crosstalk rules: parallel-run-length limits and 3W spacing for sensitive/high-speed nets, reported and enforced by the router cost policy | Lead + worker | P3 |
-| 22 | Teardrops at pad/via joins (KiCad-compatible), DFM checks: annular ring, drill aspect ratio, solder-mask slivers | Worker | P3 |
+| 22 | ✅ Teardrops (opt-in, KiCad-native) and DFM checks (annular ring, aspect ratio, min drill, NPTH clearance). Next: solder-mask slivers, copper balance | Worker | done |
 | 23 | Exact window optimisation: small congested regions solved exactly (ILP via HiGHS / `good_lp`, MIT) and spliced back under oracle verification | Lead | P3 |
 | 24 | Push-and-shove local moves (KiCad PNS-style walkaround/shove) as LNS operator | Lead + worker | P3 |
 | 25 | Next-generation core: topological (rubber-band) routing on an octilinear visibility/escape graph — topology first, then tight geometry; removes lattice artefacts at the source | Lead | M3 |
