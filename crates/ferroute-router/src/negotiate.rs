@@ -253,6 +253,11 @@ fn tree_geometry(
     (nodes, edges)
 }
 
+/// Seed islands tried when the first one cannot reach any other island.
+const MAX_SEEDS: usize = 4;
+/// Nets with more islands than this (pour nets) are dropped last when legalising.
+const BIG_NET_ISLANDS: usize = 16;
+
 /// A terminal as seen from its lattice node.
 #[derive(Copy, Clone, Debug)]
 struct TerminalRef {
@@ -370,6 +375,7 @@ fn route_one(
     let mut route = NetRoute::default();
     let mut connected = vec![false; job.islands.len()];
     connected[0] = true;
+    let mut seed = 0usize;
     let mut searches = 0u64;
     let mut used_stubs: Vec<u32> = Vec::new();
     // Stub headings at terminals whose stub is part of the route (copper leaves there).
@@ -387,10 +393,20 @@ fn route_one(
         let mut got = Vec::new();
         for t in term_of.get(&n).map_or(&[][..], Vec::as_slice) {
             let Some(s) = t.stub else {
-                // A plane terminal: arriving there joins the pour, no copper to add.
-                if want(t.island) {
-                    got.push(t.island);
+                // A plane terminal: arriving there joins the pour, no copper to add. An
+                // escape end carries a heading: it must not meet the other copper at an
+                // acute angle (acid trap).
+                if !want(t.island) {
+                    continue;
                 }
+                if let Some(h) = t.heading {
+                    if crate::junction::forbidden_departures(mask) & crate::junction::bit(h) != 0 {
+                        continue;
+                    }
+                    mask |= crate::junction::bit(h);
+                    heads.push((n, h));
+                }
+                got.push(t.island);
                 continue;
             };
             if !want(t.island) || duplicates_breakout(stubs, used, Some(s)) {
@@ -460,6 +476,13 @@ fn route_one(
             term_of.keys().filter_map(|&n| target(n).map(|t| (n, t))).collect();
         let target_now = |n: NodeIdx| tmap.get(&n).copied();
         let Some(path) = astar(&ctx, &sources, &target_now, tbox) else {
+            // Nothing reachable from the seed island (boxed in): seed from another island.
+            if route.paths.is_empty() && seed + 1 < job.islands.len().min(MAX_SEEDS) {
+                connected[seed] = false;
+                seed += 1;
+                connected[seed] = true;
+                continue;
+            }
             break;
         };
         let (start, end) = (path[0], path[path.len() - 1]);
@@ -614,7 +637,11 @@ pub fn negotiate(
         .map(|n| grid.coords(u32::try_from(n).unwrap_or(u32::MAX)))
         .collect();
     // Legalisation: drop lowest-priority conflicting nets until no resource is shared.
-    for &j in order.iter().rev() {
+    // Small nets are dropped before big ones (losing a 55-island pour net costs 54
+    // connections); otherwise the lowest-priority-first order is kept.
+    let mut rip_order: Vec<usize> = order.iter().rev().copied().collect();
+    rip_order.sort_by_key(|&j| jobs[j].islands.len() > BIG_NET_ISLANDS);
+    for &j in &rip_order {
         if !routes[j].paths.is_empty() && conflicts(&st, grid, plan, &routes[j]) {
             let old = std::mem::take(&mut routes[j]);
             commit(&mut st, grid, plan, &old, -1);

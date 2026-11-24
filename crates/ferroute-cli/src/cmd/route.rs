@@ -95,6 +95,10 @@ pub struct RouteArgs {
     /// must be filled and capped (IPC-4761 type VII): an extra fabrication cost.
     #[arg(long)]
     pub allow_via_in_pad: bool,
+    /// Do not plan the break-out of area arrays (BGA/LGA) before routing (also
+    /// `[routing] escape = false` in --rules).
+    #[arg(long)]
+    pub no_escape: bool,
     /// Enable KiCad's native teardrops on every pad and via that gets new copper (also
     /// `[routing] teardrops = true` in --rules). Only the teardrop property of those pads and
     /// vias is written; KiCad creates the copper when zones are refilled.
@@ -123,12 +127,14 @@ pub fn run(a: &RouteArgs) -> Result<ExitCode> {
     let mut board = kb.board;
     let mut via_in_pad = a.allow_via_in_pad;
     let mut teardrops = a.teardrops;
+    let mut escape = !a.no_escape;
     if let Some(path) = &a.rules {
         let text =
             std::fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
         let rules = parse_rules(&text).with_context(|| format!("in {}", path.display()))?;
         via_in_pad |= rules.via_in_pad();
         teardrops |= rules.teardrops();
+        escape &= rules.escape();
         for w in rules.apply(&mut board)? {
             out(&format!("rules warning: {w}"));
         }
@@ -163,6 +169,7 @@ pub fn run(a: &RouteArgs) -> Result<ExitCode> {
             max_iterations: a.iterations,
             accel: a.accel.into(),
             via_in_pad,
+            escape,
             ..RouterConfig::default()
         },
         nudge: a.allow_move.then(|| {

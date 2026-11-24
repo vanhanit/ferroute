@@ -19,6 +19,7 @@ pub mod detour;
 pub mod diffpair;
 pub mod direct;
 pub mod emit;
+pub mod escape;
 pub mod grid;
 pub mod junction;
 pub mod legality;
@@ -39,7 +40,7 @@ use ferroute_board::{Board, BoardEdit, LayerSet, NetId, PadId};
 use ferroute_drc::{BucketGrid, DrcConfig, ItemRef, connectivity::UnionFind, copper_items};
 use ferroute_geom::{Coord, Rect};
 use grid::Grid;
-use legality::{AccelField, ClassLegality, Obstacles};
+use legality::{AccelField, ClassLegality, Obstacles, allows};
 use negotiate::{NegotiationConfig, NegotiationStats, NetJob, negotiate};
 use plan::{Plan, default_pitch};
 use search::Costs;
@@ -97,6 +98,14 @@ pub struct RouterConfig {
     /// Coordinated rip-up & re-route of small net neighbourhoods after the first passes.
     #[serde(default)]
     pub lns: lns::LnsConfig,
+    /// Plan the break-out of area arrays (BGA/LGA) before lattice routing ([`escape`]).
+    /// Boards without an area array are unaffected.
+    #[serde(default = "default_escape")]
+    pub escape: bool,
+}
+
+const fn default_escape() -> bool {
+    true
 }
 
 const fn default_order_rounds() -> u32 {
@@ -125,6 +134,7 @@ impl Default for RouterConfig {
             order_rounds: default_order_rounds(),
             via_in_pad: false,
             lns: lns::LnsConfig::default(),
+            escape: default_escape(),
         }
     }
 }
@@ -160,6 +170,12 @@ pub struct RouteStats {
     pub drc_gate_rips: usize,
     /// Detour-driven re-ordering rounds that were run (0 = first pass was kept as is).
     pub order_rounds_run: u32,
+    /// Balls of area arrays that received planned escape copper ([`escape`]).
+    #[serde(default)]
+    pub escape_balls: usize,
+    /// Dog-bone vias placed by the escape stage.
+    #[serde(default)]
+    pub escape_vias: usize,
     /// Large-neighbourhood re-route attempts that were run.
     #[serde(default)]
     pub lns_rounds_run: u32,
@@ -333,6 +349,8 @@ pub struct Prepared {
     work: Board,
     links: Vec<direct::Link>,
     taken: Vec<(PadId, ferroute_geom::Dir8)>,
+    /// Planned area-array escapes (already part of `work`).
+    escapes: Vec<escape::Escape>,
     obs: Obstacles,
     legal: Vec<ClassLegality>,
     accel_name: String,
@@ -403,8 +421,26 @@ pub fn prepare(board: &Board, cfg: &RouterConfig) -> Result<Prepared, RouteError
         origin: ferroute_board::Origin::Existing,
         ..l.track.clone()
     }));
-    let board = &work;
     let taken: Vec<(PadId, ferroute_geom::Dir8)> = links.iter().flat_map(|l| l.ends).collect();
+    // Area arrays (BGA/LGA): planned escapes become fixed copper of their nets.
+    let mut escapes: Vec<escape::Escape> = Vec::new();
+    if cfg.escape {
+        let arrays = escape::detect_arrays(&work);
+        if !arrays.is_empty() {
+            escapes = plan_escapes(&work, &grid, &arrays, cfg, &pair_nets);
+            for e in &escapes {
+                work.tracks.extend(e.tracks.iter().map(|t| ferroute_board::Track {
+                    origin: ferroute_board::Origin::Existing,
+                    ..t.clone()
+                }));
+                work.vias.extend(e.vias.iter().map(|v| ferroute_board::Via {
+                    origin: ferroute_board::Origin::Existing,
+                    ..v.clone()
+                }));
+            }
+        }
+    }
+    let board = &work;
     let obs = Obstacles::from_board(board);
     let (accel, accel_name) = build_accel(&grid, &obs, &plan, cfg.accel);
     let legal: Vec<ClassLegality> = plan
@@ -431,6 +467,7 @@ pub fn prepare(board: &Board, cfg: &RouterConfig) -> Result<Prepared, RouteError
         work,
         links,
         taken,
+        escapes,
         obs,
         legal,
         accel_name,
@@ -463,6 +500,7 @@ pub fn route_prepared(prep: &Prepared, cfg: &RouterConfig) -> Result<RouteOutcom
     let (pitch, legality_ms) = (*pitch, *legality_ms);
     let board_pairs = &original.diff_pairs;
     let mut links = prep.links.clone();
+    let mut escapes = prep.escapes.clone();
     // Jobs.
     let base_costs = Costs {
         via: cfg.via_cost,
@@ -500,6 +538,22 @@ pub fn route_prepared(prep: &Prepared, cfg: &RouterConfig) -> Result<RouteOutcom
         for g in groups {
             let mut ts = Vec::new();
             for &pad in g {
+                if let Some(end) = escapes.iter().find(|e| e.pad == pad).and_then(|e| e.end) {
+                    // The ball is already broken out: the route starts at the escape end.
+                    if let Some(l) = grid.grid_layer(end.layer) {
+                        let (i, j) = (
+                            (end.point.x - grid.origin.x) / grid.pitch,
+                            (end.point.y - grid.origin.y) / grid.pitch,
+                        );
+                        if let (Ok(i), Ok(j)) = (u32::try_from(i), u32::try_from(j)) {
+                            let node = grid.idx(i, j, l);
+                            if allows(legal[class].node[node as usize], net) {
+                                ts.push(Terminal { node, stub: None, heading: Some(end.heading) });
+                            }
+                        }
+                    }
+                    continue;
+                }
                 let first = stubs.len();
                 ts.extend(pad_terminals(
                     board,
@@ -590,7 +644,7 @@ pub fn route_prepared(prep: &Prepared, cfg: &RouterConfig) -> Result<RouteOutcom
     let mut gate_rips = 0usize;
     let mut link_rips: Vec<NetId> = Vec::new();
     loop {
-        let edit = assemble(&per_net, &links);
+        let edit = assemble(&per_net, &links, &escapes);
         let mut after = original.clone();
         after.apply(&edit);
         let rep = ferroute_drc::check(
@@ -618,7 +672,9 @@ pub fn route_prepared(prep: &Prepared, cfg: &RouterConfig) -> Result<RouteOutcom
         bad.dedup();
         // Only nets of this pass can be ripped (the pair stage's copper is verified apart).
         bad.retain(|n| {
-            per_net.iter().any(|e| e.0 == *n) || links.iter().any(|l| l.track.net == *n)
+            per_net.iter().any(|e| e.0 == *n)
+                || links.iter().any(|l| l.track.net == *n)
+                || escapes.iter().any(|e| e.net == *n)
         });
         if bad.is_empty() {
             break;
@@ -644,6 +700,9 @@ pub fn route_prepared(prep: &Prepared, cfg: &RouterConfig) -> Result<RouteOutcom
             !rip
         });
         removed |= links.len() != before;
+        let before = escapes.len();
+        escapes.retain(|e| !bad.contains(&e.net));
+        removed |= escapes.len() != before;
         if !removed {
             // Nothing left to rip: stop instead of spinning. The pipeline's final oracle gate
             // still refuses any output with an introduced violation.
@@ -652,7 +711,7 @@ pub fn route_prepared(prep: &Prepared, cfg: &RouterConfig) -> Result<RouteOutcom
         }
     }
     // Gridless clean-up of the emitted copper (guarded by the oracle inside).
-    let edit = straighten::straighten(original, &assemble(&per_net, &links));
+    let edit = straighten::straighten(original, &assemble(&per_net, &links, &escapes));
     // Vias move onto the lines of their traces, then the traces are straightened again.
     let edit = vias::relocate_vias(original, &edit, cfg.via_in_pad);
     let edit = straighten::straighten(original, &edit);
@@ -697,6 +756,8 @@ pub fn route_prepared(prep: &Prepared, cfg: &RouterConfig) -> Result<RouteOutcom
         accel_backend: accel_name.clone(),
         drc_gate_rips: gate_rips,
         order_rounds_run: 0,
+        escape_balls: escapes.len(),
+        escape_vias: escapes.iter().map(|e| e.vias.len()).sum(),
         lns_rounds_run: 0,
         lns_accepted: 0,
         detour_excess_mm: 0.0,
@@ -775,18 +836,64 @@ pub fn choose_lattice(
 
 type NetCopper = (NetId, Vec<ferroute_board::Track>, Vec<ferroute_board::Via>, bool);
 
-fn assemble(per_net: &[NetCopper], links: &[direct::Link]) -> BoardEdit {
+fn assemble(
+    per_net: &[NetCopper],
+    links: &[direct::Link],
+    escapes: &[escape::Escape],
+) -> BoardEdit {
     BoardEdit {
         new_arcs: Vec::new(),
         moves: Vec::new(),
         new_tracks: links
             .iter()
             .map(|l| l.track.clone())
+            .chain(escapes.iter().flat_map(|e| e.tracks.iter().cloned()))
             .chain(per_net.iter().flat_map(|e| e.1.iter().cloned()))
             .collect(),
-        new_vias: per_net.iter().flat_map(|e| e.2.iter().cloned()).collect(),
+        new_vias: escapes
+            .iter()
+            .flat_map(|e| e.vias.iter().cloned())
+            .chain(per_net.iter().flat_map(|e| e.2.iter().cloned()))
+            .collect(),
         zone_fills: Vec::new(),
     }
+}
+
+/// Escape plan for the area `arrays` of `work` (see [`escape`]): only lone balls (and one
+/// ball per island of a pour net) on requested nets, outside coupled pairs.
+fn plan_escapes(
+    work: &Board,
+    grid: &Grid,
+    arrays: &[escape::Array],
+    cfg: &RouterConfig,
+    pair_nets: &[NetId],
+) -> Vec<escape::Escape> {
+    let (islands, on_plane) = pad_islands_with_planes(work);
+    // Island key of every pad that may receive escape copper: a lone pad (signals) or any
+    // pad of an island not yet on its net's pour (pour nets; one via serves the island).
+    let pours: Vec<NetId> = ferroute_drc::zones::fill_polys(work).iter().map(|f| f.net).collect();
+    let mut key: Vec<Option<usize>> = vec![None; work.pads.len()];
+    let mut next = 0usize;
+    for (n, groups) in islands.iter().enumerate() {
+        for (g, grp) in groups.iter().enumerate() {
+            next += 1;
+            let net = NetId(u32::try_from(n).unwrap_or(0));
+            if !on_plane[n][g] && (grp.len() == 1 || pours.contains(&net)) {
+                for p in grp {
+                    key[p.idx()] = Some(next);
+                }
+            }
+        }
+    }
+    let eligible = |pad: PadId| {
+        let net = work.pad(pad).net;
+        if cfg.nets.as_ref().is_some_and(|v| !v.contains(&net)) || pair_nets.contains(&net) {
+            return None;
+        }
+        key[pad.idx()]
+    };
+    let obs = Obstacles::from_board(work);
+    escape::plan(work, &obs, &plan::class_geoms(&work.rules), grid, arrays, &eligible)
 }
 
 fn build_accel(
@@ -816,5 +923,7 @@ fn build_accel(
     }
 }
 
+#[cfg(test)]
+mod escape_tests;
 #[cfg(test)]
 mod tests;

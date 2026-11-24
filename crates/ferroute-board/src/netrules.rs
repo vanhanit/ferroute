@@ -38,6 +38,8 @@ pub struct RoutingSpec {
     /// Switch on KiCad's native teardrops for every pad and via that gets new copper
     /// (KiCad generates the teardrop copper itself on refill).
     pub teardrops: Option<bool>,
+    /// Plan the break-out of area arrays (BGA/LGA) before routing (default `true`).
+    pub escape: Option<bool>,
 }
 
 /// One rule: selector globs plus the constraints it sets.
@@ -296,6 +298,12 @@ impl RuleSet {
     #[must_use]
     pub fn via_in_pad(&self) -> bool {
         self.routing.as_ref().and_then(|r| r.via_in_pad).unwrap_or(false)
+    }
+
+    /// `[routing] escape` (`true` when absent).
+    #[must_use]
+    pub fn escape(&self) -> bool {
+        self.routing.as_ref().and_then(|r| r.escape).unwrap_or(true)
     }
 
     /// `[routing] teardrops` (`false` when absent).
