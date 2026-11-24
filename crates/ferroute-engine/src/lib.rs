@@ -112,11 +112,21 @@ struct Candidate {
     place: Option<PlaceResult>,
 }
 
-fn quality(c: &Candidate) -> (usize, usize, u64) {
-    // Lexicographic: fewer failed nets, fewer vias, shorter wire (µm, integer for total order).
+/// Weight of one via in the candidate cost, as equivalent trace length (µm).
+const VIA_COST_UM: u64 = 4_000;
+/// Weight of one routing-quality defect (sliver, right angle, via jog, pad-edge bend).
+const DEFECT_COST_UM: u64 = 2_000;
+
+fn quality(c: &Candidate) -> (usize, u64) {
+    // Fewer failed nets first; then one weighted cost an expert would use: wire length plus
+    // a few millimetres per via and per quality defect (vias and defects are not worth any
+    // amount of extra wire).
     #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
     let wl = (c.out.stats.wirelength_nm / 1e3) as u64;
-    (c.out.failed.len(), c.out.stats.vias, wl)
+    let st = &c.out.stats;
+    let defects = (st.slivers + st.right_angle_bends + st.via_jogs + st.near_pad_bends) as u64;
+    let cost = wl + st.vias as u64 * VIA_COST_UM + defects * DEFECT_COST_UM;
+    (c.out.failed.len(), cost)
 }
 
 fn moves_between(policy_board: &Board, placed: &Board) -> Vec<FootprintMove> {
@@ -217,6 +227,14 @@ fn run_once(board: &Board, cfg: &PipelineConfig) -> Result<PipelineResult, Route
             if quality(&cand) < quality(&best) {
                 best = cand;
             }
+        }
+    }
+    if cfg.nudge.is_some() && !best.moves.is_empty() {
+        // Nudging may only help: after the LNS rounds, the un-nudged placement competes too.
+        let out = ferroute_router::route(&policy_board, &router)?;
+        let fixed = Candidate { moves: Vec::new(), placed: policy_board.clone(), out, place: None };
+        if quality(&fixed) < quality(&best) {
+            best = fixed;
         }
     }
     let mut edit = BoardEdit {
