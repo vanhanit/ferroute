@@ -136,3 +136,83 @@ fn moves_land_on_the_placement_grid() {
         }
     }
 }
+
+/// The prefilter only skips geometry that provably cannot matter: verdicts equal those of
+/// a prefilter that never skips, for random candidate placements (incl. rotations).
+#[test]
+fn prefilter_never_changes_the_legality_verdict() {
+    let mut b = BoardBuilder::new(mm(30), mm(24), 2);
+    let n: Vec<_> = (0..6).map(|i| b.net(&format!("N{i}"))).collect();
+    let mut rng = ferroute_geom::rng::Rng::new(7);
+    for i in 0..40 {
+        let (x, y) = (rng.range_i64(30, 270), rng.range_i64(30, 210));
+        let rot = [0.0, 90.0, 45.0, 30.0][rng.below(4) as usize];
+        b.smd2(&format!("R{i}"), pt10(x, y), rot, n[i % 6], n[(i + 1) % 6]);
+    }
+    let mut board = b.build();
+    apply_policy(&mut board, &MovePolicy { max_displacement: mm(4), ..MovePolicy::default() });
+    let pf = Prefilter::new(&board);
+    let never = Prefilter {
+        court: vec![Coord::MAX / 8; board.footprints.len()],
+        pads: vec![Coord::MAX / 8; board.footprints.len()],
+    };
+    let placements: Vec<Placement> = board.footprints.iter().map(|f| f.placement).collect();
+    let (mut yes, mut no) = (0, 0);
+    for _ in 0..4000 {
+        let fid = FootprintId(u32::try_from(rng.below(board.footprints.len() as u64)).unwrap());
+        let mut cand = placements[fid.idx()];
+        let (dx, dy) = (rng.range_i64(-30, 30) * 100_000, rng.range_i64(-30, 30) * 100_000);
+        cand.pos = cand.pos + Point::new(dx, dy);
+        if rng.below(4) == 0 {
+            cand.rot = cand.rot.add(Angle::from_degrees(90.0));
+        }
+        let a = legal_with(&board, &pf, &placements, fid, cand);
+        let c = legal_with(&board, &never, &placements, fid, cand);
+        assert_eq!(a, c, "verdict differs for {fid:?} at {cand:?}");
+        if a {
+            yes += 1;
+        } else {
+            no += 1;
+        }
+    }
+    assert!(yes > 50 && no > 50, "test must exercise both verdicts ({yes}/{no})");
+}
+
+/// The incremental cost equals the full cost bit for bit, through accepted and rejected
+/// moves (so annealing decisions are unchanged).
+#[test]
+fn incremental_cost_equals_full_cost_bit_for_bit() {
+    let mut b = BoardBuilder::new(mm(30), mm(24), 2);
+    let n: Vec<_> = (0..7).map(|i| b.net(&format!("N{i}"))).collect();
+    let mut rng = ferroute_geom::rng::Rng::new(11);
+    for i in 0..30 {
+        let (x, y) = (rng.range_i64(30, 270), rng.range_i64(30, 210));
+        let rot = [0.0, 90.0][rng.below(2) as usize];
+        b.smd2(&format!("R{i}"), pt10(x, y), rot, n[i % 7], n[(i * 3 + 1) % 7]);
+    }
+    let mut board = b.build();
+    apply_policy(&mut board, &MovePolicy { max_displacement: mm(4), ..MovePolicy::default() });
+    let cfg = PlaceConfig { net_weights: vec![(n[2], 6.0), (n[5], 0.0)], ..PlaceConfig::default() };
+    let model = Model::new(&board, &cfg);
+    let mut cur: Vec<Placement> = board.footprints.iter().map(|f| f.placement).collect();
+    let mut cc = model.cache(&cur);
+    assert_eq!(model.cost_cached(&mut cc), model.cost(&cur));
+    for step in 0..600 {
+        let fid = FootprintId(u32::try_from(rng.below(board.footprints.len() as u64)).unwrap());
+        let mut cand = cur[fid.idx()];
+        let (dx, dy) = (rng.range_i64(-20, 20) * 100_000, rng.range_i64(-20, 20) * 100_000);
+        cand.pos = cand.pos + Point::new(dx, dy);
+        if rng.below(5) == 0 {
+            cand.rot = cand.rot.add(Angle::from_degrees(90.0));
+        }
+        let old = cur[fid.idx()];
+        cur[fid.idx()] = cand;
+        let (c, undo) = model.eval_move(&mut cc, fid, cand);
+        assert_eq!(c, model.cost(&cur), "step {step}");
+        if rng.below(2) == 0 {
+            cur[fid.idx()] = old;
+            cc.undo(undo);
+        }
+        assert_eq!(model.cost_cached(&mut cc), model.cost(&cur), "state after step {step}");
+    }
+}

@@ -235,16 +235,238 @@ impl<'a> Model<'a> {
     }
 }
 
+/// Per-net cost terms derived from the net's pad bounding box.
+#[derive(Copy, Clone, Debug)]
+struct NetTerm {
+    /// Weighted half-perimeter (nm).
+    wire: f64,
+    /// Weighted RUDY density added to every covered bin.
+    contrib: f64,
+    bins: (i64, i64, i64, i64),
+}
+
+/// Cached geometry of the placement being annealed, so a one-footprint move re-derives
+/// only the nets and displacement it touches. Every sum is still accumulated in the
+/// same order as [`Model::cost`], so both agree bit for bit.
+#[derive(Debug)]
+struct CostCache {
+    padpos: Vec<Point>,
+    term: Vec<Option<NetTerm>>,
+    dist: Vec<f64>,
+    demand: Vec<f64>,
+    /// Nets (with a cost term) touched by each footprint's pads.
+    fp_nets: Vec<Vec<usize>>,
+}
+
+/// What [`Model::eval_move`] changed, to undo a rejected move.
+#[derive(Debug, Default)]
+struct Undo {
+    pads: Vec<(usize, Point)>,
+    nets: Vec<(usize, Option<NetTerm>)>,
+    fp: usize,
+    dist: f64,
+}
+
+impl Model<'_> {
+    fn net_term(&self, n: usize, pts: &[Point]) -> Option<NetTerm> {
+        if pts.len() < 2 || self.weights[n] == 0.0 {
+            return None;
+        }
+        let r = Rect::from_points(pts)?;
+        let (origin, bx, by) = self.bins;
+        #[allow(clippy::cast_precision_loss)]
+        let bin = self.cfg.bin.max(1) as f64;
+        #[allow(clippy::cast_precision_loss)]
+        let (w, h) = (r.width() as f64, r.height() as f64);
+        let wire = self.weights[n] * (w + h);
+        let (w, h) = (w.max(bin), h.max(bin));
+        let density = (w + h) / (w * h) * bin;
+        let i0 = ((r.min.x - origin.x) / self.cfg.bin).clamp(0, bx - 1);
+        let i1 = ((r.max.x - origin.x) / self.cfg.bin).clamp(0, bx - 1);
+        let j0 = ((r.min.y - origin.y) / self.cfg.bin).clamp(0, by - 1);
+        let j1 = ((r.max.y - origin.y) / self.cfg.bin).clamp(0, by - 1);
+        Some(NetTerm { wire, contrib: density * self.weights[n], bins: (i0, i1, j0, j1) })
+    }
+
+    fn net_term_cached(&self, cc: &CostCache, n: usize) -> Option<NetTerm> {
+        let pts: Vec<Point> = self.pads_by_net[n].iter().map(|p| cc.padpos[p.0 as usize]).collect();
+        self.net_term(n, &pts)
+    }
+
+    fn cache(&self, pl: &[Placement]) -> CostCache {
+        let board = self.board;
+        let padpos: Vec<Point> = board.pad_ids().map(|p| self.pad_pos(pl, p)).collect();
+        let (_, bx, by) = self.bins;
+        #[allow(clippy::cast_sign_loss, clippy::cast_possible_truncation)]
+        let demand = vec![0.0f64; (bx * by) as usize];
+        let mut cc = CostCache {
+            padpos,
+            term: Vec::new(),
+            dist: board
+                .footprints
+                .iter()
+                .zip(pl)
+                .map(|(f, p)| p.pos.dist(f.original.pos))
+                .collect(),
+            demand,
+            fp_nets: Vec::new(),
+        };
+        cc.term = (0..self.pads_by_net.len()).map(|n| self.net_term_cached(&cc, n)).collect();
+        cc.fp_nets = board
+            .footprints
+            .iter()
+            .map(|f| {
+                let mut v: Vec<usize> = f
+                    .pads
+                    .iter()
+                    .map(|&p| board.pad(p).net.idx())
+                    .filter(|&n| cc.term[n].is_some())
+                    .collect();
+                v.sort_unstable();
+                v.dedup();
+                v
+            })
+            .collect();
+        cc
+    }
+
+    /// Cost of the cached placement.
+    fn cost_cached(&self, cc: &mut CostCache) -> Cost {
+        let (_, bx, _) = self.bins;
+        cc.demand.fill(0.0);
+        let mut wire = 0.0;
+        for t in cc.term.iter().flatten() {
+            wire += t.wire;
+            let (i0, i1, j0, j1) = t.bins;
+            for j in j0..=j1 {
+                for i in i0..=i1 {
+                    #[allow(clippy::cast_sign_loss, clippy::cast_possible_truncation)]
+                    {
+                        cc.demand[(j * bx + i) as usize] += t.contrib;
+                    }
+                }
+            }
+        }
+        let cong: f64 =
+            cc.demand.iter().map(|&d| (d - 0.6 * self.capacity).max(0.0).powi(2)).sum::<f64>()
+                / self.capacity.max(1.0);
+        let disp: f64 = cc.dist.iter().copied().sum();
+        let (wire_mm, displacement_mm) = (mm(wire), mm(disp));
+        Cost {
+            wire_mm,
+            congestion: cong,
+            displacement_mm,
+            total: self.cfg.w_wire * wire_mm
+                + self.cfg.w_cong * cong
+                + self.cfg.w_disp * displacement_mm,
+        }
+    }
+
+    /// Cost with footprint `fid` moved to `cand`; the cache is left in the moved state
+    /// (call [`CostCache::undo`] to reject).
+    fn eval_move(&self, cc: &mut CostCache, fid: FootprintId, cand: Placement) -> (Cost, Undo) {
+        let fp = self.board.footprint(fid);
+        let mut undo = Undo { fp: fid.idx(), dist: cc.dist[fid.idx()], ..Undo::default() };
+        for &p in &fp.pads {
+            let i = p.0 as usize;
+            undo.pads.push((i, cc.padpos[i]));
+            cc.padpos[i] = self.board.pad(p).position(cand);
+        }
+        cc.dist[fid.idx()] = cand.pos.dist(fp.original.pos);
+        for k in 0..cc.fp_nets[fid.idx()].len() {
+            let n = cc.fp_nets[fid.idx()][k];
+            undo.nets.push((n, cc.term[n]));
+            cc.term[n] = self.net_term_cached(cc, n);
+        }
+        (self.cost_cached(cc), undo)
+    }
+}
+
+impl CostCache {
+    fn undo(&mut self, u: Undo) {
+        for (i, p) in u.pads {
+            self.padpos[i] = p;
+        }
+        for (n, t) in u.nets {
+            self.term[n] = t;
+        }
+        self.dist[u.fp] = u.dist;
+    }
+}
+
 /// Rounds `v` to the nearest multiple of `g` (ties toward +∞), in absolute coordinates.
 #[must_use]
 pub const fn snap(v: Coord, g: Coord) -> Coord {
     (v + g / 2).div_euclid(g) * g
 }
 
+/// Conservative extents that let [`legal_with`] skip far-away footprints without building
+/// their geometry. Every extent is an upper bound of the true distance from the
+/// footprint's anchor (plus a rounding margin), so skipping never changes the verdict.
+#[derive(Debug)]
+pub struct Prefilter {
+    /// Per footprint: radius of the courtyard around the anchor.
+    court: Vec<Coord>,
+    /// Per footprint: radius around the anchor that contains every pad hull.
+    pads: Vec<Coord>,
+}
+
+/// Slack for the integer rounding of rotated points.
+const EXTENT_MARGIN: Coord = 16;
+
+fn norm_ceil(p: Point) -> Coord {
+    #[allow(clippy::cast_precision_loss, clippy::cast_possible_truncation)]
+    let n = (p.x as f64).hypot(p.y as f64).ceil() as Coord;
+    n
+}
+
+impl Prefilter {
+    /// Builds the extents of `board`'s footprints.
+    #[must_use]
+    pub fn new(board: &Board) -> Self {
+        let court = board
+            .footprints
+            .iter()
+            .map(|f| f.courtyard_local.pts.iter().map(|&p| norm_ceil(p)).max().unwrap_or(0))
+            .map(|r| r + EXTENT_MARGIN)
+            .collect();
+        let pads = board
+            .footprints
+            .iter()
+            .map(|f| {
+                f.pads
+                    .iter()
+                    .map(|&id| {
+                        let pad = board.pad(id);
+                        let h = pad.shape.local_hull();
+                        let hull_r = h.pts.iter().map(|&p| norm_ceil(p)).max().unwrap_or(0);
+                        norm_ceil(pad.local_pos) + hull_r + h.radius
+                    })
+                    .max()
+                    .unwrap_or(0)
+                    + EXTENT_MARGIN
+            })
+            .collect();
+        Self { court, pads }
+    }
+}
+
 /// Exact hard-constraint check for placing footprint `fid` at `pl` while every other
 /// footprint uses `placements`.
 #[must_use]
 pub fn legal(board: &Board, placements: &[Placement], fid: FootprintId, pl: Placement) -> bool {
+    legal_with(board, &Prefilter::new(board), placements, fid, pl)
+}
+
+/// [`legal`] with precomputed [`Prefilter`] extents (same verdict, far less geometry).
+#[must_use]
+pub fn legal_with(
+    board: &Board,
+    pf: &Prefilter,
+    placements: &[Placement],
+    fid: FootprintId,
+    pl: Placement,
+) -> bool {
     let fp = board.footprint(fid);
     let Mobility::Movable { max_displacement, allow_rotation } = fp.mobility else {
         return pl == fp.original;
@@ -273,6 +495,15 @@ pub fn legal(board: &Board, placements: &[Placement], fid: FootprintId, pl: Plac
     let bb = court.bbox().unwrap_or(Rect::new(pl.pos, pl.pos));
     for (j, other) in board.footprints.iter().enumerate() {
         if j == fid.idx() || other.side != fp.side {
+            continue;
+        }
+        // Courtyards within disjoint anchor discs cannot intersect.
+        let (dx, dy) = (
+            i128::from(placements[j].pos.x) - i128::from(pl.pos.x),
+            i128::from(placements[j].pos.y) - i128::from(pl.pos.y),
+        );
+        let reach = i128::from(pf.court[j] + pf.court[fid.idx()]);
+        if dx * dx + dy * dy > reach * reach {
             continue;
         }
         let oc = other.courtyard_at(placements[j]);
@@ -304,6 +535,13 @@ pub fn legal(board: &Board, placements: &[Placement], fid: FootprintId, pl: Plac
         let hb = h.bbox().inflate(board.rules.max_clearance() + 1);
         for (k, other) in board.footprints.iter().enumerate() {
             if k == fid.idx() {
+                continue;
+            }
+            // Every pad hull of `other` lies within `pf.pads[k]` of its anchor: skip the
+            // whole footprint when that square misses the (inflated) candidate pad box.
+            let (a, r) = (placements[k].pos, pf.pads[k]);
+            if a.x + r < hb.min.x || a.x - r > hb.max.x || a.y + r < hb.min.y || a.y - r > hb.max.y
+            {
                 continue;
             }
             for &qid in &other.pads {
@@ -344,12 +582,14 @@ fn chain(
     board: &Board,
     cfg: &PlaceConfig,
     model: &Model<'_>,
+    pf: &Prefilter,
     movable: &[FootprintId],
     seed: u64,
 ) -> (Vec<Placement>, Cost, u64, u64) {
     let mut rng = Rng::new(seed);
     let mut cur: Vec<Placement> = board.footprints.iter().map(|f| f.placement).collect();
     let mut cur_cost = model.cost(&cur);
+    let mut cc = model.cache(&cur);
     let mut best = cur.clone();
     let mut best_cost = cur_cost;
     let total = u64::from(cfg.moves_per_fp) * movable.len() as u64;
@@ -383,12 +623,12 @@ fn chain(
             cand.pos = Point::new(snap(p.x, g), snap(p.y, g));
         }
         proposed += 1;
-        if cand == cur[fid.idx()] || !legal(board, &cur, fid, cand) {
+        if cand == cur[fid.idx()] || !legal_with(board, pf, &cur, fid, cand) {
             continue;
         }
         let old = cur[fid.idx()];
         cur[fid.idx()] = cand;
-        let c = model.cost(&cur);
+        let (c, undo) = model.eval_move(&mut cc, fid, cand);
         let delta = c.total - cur_cost.total;
         if delta <= 0.0 || rng.next_f64() < ferroute_geom::detmath::exp(-delta / temp) {
             cur_cost = c;
@@ -399,6 +639,7 @@ fn chain(
             }
         } else {
             cur[fid.idx()] = old;
+            cc.undo(undo);
         }
     }
     (best, best_cost, accepted, proposed)
@@ -422,6 +663,7 @@ pub fn optimize(board: &Board, cfg: &PlaceConfig) -> PlaceResult {
         return PlaceResult { before, after: before, ..PlaceResult::default() };
     }
     let starts = cfg.starts.max(1);
+    let pf = Prefilter::new(board);
     let results: Vec<(Vec<Placement>, Cost, u64, u64)> = {
         use rayon::prelude::*;
         (0..starts)
@@ -431,6 +673,7 @@ pub fn optimize(board: &Board, cfg: &PlaceConfig) -> PlaceResult {
                     board,
                     cfg,
                     &model,
+                    &pf,
                     &movable,
                     splitmix64(cfg.seed ^ u64::from(c).wrapping_mul(0xA24B_AED4_963E_E407)),
                 )
