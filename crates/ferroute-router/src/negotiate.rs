@@ -386,7 +386,13 @@ fn route_one(
      -> Vec<usize> {
         let mut got = Vec::new();
         for t in term_of.get(&n).map_or(&[][..], Vec::as_slice) {
-            let Some(s) = t.stub else { continue };
+            let Some(s) = t.stub else {
+                // A plane terminal: arriving there joins the pour, no copper to add.
+                if want(t.island) {
+                    got.push(t.island);
+                }
+                continue;
+            };
             if !want(t.island) || duplicates_breakout(stubs, used, Some(s)) {
                 continue;
             }

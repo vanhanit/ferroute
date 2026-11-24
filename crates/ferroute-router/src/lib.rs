@@ -27,6 +27,7 @@ pub mod meander;
 pub mod negotiate;
 pub mod pairgeom;
 pub mod plan;
+pub mod plane;
 pub mod search;
 pub mod smooth;
 pub mod straighten;
@@ -219,6 +220,13 @@ pub const fn splitmix64(mut x: u64) -> u64 {
 /// Groups each net's pads into islands already connected by existing copper.
 #[must_use]
 pub fn pad_islands(board: &Board) -> Vec<Vec<Vec<PadId>>> {
+    pad_islands_with_planes(board).0
+}
+
+/// [`pad_islands`] plus, per net and island, whether the island touches a stored fill of
+/// its net (a plane): such islands need no via to the pour.
+#[must_use]
+pub fn pad_islands_with_planes(board: &Board) -> (Vec<Vec<Vec<PadId>>>, Vec<Vec<bool>>) {
     let items = copper_items(board);
     let boxes: Vec<Rect> = items.iter().map(|it| it.bbox.inflate(1)).collect();
     let grid = BucketGrid::new(&boxes, 2_000_000);
@@ -237,6 +245,13 @@ pub fn pad_islands(board: &Board) -> Vec<Vec<Vec<PadId>>> {
     for (a, b) in ferroute_drc::zones::fill_links(board, &items) {
         uf.union(a, b);
     }
+    let mut plane_roots: Vec<Vec<u32>> = vec![Vec::new(); board.nets.len()];
+    for (k, f) in ferroute_drc::zones::fill_polys(board).iter().enumerate() {
+        if f.net != NetId::NONE {
+            let r = uf.find(u32::try_from(items.len() + k).unwrap_or(u32::MAX));
+            plane_roots[f.net.idx()].push(r);
+        }
+    }
     let mut out: Vec<Vec<Vec<PadId>>> = vec![Vec::new(); board.nets.len()];
     let mut root_of: Vec<Vec<u32>> = vec![Vec::new(); board.nets.len()];
     for (k, it) in items.iter().enumerate() {
@@ -254,7 +269,12 @@ pub fn pad_islands(board: &Board) -> Vec<Vec<Vec<PadId>>> {
             }
         }
     }
-    out
+    let touches = root_of
+        .iter()
+        .zip(&plane_roots)
+        .map(|(roots, pr)| roots.iter().map(|r| pr.contains(r)).collect())
+        .collect();
+    (out, touches)
 }
 
 /// Routes `board` (pads at their current placements; existing copper is kept fixed).
@@ -380,7 +400,8 @@ pub fn route_once(board: &Board, cfg: &RouterConfig) -> Result<RouteOutcome, Rou
         via_turn: cfg.via_turn_cost,
         kink: cfg.kink_cost,
     };
-    let islands = pad_islands(board);
+    let (islands, island_on_plane) = pad_islands_with_planes(board);
+    let fills = ferroute_drc::zones::fill_polys(board);
     let mut stubs: Vec<Stub> = Vec::new();
     let mut jobs: Vec<NetJob> = Vec::new();
     let mut failed: Vec<NetId> = Vec::new();
@@ -389,11 +410,21 @@ pub fn route_once(board: &Board, cfg: &RouterConfig) -> Result<RouteOutcome, Rou
             continue;
         }
         let groups = &islands[net.idx()];
-        if groups.len() < 2 {
-            continue;
-        }
         let class = usize::from(board.nets[net.idx()].class).min(plan.classes.len() - 1);
         let cp = &plan.classes[class];
+        // The net's pour is one more island unless a pad island already touches it: the
+        // plane joins every pad that reaches it, so those pads need no trace between them.
+        let on_plane = &island_on_plane[net.idx()];
+        let plane_terms = if groups.is_empty() {
+            Vec::new()
+        } else {
+            let centres: Vec<_> = groups.iter().flatten().map(|&p| board.pad_position(p)).collect();
+            plane::plane_terminals(&grid, &legal[class], &cp.geom, net, &fills, &centres)
+        };
+        let plane_island = !plane_terms.is_empty() && !on_plane.iter().any(|&b| b);
+        if groups.len() + usize::from(plane_island) < 2 {
+            continue;
+        }
         let mut term_groups: Vec<Vec<Terminal>> = Vec::with_capacity(groups.len());
         for g in groups {
             let mut ts = Vec::new();
@@ -430,7 +461,13 @@ pub fn route_once(board: &Board, cfg: &RouterConfig) -> Result<RouteOutcome, Rou
                     ));
                 }
             }
+            if on_plane[term_groups.len()] {
+                ts.extend(plane_terms.iter().cloned());
+            }
             term_groups.push(ts);
+        }
+        if plane_island {
+            term_groups.push(plane_terms);
         }
         if term_groups.iter().any(Vec::is_empty) {
             failed.push(net);

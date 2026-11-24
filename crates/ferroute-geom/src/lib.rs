@@ -697,6 +697,26 @@ impl Polygon {
         !self.edges().any(|e| h.segment_clearance_violated(e, clearance))
     }
 
+    /// Exact: does the closed disk of `radius` around `c` lie entirely inside this polygon
+    /// (centre inside, every boundary edge at least 1 nm from the disk)? Only edges whose
+    /// bounding box can reach the disk are examined, so it is fast on large polygons.
+    #[must_use]
+    pub fn contains_disk(&self, c: Point, radius: Coord) -> bool {
+        if !self.contains(c) {
+            return false;
+        }
+        let reach = Rect::new(c, c).inflate(radius + 2);
+        let h = Hull::disk(c, radius);
+        !self.edges().any(|e| {
+            Rect::new(
+                Point::new(e.a.x.min(e.b.x), e.a.y.min(e.b.y)),
+                Point::new(e.a.x.max(e.b.x), e.a.y.max(e.b.y)),
+            )
+            .intersects(reach)
+                && h.segment_clearance_violated(e, 1)
+        })
+    }
+
     /// Exact: does hull `h` come closer than `clearance` to this polygon's area
     /// (overlap or proximity)?
     #[must_use]

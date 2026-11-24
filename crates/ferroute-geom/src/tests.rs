@@ -74,6 +74,16 @@ fn polygon_containment() {
 }
 
 #[test]
+fn polygon_contains_disk_exactly() {
+    let l = Polygon::new(vec![p(0, 0), p(100, 0), p(100, 40), p(40, 40), p(40, 100), p(0, 100)]);
+    assert!(l.contains_disk(p(20, 20), 18));
+    assert!(!l.contains_disk(p(20, 20), 20), "touches the boundary");
+    assert!(!l.contains_disk(p(30, 30), 15), "reflex corner");
+    assert!(!l.contains_disk(p(80, 80), 1), "outside");
+    assert!(l.contains_disk(p(70, 20), 18));
+}
+
+#[test]
 fn convex_hull_of_square_with_interior_point() {
     let h = convex_hull(&[p(0, 0), p(10, 0), p(10, 10), p(0, 10), p(5, 5), p(10, 0)]);
     assert_eq!(h.len(), 4);

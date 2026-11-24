@@ -79,3 +79,40 @@ fn a_fill_on_one_layer_only_blocks_that_layer() {
     assert!(rep.introduced().next().is_none(), "{:#?}", rep.violations);
     assert_eq!(rep.connectivity.connections_missing, 0);
 }
+
+/// Two GND SMD pads on F.Cu, a GND pour on B.Cu only: each pad drops a short stub and a
+/// via that lands wholly inside the pour (no via in a pad), without a trace between pads.
+#[test]
+fn plane_nets_reach_their_pour_with_dog_bone_vias() {
+    let mut b = BoardBuilder::new(mm(30), mm(20), 2);
+    let (q, gnd) = (b.net("Q"), b.net("GND"));
+    b.smd2("G1", pt10(60, 100), 0.0, gnd, q);
+    b.smd2("G2", pt10(240, 100), 0.0, gnd, q);
+    let mut board = b.build();
+    let poly = rect(30, 30, 270, 170);
+    board.zones.push(Zone {
+        net: gnd,
+        layers: LayerSet::all(2),
+        outline: poly.clone(),
+        fills: vec![ZoneFill { layer: LayerId(1), polys: vec![poly.clone()] }],
+        clearance: 300_000,
+        min_thickness: 250_000,
+        priority: 0,
+        pad_connection: PadConnection::ThermalRelief,
+        islands: Default::default(),
+        yields: false,
+    });
+    let out = route(&board, &cfg()).expect("route");
+    assert!(out.failed.is_empty(), "{:?} {:?}", out.failed, out.stats);
+    let mut after = board.clone();
+    after.apply(&out.edit);
+    let gvias: Vec<_> = after.vias.iter().filter(|v| v.net == gnd).collect();
+    assert_eq!(gvias.len(), 2, "{gvias:?}");
+    for v in &gvias {
+        assert!(poly.contains_disk(v.pos, v.diameter / 2), "via copper inside the pour");
+        assert!(after.via_in_pad(v).is_none(), "no via in a pad");
+    }
+    let rep = check(&after, &DrcConfig::default());
+    assert!(rep.introduced().next().is_none(), "{:#?}", rep.violations);
+    assert_eq!(rep.connectivity.connections_missing, 0, "{:?}", rep.connectivity);
+}
