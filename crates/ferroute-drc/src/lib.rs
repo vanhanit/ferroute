@@ -18,6 +18,7 @@
 //! copper-to-hole clearance, keep-out areas, courtyard overlap, minimum track width /
 //! via size, and connectivity (unrouted connections + completion ratio).
 
+pub use ferroute_board::custom::Severity;
 use ferroute_board::custom::{ConstraintKind, ItemCtx, ItemType};
 use ferroute_board::{
     Board, FootprintId, LayerId, LayerSet, NetId, Origin, PadId, Side, Via, ViaKind,
@@ -84,6 +85,18 @@ pub enum ViolationKind {
     ViaDrill,
     /// Via / pad annular ring narrower than a custom `annular_width` rule.
     AnnularWidth,
+    /// Track wider than a custom `track_width` `max`.
+    TrackWidthMax,
+    /// Via copper diameter above a custom `via_diameter` `max`.
+    ViaDiameterMax,
+    /// Via drill above a custom `hole_size` `max`.
+    ViaDrillMax,
+    /// Annular ring wider than a custom `annular_width` `max`.
+    AnnularWidthMax,
+    /// Plated or unplated pad hole below a custom `hole_size` `min`.
+    PadDrill,
+    /// Pad hole above a custom `hole_size` `max`.
+    PadDrillMax,
     /// A via whose copper span does not fit its kind (e.g. a micro via over more than two
     /// adjacent layers, a blind via with both ends on outer layers).
     ViaSpan,
@@ -120,6 +133,10 @@ pub struct Violation {
     /// `true` when the violation involves copper created by ferroute or a footprint
     /// ferroute moved. The router invariant is: *no introduced violations, ever*.
     pub introduced: bool,
+    /// [`Severity::Error`] fails the gate; warnings are reported but never fail it.
+    /// Suppressed (`ignore` / `exclusion`) violations are not reported at all.
+    #[serde(default)]
+    pub severity: Severity,
 }
 
 /// Full DRC result.
@@ -130,15 +147,25 @@ pub struct DrcReport {
 }
 
 impl DrcReport {
-    /// No violations of any kind (connectivity not considered).
+    /// No *error* violations (warnings do not count; connectivity not considered).
     #[must_use]
     pub fn is_clean(&self) -> bool {
-        self.violations.is_empty()
+        self.errors().next().is_none()
     }
 
-    /// Violations caused by ferroute (routed copper / moved footprints).
+    /// Hard violations (severity error).
+    pub fn errors(&self) -> impl Iterator<Item = &Violation> {
+        self.violations.iter().filter(|v| v.severity == Severity::Error)
+    }
+
+    /// Non-error violations (custom rules with `(severity warning)`).
+    pub fn warnings(&self) -> impl Iterator<Item = &Violation> {
+        self.violations.iter().filter(|v| v.severity == Severity::Warning)
+    }
+
+    /// Error violations caused by ferroute (routed copper / moved footprints).
     pub fn introduced(&self) -> impl Iterator<Item = &Violation> {
-        self.violations.iter().filter(|v| v.introduced)
+        self.errors().filter(|v| v.introduced)
     }
 
     #[must_use]
@@ -386,7 +413,7 @@ pub fn check(board: &Board, cfg: &DrcConfig) -> DrcReport {
     let max_req = r
         .max_clearance()
         .max(r.hole_clearance)
-        .max(r.hole_to_hole)
+        .max(r.effective_hole_to_hole())
         .max(r.max_custom_min(ConstraintKind::Clearance))
         .max(r.max_custom_min(ConstraintKind::HoleClearance));
     let inflate = (max_req + 1) / 2 + 1;
@@ -418,12 +445,64 @@ pub fn check(board: &Board, cfg: &DrcConfig) -> DrcReport {
         (a.kind, a.a, a.b, a.layer).cmp(&(b.kind, b.a, b.b, b.layer)).then(a.at.cmp(&b.at))
     });
     dedup_arc_pieces(&mut violations);
+    apply_severity(board, &mut violations);
     let connectivity = if cfg.connectivity {
         connectivity::analyse(board, &items)
     } else {
         Connectivity::default()
     };
     DrcReport { violations, connectivity }
+}
+
+/// Constraint a violation kind is governed by (`None` = not a custom-rule constraint).
+const fn constraint_of(kind: ViolationKind) -> Option<ConstraintKind> {
+    Some(match kind {
+        ViolationKind::Clearance => ConstraintKind::Clearance,
+        ViolationKind::EdgeClearance => ConstraintKind::EdgeClearance,
+        ViolationKind::HoleClearance => ConstraintKind::HoleClearance,
+        ViolationKind::HoleToHole => ConstraintKind::HoleToHole,
+        ViolationKind::TrackWidth | ViolationKind::TrackWidthMax => ConstraintKind::TrackWidth,
+        ViolationKind::ViaDiameter | ViolationKind::ViaDiameterMax => ConstraintKind::ViaDiameter,
+        ViolationKind::ViaDrill
+        | ViolationKind::ViaDrillMax
+        | ViolationKind::PadDrill
+        | ViolationKind::PadDrillMax => ConstraintKind::HoleSize,
+        ViolationKind::AnnularWidth | ViolationKind::AnnularWidthMax => {
+            ConstraintKind::AnnularWidth
+        }
+        _ => return None,
+    })
+}
+
+/// Net of a board item (`NetId::NONE` for items without one).
+fn net_of(board: &Board, item: ItemRef) -> NetId {
+    let at = |i: u32| usize::try_from(i).unwrap_or(usize::MAX);
+    match item {
+        ItemRef::Pad(id) => board.pad(id).net,
+        ItemRef::Track(i) => board.tracks.get(at(i)).map_or(NetId::NONE, |t| t.net),
+        ItemRef::Arc(i) => board.arcs.get(at(i)).map_or(NetId::NONE, |t| t.net),
+        ItemRef::Via(i) => board.vias.get(at(i)).map_or(NetId::NONE, |v| v.net),
+        _ => NetId::NONE,
+    }
+}
+
+/// Re-classifies violations by the `(severity ..)` of the custom rule that governs them:
+/// warnings stay in the report as non-errors, `ignore` / `exclusion` drop them.
+fn apply_severity(board: &Board, violations: &mut Vec<Violation>) {
+    if board.rules.custom.is_empty() {
+        return;
+    }
+    let ctx = |item: ItemRef, layer: Option<LayerId>| {
+        let c = item_ctx(item, net_of(board, item));
+        layer.map_or(c, |l| c.on(l))
+    };
+    violations.retain_mut(|v| {
+        let Some(kind) = constraint_of(v.kind) else { return true };
+        let a = ctx(v.a, v.layer);
+        let b = v.b.filter(|b| *b != ItemRef::BoardEdge).map(|b| ctx(b, v.layer));
+        v.severity = board.rules.severity_for(board, kind, &a, b.as_ref());
+        !v.severity.is_suppressed()
+    });
 }
 
 fn check_copper(
@@ -470,6 +549,7 @@ fn check_copper(
                 actual: a.hull.distance(&b.hull),
                 required: req,
                 introduced: a.introduced || b.introduced,
+                severity: Severity::Error,
             })
         })
         .collect()
@@ -506,6 +586,7 @@ fn check_edges(board: &Board, items: &[CopperItem]) -> Vec<Violation> {
                 .fold(f64::INFINITY, f64::min),
             required: edge_req(it),
             introduced: it.introduced,
+            severity: Severity::Error,
         })
         .collect()
 }
@@ -553,11 +634,17 @@ fn check_holes(board: &Board, items: &[CopperItem]) -> Vec<Violation> {
     let r = &board.rules;
     let mut out = Vec::new();
     // Hole-to-hole (net independent).
-    let hb: Vec<Rect> = hs.iter().map(|h| h.hull.bbox().inflate(r.hole_to_hole / 2 + 1)).collect();
+    let reach_h2h = r.effective_hole_to_hole();
+    let hb: Vec<Rect> = hs.iter().map(|h| h.hull.bbox().inflate(reach_h2h / 2 + 1)).collect();
     let hg = BucketGrid::new(&hb, 2_000_000);
     for (i, j) in hg.pairs(&hb) {
         let (a, b) = (&hs[i as usize], &hs[j as usize]);
-        if a.hull.clearance_violated(&b.hull, r.hole_to_hole) {
+        let req = if r.custom.is_empty() {
+            r.hole_to_hole
+        } else {
+            r.hole_to_hole_for(board, &item_ctx(a.item, a.net), &item_ctx(b.item, b.net))
+        };
+        if a.hull.clearance_violated(&b.hull, req) {
             out.push(Violation {
                 kind: ViolationKind::HoleToHole,
                 a: a.item,
@@ -565,8 +652,9 @@ fn check_holes(board: &Board, items: &[CopperItem]) -> Vec<Violation> {
                 layer: None,
                 at: mid(a.hull.bbox(), b.hull.bbox()),
                 actual: a.hull.distance(&b.hull),
-                required: r.hole_to_hole,
+                required: req,
                 introduced: a.introduced || b.introduced,
+                severity: Severity::Error,
             });
         }
     }
@@ -598,6 +686,7 @@ fn check_holes(board: &Board, items: &[CopperItem]) -> Vec<Violation> {
                     actual: it.hull.distance(&h.hull),
                     required: req,
                     introduced: h.introduced || it.introduced,
+                    severity: Severity::Error,
                 });
             }
         }
@@ -626,6 +715,7 @@ fn check_keepouts(board: &Board, items: &[CopperItem]) -> Vec<Violation> {
                     actual: 0.0,
                     required: 0,
                     introduced: it.introduced,
+                    severity: Severity::Error,
                 });
             }
         }
@@ -641,6 +731,7 @@ fn check_keepouts(board: &Board, items: &[CopperItem]) -> Vec<Violation> {
                         actual: 0.0,
                         required: 0,
                         introduced: fp.placement != fp.original,
+                        severity: Severity::Error,
                     });
                 }
             }
@@ -676,6 +767,7 @@ pub fn check_courtyards(board: &Board) -> Vec<Violation> {
                 actual: 0.0,
                 required: 0,
                 introduced: fa.placement != fa.original || fb.placement != fb.original,
+                severity: Severity::Error,
             })
         })
         .collect()
@@ -692,31 +784,29 @@ fn check_sizes(board: &Board) -> Vec<Violation> {
         }
     };
     let mut out = Vec::new();
-    for (i, t) in board.tracks.iter().enumerate() {
-        let req = track_min(t.net, t.layer);
-        if t.width < req {
-            out.push(size_violation(
-                ViolationKind::TrackWidth,
-                ItemRef::Track(idx(i)),
-                t.start,
-                t.width,
-                req,
-                t.origin,
-            ));
+    let track_max = |net: NetId, layer: LayerId| {
+        if custom {
+            let ctx = ItemCtx::new(net, ItemType::Track).on(layer);
+            r.max_limit_for(board, ConstraintKind::TrackWidth, &ctx, None)
+        } else {
+            None
         }
+    };
+    let mut width_check =
+        |item: ItemRef, at: Point, width: Coord, net: NetId, layer: LayerId, origin: Origin| {
+            let req = track_min(net, layer);
+            if width < req {
+                out.push(size_violation(ViolationKind::TrackWidth, item, at, width, req, origin));
+            }
+            if let Some(mx) = track_max(net, layer).filter(|&mx| width > mx) {
+                out.push(size_violation(ViolationKind::TrackWidthMax, item, at, width, mx, origin));
+            }
+        };
+    for (i, t) in board.tracks.iter().enumerate() {
+        width_check(ItemRef::Track(idx(i)), t.start, t.width, t.net, t.layer, t.origin);
     }
     for (i, t) in board.arcs.iter().enumerate() {
-        let req = track_min(t.net, t.layer);
-        if t.width < req {
-            out.push(size_violation(
-                ViolationKind::TrackWidth,
-                ItemRef::Arc(idx(i)),
-                t.start,
-                t.width,
-                req,
-                t.origin,
-            ));
-        }
+        width_check(ItemRef::Arc(idx(i)), t.start, t.width, t.net, t.layer, t.origin);
     }
     for (i, v) in board.vias.iter().enumerate() {
         let mut ctx = ItemCtx::new(v.net, ItemType::Via);
@@ -741,6 +831,7 @@ fn check_sizes(board: &Board) -> Vec<Violation> {
                 actual: 0.0,
                 required: 0,
                 introduced: v.origin == Origin::Routed,
+                severity: Severity::Error,
             });
         }
         if v.diameter < min_d {
@@ -764,18 +855,76 @@ fn check_sizes(board: &Board) -> Vec<Violation> {
             ));
         }
         if custom {
-            let ring_min = r.min_annular_for(board, &ctx);
-            let ring = (v.diameter - v.drill) / 2;
-            if ring < ring_min {
-                out.push(size_violation(
-                    ViolationKind::AnnularWidth,
-                    ItemRef::Via(idx(i)),
-                    v.pos,
-                    ring,
-                    ring_min,
-                    v.origin,
-                ));
+            let at = ItemRef::Via(idx(i));
+            let max_of = |k| r.max_limit_for(board, k, &ctx, None);
+            for (kind, actual, mx) in [
+                (ViolationKind::ViaDiameterMax, v.diameter, max_of(ConstraintKind::ViaDiameter)),
+                (ViolationKind::ViaDrillMax, v.drill, max_of(ConstraintKind::HoleSize)),
+            ] {
+                if let Some(mx) = mx.filter(|&m| actual > m) {
+                    out.push(size_violation(kind, at, v.pos, actual, mx, v.origin));
+                }
             }
+            let ring = (v.diameter - v.drill) / 2;
+            out.extend(annular_violations(board, &ctx, at, v.pos, ring, v.origin));
+        }
+    }
+    if custom {
+        out.extend(pad_hole_violations(board));
+    }
+    out
+}
+
+/// Annular-ring `min` / `max` custom-rule violations for one ring width.
+fn annular_violations(
+    board: &Board,
+    ctx: &ItemCtx,
+    item: ItemRef,
+    at: Point,
+    ring: Coord,
+    origin: Origin,
+) -> Vec<Violation> {
+    let r = &board.rules;
+    let mut out = Vec::new();
+    let ring_min = r.min_annular_for(board, ctx);
+    if ring < ring_min {
+        out.push(size_violation(ViolationKind::AnnularWidth, item, at, ring, ring_min, origin));
+    }
+    if let Some(mx) =
+        r.max_limit_for(board, ConstraintKind::AnnularWidth, ctx, None).filter(|&m| ring > m)
+    {
+        out.push(size_violation(ViolationKind::AnnularWidthMax, item, at, ring, mx, origin));
+    }
+    out
+}
+
+/// Custom `hole_size` / `annular_width` rules for pad holes. Pads of a footprint ferroute
+/// moved count as introduced. Pads whose copper is an arbitrary convex polygon have no
+/// well-defined ring and are only checked for hole size.
+fn pad_hole_violations(board: &Board) -> Vec<Violation> {
+    let r = &board.rules;
+    let mut out = Vec::new();
+    for id in board.pad_ids() {
+        let pad = board.pad(id);
+        let Some(d) = pad.drill else { continue };
+        let fp = board.footprint(pad.footprint);
+        let origin = if fp.placement != fp.original { Origin::Routed } else { Origin::Existing };
+        let at = board.pad_position(id);
+        let item = ItemRef::Pad(id);
+        let ctx = ItemCtx::new(pad.net, ItemType::Pad);
+        let min = r.custom_min_for(board, ConstraintKind::HoleSize, &ctx, None);
+        if d.diameter < min {
+            out.push(size_violation(ViolationKind::PadDrill, item, at, d.diameter, min, origin));
+        }
+        if let Some(mx) =
+            r.max_limit_for(board, ConstraintKind::HoleSize, &ctx, None).filter(|&m| d.diameter > m)
+        {
+            out.push(size_violation(ViolationKind::PadDrillMax, item, at, d.diameter, mx, origin));
+        }
+        if d.plated
+            && let Some(m) = dfm::pad_min_dimension(&pad.shape)
+        {
+            out.extend(annular_violations(board, &ctx, item, at, (m - d.diameter) / 2, origin));
         }
     }
     out
@@ -817,6 +966,7 @@ fn size_violation(
         actual,
         required,
         introduced: origin == Origin::Routed,
+        severity: Severity::Error,
     }
 }
 

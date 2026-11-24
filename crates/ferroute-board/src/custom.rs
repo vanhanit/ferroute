@@ -19,6 +19,7 @@ pub enum ConstraintKind {
     TrackWidth,
     ViaDiameter,
     HoleSize,
+    HoleToHole,
     HoleClearance,
     EdgeClearance,
     AnnularWidth,
@@ -36,6 +37,7 @@ impl ConstraintKind {
             Self::TrackWidth => "track_width",
             Self::ViaDiameter => "via_diameter",
             Self::HoleSize => "hole_size",
+            Self::HoleToHole => "hole_to_hole",
             Self::HoleClearance => "hole_clearance",
             Self::EdgeClearance => "edge_clearance",
             Self::AnnularWidth => "annular_width",
@@ -53,6 +55,7 @@ impl ConstraintKind {
             "track_width" => Self::TrackWidth,
             "via_diameter" => Self::ViaDiameter,
             "hole_size" | "hole" => Self::HoleSize,
+            "hole_to_hole" => Self::HoleToHole,
             "hole_clearance" => Self::HoleClearance,
             "edge_clearance" => Self::EdgeClearance,
             "annular_width" => Self::AnnularWidth,
@@ -70,6 +73,52 @@ pub struct Limits {
     pub min: Option<Coord>,
     pub max: Option<Coord>,
     pub opt: Option<Coord>,
+}
+
+/// `(severity ..)` of a rule. Only [`Severity::Error`] is a hard failure (the gate);
+/// warnings are reported as non-error violations, `Ignore` / `Exclusion` suppress them.
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum Severity {
+    #[default]
+    Error,
+    Warning,
+    Ignore,
+    Exclusion,
+}
+
+impl Severity {
+    /// Parses a KiCad severity keyword.
+    #[must_use]
+    pub fn from_keyword(s: &str) -> Option<Self> {
+        Some(match s {
+            "error" => Self::Error,
+            "warning" => Self::Warning,
+            "ignore" => Self::Ignore,
+            "exclusion" => Self::Exclusion,
+            _ => return None,
+        })
+    }
+
+    /// Strictness order: error > warning > ignore = exclusion.
+    const fn rank(self) -> u8 {
+        match self {
+            Self::Error => 2,
+            Self::Warning => 1,
+            Self::Ignore | Self::Exclusion => 0,
+        }
+    }
+
+    /// The stricter of two severities.
+    #[must_use]
+    pub const fn stricter(self, o: Self) -> Self {
+        if o.rank() > self.rank() { o } else { self }
+    }
+
+    /// `true` when violations of this severity are suppressed entirely.
+    #[must_use]
+    pub const fn is_suppressed(self) -> bool {
+        self.rank() == 0
+    }
 }
 
 /// `(layer ..)` filter of a rule.
@@ -129,6 +178,9 @@ pub struct CustomRule {
     pub condition: Cond,
     pub layer: Option<LayerFilter>,
     pub constraints: Vec<(ConstraintKind, Limits)>,
+    /// `(severity ..)`; defaults to [`Severity::Error`].
+    #[serde(default)]
+    pub severity: Severity,
 }
 
 /// Kind of a board item as seen by conditions (`A.Type`).
@@ -343,6 +395,100 @@ impl crate::DesignRules {
         cur
     }
 
+    /// Smallest `max` of `kind` for the pair: the last definite rule with a `max` sets it
+    /// (winner-takes-all), a maybe-matching rule can only lower it. `None` = unbounded.
+    #[must_use]
+    pub fn max_limit_for(
+        &self,
+        board: &Board,
+        kind: ConstraintKind,
+        a: &ItemCtx,
+        b: Option<&ItemCtx>,
+    ) -> Option<Coord> {
+        let mut cur: Option<Coord> = None;
+        for r in &self.custom {
+            let Some(v) = r.limits(kind).and_then(|l| l.max) else { continue };
+            match r.matches(board, a, b) {
+                Tri::True => cur = Some(v),
+                Tri::Maybe => cur = Some(cur.map_or(v, |c| c.min(v))),
+                Tri::False => {}
+            }
+        }
+        cur
+    }
+
+    /// Smallest `max` of `kind` over every rule that may apply to an item of `net`
+    /// (conservative; pair rules count when `net` can be either side).
+    #[must_use]
+    pub fn max_limit_for_net(
+        &self,
+        board: &Board,
+        kind: ConstraintKind,
+        net: NetId,
+        item: Option<ItemType>,
+        pair: bool,
+    ) -> Option<Coord> {
+        let a = ItemCtx { net: Some(net), kind: item, layer: None };
+        let other = pair.then_some(ItemCtx::UNKNOWN);
+        self.custom
+            .iter()
+            .filter_map(|r| {
+                let v = r.limits(kind)?.max?;
+                (r.matches(board, &a, other.as_ref()) != Tri::False).then_some(v)
+            })
+            .min()
+    }
+
+    /// Severity a violation of `kind` between `a` and `b` is reported with: the last
+    /// definite rule constraining `kind` decides (default error); a maybe-matching rule can
+    /// only make it stricter.
+    #[must_use]
+    pub fn severity_for(
+        &self,
+        board: &Board,
+        kind: ConstraintKind,
+        a: &ItemCtx,
+        b: Option<&ItemCtx>,
+    ) -> Severity {
+        let mut cur = Severity::Error;
+        for r in &self.custom {
+            if r.limits(kind).is_none() {
+                continue;
+            }
+            match r.matches(board, a, b) {
+                Tri::True => cur = r.severity,
+                Tri::Maybe => cur = cur.stricter(r.severity),
+                Tri::False => {}
+            }
+        }
+        cur
+    }
+
+    /// Minimum of `kind` demanded by custom rules alone (0 when none applies).
+    #[must_use]
+    pub fn custom_min_for(
+        &self,
+        board: &Board,
+        kind: ConstraintKind,
+        a: &ItemCtx,
+        b: Option<&ItemCtx>,
+    ) -> Coord {
+        self.resolve(board, kind, a, b, 0)
+    }
+
+    /// Drill-edge to drill-edge distance required between two holes.
+    #[must_use]
+    pub fn hole_to_hole_for(&self, board: &Board, a: &ItemCtx, b: &ItemCtx) -> Coord {
+        self.resolve(board, ConstraintKind::HoleToHole, a, Some(b), self.hole_to_hole)
+    }
+
+    /// Largest hole-to-hole distance any pair may need (sizes query windows and routing
+    /// reach: use this instead of `hole_to_hole` wherever a conservative bound is needed).
+    #[must_use]
+    pub fn effective_hole_to_hole(&self) -> Coord {
+        self.hole_to_hole.max(self.max_custom_min(ConstraintKind::HoleToHole))
+    }
+
     /// Required copper clearance between two items on the layer in their contexts.
     #[must_use]
     pub fn clearance_for(&self, board: &Board, a: &ItemCtx, b: &ItemCtx) -> Coord {
@@ -508,6 +654,7 @@ mod tests {
             condition: c,
             layer: None,
             constraints: vec![(kind, Limits { min: Some(min), ..Limits::default() })],
+            severity: Severity::Error,
         }
     }
 
@@ -616,6 +763,7 @@ mod tests {
                     ConstraintKind::Length,
                     Limits { min: Some(mm(5)), max: Some(mm(40)), opt: None },
                 )],
+                severity: Severity::Error,
             },
         ];
         assert_eq!(b.rules.min_width_for_net(&b, lv), 300_000);
@@ -623,5 +771,75 @@ mod tests {
         assert_eq!(b.rules.length_limits_for_net(&b, lv), (Some(mm(5)), Some(mm(40))));
         assert_eq!(b.rules.min_track_width_for(&b, &ItemCtx::new(lv, ItemType::Track)), 300_000);
         assert_eq!(b.rules.min_track_width_for(&b, &ItemCtx::new(hv, ItemType::Track)), 0);
+    }
+
+    fn limits_rule(c: Cond, kind: ConstraintKind, l: Limits, sev: Severity) -> CustomRule {
+        CustomRule {
+            name: "l".into(),
+            condition: c,
+            layer: None,
+            constraints: vec![(kind, l)],
+            severity: sev,
+        }
+    }
+
+    #[test]
+    fn max_limit_last_definite_wins_maybe_only_lowers() {
+        let (mut b, _, lv, _) = board();
+        let mx = |v| Limits { max: Some(v), ..Limits::default() };
+        let a = ItemCtx::new(lv, ItemType::Track);
+        let k = ConstraintKind::TrackWidth;
+        assert_eq!(b.rules.max_limit_for(&b, k, &a, None), None);
+        b.rules.custom = vec![
+            limits_rule(Cond::True, k, mx(mm(1)), Severity::Error),
+            limits_rule(Cond::True, k, mx(mm(2)), Severity::Error),
+        ];
+        assert_eq!(b.rules.max_limit_for(&b, k, &a, None), Some(mm(2)));
+        let maybe = |v| limits_rule(Cond::Unsupported("u".into()), k, mx(v), Severity::Error);
+        b.rules.custom.push(maybe(mm(1)));
+        assert_eq!(b.rules.max_limit_for(&b, k, &a, None), Some(mm(1)), "maybe lowers");
+        b.rules.custom[2] = maybe(mm(3));
+        assert_eq!(b.rules.max_limit_for(&b, k, &a, None), Some(mm(2)), "maybe never raises");
+        let net = b.rules.max_limit_for_net(&b, k, lv, Some(ItemType::Track), false);
+        assert_eq!(net, Some(mm(1)), "per-net bound is the smallest of all candidate rules");
+    }
+
+    #[test]
+    fn severity_last_definite_wins_maybe_is_stricter() {
+        let (mut b, hv, lv, _) = board();
+        let k = ConstraintKind::Clearance;
+        let mn = Limits { min: Some(mm(1)), ..Limits::default() };
+        let (a, c) = (ItemCtx::new(hv, ItemType::Track), ItemCtx::new(lv, ItemType::Track));
+        assert_eq!(b.rules.severity_for(&b, k, &a, Some(&c)), Severity::Error);
+        b.rules.custom = vec![limits_rule(Cond::True, k, mn, Severity::Warning)];
+        assert_eq!(b.rules.severity_for(&b, k, &a, Some(&c)), Severity::Warning);
+        b.rules.custom.push(limits_rule(Cond::Unsupported("u".into()), k, mn, Severity::Error));
+        assert_eq!(b.rules.severity_for(&b, k, &a, Some(&c)), Severity::Error);
+        b.rules.custom[1].severity = Severity::Ignore;
+        assert_eq!(b.rules.severity_for(&b, k, &a, Some(&c)), Severity::Warning);
+        b.rules.custom[1] = limits_rule(Cond::True, k, mn, Severity::Exclusion);
+        assert!(b.rules.severity_for(&b, k, &a, Some(&c)).is_suppressed());
+        // A rule of another constraint kind does not influence it.
+        let w = ConstraintKind::TrackWidth;
+        b.rules.custom = vec![limits_rule(Cond::True, w, mn, Severity::Ignore)];
+        assert_eq!(b.rules.severity_for(&b, k, &a, Some(&c)), Severity::Error);
+    }
+
+    #[test]
+    fn hole_to_hole_rule_resolves_and_widens_reach() {
+        let (mut b, hv, lv, _) = board();
+        let a = ItemCtx::new(hv, ItemType::Via);
+        let c = ItemCtx::new(lv, ItemType::Pad);
+        assert_eq!(b.rules.hole_to_hole_for(&b, &a, &c), b.rules.hole_to_hole);
+        b.rules.custom.push(rule(
+            "h",
+            eq(RuleSide::A, Field::Type, "via"),
+            ConstraintKind::HoleToHole,
+            mm(1),
+        ));
+        assert_eq!(b.rules.hole_to_hole_for(&b, &a, &c), mm(1));
+        assert_eq!(b.rules.hole_to_hole_for(&b, &c, &a), mm(1), "commutative");
+        assert_eq!(b.rules.effective_hole_to_hole(), mm(1));
+        assert_eq!(ConstraintKind::from_keyword("hole_to_hole"), Some(ConstraintKind::HoleToHole));
     }
 }

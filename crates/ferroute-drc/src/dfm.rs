@@ -117,7 +117,7 @@ impl DfmIssue {
 
 /// Smallest copper dimension of a pad (the ring is measured across it); `None` for
 /// custom polygons, whose inscribed size is not derivable from a convex superset.
-fn pad_min_dimension(shape: &PadShape) -> Option<Coord> {
+pub(crate) fn pad_min_dimension(shape: &PadShape) -> Option<Coord> {
     match shape {
         PadShape::Circle { diameter } => Some(*diameter),
         PadShape::Rect { w, h } | PadShape::Oval { w, h } | PadShape::RoundRect { w, h, .. } => {
@@ -254,7 +254,7 @@ fn npth_copper(board: &Board, cfg: &DfmConfig) -> Vec<DfmIssue> {
 mod tests {
     use super::*;
     use ferroute_board::builder::{BoardBuilder, mm, pt10};
-    use ferroute_board::custom::{Cond, ConstraintKind, CustomRule, Limits};
+    use ferroute_board::custom::{Cond, ConstraintKind, CustomRule, Limits, Severity};
     use ferroute_board::{Drill, Origin};
 
     fn via_board(diameter: Coord, drill: Coord) -> Board {
@@ -293,6 +293,7 @@ mod tests {
                 ConstraintKind::AnnularWidth,
                 Limits { min: Some(200_000), ..Limits::default() },
             )],
+            severity: Severity::Error,
         });
         assert_eq!(
             kinds(&board, &cfg),

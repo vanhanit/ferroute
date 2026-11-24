@@ -35,9 +35,13 @@ pub fn run(a: &DrcArgs) -> Result<ExitCode> {
     let mut kinds: Vec<_> = summary(&rep).into_iter().collect();
     kinds.sort();
     out(&format!(
-        "{}: {} violation(s), {} unrouted connection(s), completion {:.1}%",
+        "{}: {} violation(s){}, {} unrouted connection(s), completion {:.1}%",
         a.board.display(),
-        rep.violations.len(),
+        rep.errors().count(),
+        match rep.warnings().count() {
+            0 => String::new(),
+            w => format!(" + {w} warning(s)"),
+        },
         rep.connectivity.connections_missing,
         rep.connectivity.completion() * 100.0
     ));
@@ -46,7 +50,8 @@ pub fn run(a: &DrcArgs) -> Result<ExitCode> {
     }
     for v in rep.violations.iter().take(50) {
         out(&format!(
-            "  - {:?} {} ↔ {} at ({:.3}, {:.3}) mm: {:.4} mm < {:.4} mm",
+            "  - {}{:?} {} ↔ {} at ({:.3}, {:.3}) mm: {:.4} mm < {:.4} mm",
+            if v.severity == ferroute_drc::Severity::Warning { "warning: " } else { "" },
             v.kind,
             item_label(&kb.board, v.a),
             v.b.map_or_else(String::new, |b| item_label(&kb.board, b)),
@@ -70,7 +75,7 @@ pub fn run(a: &DrcArgs) -> Result<ExitCode> {
         }
         std::fs::write(p, serde_json::to_string_pretty(&v)?)?;
     }
-    let fail = (a.fail_on_violation && !rep.violations.is_empty())
+    let fail = (a.fail_on_violation && !rep.is_clean())
         || (a.fail_on_unconnected && rep.connectivity.connections_missing > 0);
     Ok(if fail { ExitCode::from(1) } else { ExitCode::SUCCESS })
 }

@@ -3,9 +3,11 @@
 //!
 //! Supported: `(version N)`, `(rule NAME (condition "..") (layer ..) (severity ..)
 //! (constraint TYPE (min ..) (max ..) (opt ..)))` for clearance, track_width,
-//! via_diameter, hole_size, hole_clearance, edge_clearance, annular_width, diff_pair_gap,
+//! via_diameter, hole_size, hole_to_hole, hole_clearance, edge_clearance, annular_width, diff_pair_gap,
 //! length and skew. Conditions: `A.`/`B.` `NetClass`, `NetName`, `Type`, `Layer` compared
 //! with `==`/`!=` (KiCad `*`/`?` wildcards), combined with `&&`, `||`, `!`, parentheses.
+//! `(severity error|warning|ignore|exclusion)` is honoured: warnings are reported as
+//! non-error violations, `ignore`/`exclusion` suppress; an unknown severity is an error.
 //! Anything else (`insideArea`, `Pad_Type`, ...) becomes [`Cond::Unsupported`] and is
 //! reported in the returned warnings; unsupported constraint types are skipped with a
 //! warning.
@@ -13,7 +15,7 @@
 use crate::KicadError;
 use crate::sexpr::{SExpr, parse};
 use ferroute_board::custom::{
-    CmpOp, Cond, ConstraintKind, CustomRule, Field, LayerFilter, Limits, RuleSide,
+    CmpOp, Cond, ConstraintKind, CustomRule, Field, LayerFilter, Limits, RuleSide, Severity,
 };
 use ferroute_geom::Coord;
 use ferroute_geom::units::mm_to_nm;
@@ -54,6 +56,7 @@ fn parse_rule(node: &SExpr, out: &mut DruRules) {
         condition: Cond::True,
         layer: None,
         constraints: Vec::new(),
+        severity: Severity::Error,
     };
     let warn = |out: &mut DruRules, m: String| out.warnings.push(format!("rule '{name}': {m}"));
     for c in node.items().unwrap_or_default().iter().skip(2) {
@@ -74,8 +77,10 @@ fn parse_rule(node: &SExpr, out: &mut DruRules) {
             }
             Some("severity") => {
                 let s = c.atom(1).unwrap_or("");
-                if s != "error" {
-                    warn(out, format!("severity '{s}' not honoured: enforced as error"));
+                if let Some(sev) = Severity::from_keyword(s) {
+                    rule.severity = sev;
+                } else {
+                    warn(out, format!("unknown severity '{s}': enforced as error"));
                 }
             }
             Some("constraint") => {
@@ -387,6 +392,53 @@ mod tests {
     #[test]
     fn broken_structure_is_an_error_not_silence() {
         assert!(parse_dru("(rule x (constraint clearance (min 1mm))").is_err());
+    }
+
+    #[test]
+    fn severity_is_parsed_and_unknown_stays_error() {
+        let d = parse_dru(
+            r#"(version 1)
+(rule a (severity warning) (constraint clearance (min 1mm)))
+(rule b (severity ignore) (constraint clearance (min 1mm)))
+(rule c (severity exclusion) (constraint clearance (min 1mm)))
+(rule d (severity error) (constraint clearance (min 1mm)))
+(rule e (severity bogus) (constraint clearance (min 1mm)))
+(rule f (constraint clearance (min 1mm)))"#,
+        )
+        .unwrap();
+        let sev: Vec<_> = d.rules.iter().map(|r| r.severity).collect();
+        assert_eq!(
+            sev,
+            [
+                Severity::Warning,
+                Severity::Ignore,
+                Severity::Exclusion,
+                Severity::Error,
+                Severity::Error,
+                Severity::Error
+            ]
+        );
+        assert_eq!(d.warnings.len(), 1, "{:?}", d.warnings);
+        assert!(d.warnings[0].contains("bogus"));
+    }
+
+    #[test]
+    fn hole_to_hole_and_max_limits_parse() {
+        let d = parse_dru(
+            r#"(rule h (constraint hole_to_hole (min 0.4mm)))
+(rule w (constraint track_width (min 0.1mm) (max 1mm) (opt 0.2mm)))
+(rule v (constraint via_diameter (max 0.8mm)))
+(rule s (constraint hole_size (max 0.5mm)))
+(rule r (constraint annular_width (max 0.3mm)))"#,
+        )
+        .unwrap();
+        assert_eq!(d.rules.len(), 5, "{:?}", d.warnings);
+        assert_eq!(d.rules[0].limits(ConstraintKind::HoleToHole).unwrap().min, Some(400_000));
+        let w = d.rules[1].limits(ConstraintKind::TrackWidth).unwrap();
+        assert_eq!((w.min, w.max, w.opt), (Some(100_000), Some(1_000_000), Some(200_000)));
+        assert_eq!(d.rules[2].limits(ConstraintKind::ViaDiameter).unwrap().max, Some(800_000));
+        assert_eq!(d.rules[3].limits(ConstraintKind::HoleSize).unwrap().max, Some(500_000));
+        assert_eq!(d.rules[4].limits(ConstraintKind::AnnularWidth).unwrap().max, Some(300_000));
     }
 
     #[test]

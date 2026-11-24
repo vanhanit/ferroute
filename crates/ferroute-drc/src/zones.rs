@@ -6,7 +6,7 @@
 //! an unfilled zone contributes nothing.
 
 use crate::connectivity::CONTACT_TOLERANCE;
-use crate::{BucketGrid, CopperItem, ItemRef, Violation, ViolationKind};
+use crate::{BucketGrid, CopperItem, ItemRef, Severity, Violation, ViolationKind};
 use ferroute_board::custom::{ItemCtx, ItemType};
 use ferroute_board::{Board, LayerId, NetId};
 use ferroute_geom::{Coord, Polygon, Rect};
@@ -118,6 +118,7 @@ pub fn check_fills(board: &Board, items: &[CopperItem]) -> Vec<Violation> {
                     actual: gap(f.poly, it, overlap),
                     required: req,
                     introduced: it.introduced,
+                    severity: Severity::Error,
                 });
             }
             out
