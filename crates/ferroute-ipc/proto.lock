@@ -1,0 +1,11 @@
+# ferroute proto lock: sha256 of the upstream KiCad protobufs that src/proto.rs mirrors.
+# Upstream: https://gitlab.com/kicad/code/kicad (api/proto). Last column: the ref each file is mirrored from.
+# Checked nightly by scripts/check_proto_drift.sh; after reviewing a change, refresh with --update.
+fc2d727416a2e79d131d0ae56f0965ef2b7441b365df9e718828ac355e2cc8c6  api/proto/common/envelope.proto  10.0
+a4b1cc365cce89ee4b9823f985ae41d1e677dbe34636243ee53f365ffd47462e  api/proto/common/types/base_types.proto  10.0
+44ee37af7b9533653d6d5a28fee89d37b1e42207baecd1a6f2e97287d9d79bff  api/proto/common/commands/base_commands.proto  10.0
+194a0028c3be57a79f1b57da702856d910c9c20537de013c43e9967785642f3f  api/proto/common/commands/editor_commands.proto  10.0
+460eb392f2a6b42e18097814c88d29ac16471a3d02ebd385c259535c522e2b18  api/proto/common/commands/project_commands.proto  master
+1d6ecf1c0d543196c2ed072b0481d2d1e4e9b8d44460b0513daa7650f2e0ce4d  api/proto/common/types/jobs.proto  master
+336b88f85eef64e2760b6b54b4cd8210486966dc5106d05cffb86e6d7d19f8e5  api/proto/board/board_jobs.proto  master
+fa7b175e769215541e8adb61200be2dafe473f3ec9f18d54801bada9be866587  api/proto/board/board_types.proto  10.0

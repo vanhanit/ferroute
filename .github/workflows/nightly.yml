@@ -18,3 +18,13 @@ jobs:
   verify:
     uses: ./.github/workflows/verify.yml
     secrets: inherit
+
+  # Fails when upstream KiCad api/proto no longer matches the hashes in
+  # crates/ferroute-ipc/proto.lock (the hand-written prost mirrors in src/proto.rs).
+  proto-drift:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v7
+      - name: Upstream KiCad protobufs match proto.lock
+        run: scripts/check_proto_drift.sh

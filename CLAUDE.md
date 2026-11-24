@@ -206,7 +206,7 @@ Completion and DRC come first; within that, every result must look hand-tuned:
 | 6 | Native IPC commits (`BeginCommit`/`CreateItems`/`EndCommit`) for live mode | Worker | needs KiCad 10 GUI test rig |
 | 7 | GPU A\* batches (GAMER-style sweeps) behind `ClearanceBackend`-like trait | Lead + worker | M3 |
 | 8 | ✅ Dense suite (`ferroute bench --suite dense`: bga_256_4l, bga_484_6l, qfn_dense_2l, mixed_8l). Findings drive #27–#29 | Worker | done |
-| 9 | Proto drift check against upstream KiCad `api/proto` in nightly lane | Worker | |
+| 9 | ✅ Proto drift check (`scripts/check_proto_drift.sh`, `crates/ferroute-ipc/proto.lock`, nightly `proto-drift` job; KiCad 11 files pinned to `master`, refresh with `--update` after review) | Worker | done |
 | 10 | Copper pour awareness, blind/buried/micro vias | Lead | M4 |
 | 11 | ✅ Stack-up read from `.kicad_pcb` (per-dielectric thickness/εr, sub-layers, board thickness) | Worker | done |
 | 12 | Fine-pitch escape: congestion-aware pin-access ordering for QFN/QFP/BGA | Lead | M2 |
