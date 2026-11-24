@@ -156,7 +156,7 @@ impl Plan {
             }
         }
         let max_drill = reach.iter().map(|g| g.via_drill).max().unwrap_or(0);
-        let need_h = steps_needed(max_drill + rules.hole_to_hole, pitch);
+        let need_h = steps_needed(max_drill + rules.effective_hole_to_hole(), pitch);
         let rh = need_h.saturating_sub(1).div_ceil(2);
         let classes = geoms
             .into_iter()

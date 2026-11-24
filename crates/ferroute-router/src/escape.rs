@@ -32,6 +32,7 @@
 use crate::grid::Grid;
 use crate::legality::{ClassGeom, Obstacles, allows};
 use crate::vspan::ViaModel;
+use ferroute_board::custom::{ItemCtx, ItemType};
 use ferroute_board::{Board, LayerId, LayerSet, NetId, Origin, PadId, Track, Via, ViaKind};
 use ferroute_drc::zones::FillPoly;
 use ferroute_geom::{Coord, Dir8, Hull, Point, Rect};
@@ -240,6 +241,21 @@ impl Planner<'_> {
         c
     }
 
+    /// Drill-to-drill distance two escape vias of `a` and `b` need (custom per-pair rule,
+    /// else the board-wide value).
+    fn hole_to_hole(&self, a: NetId, b: NetId) -> Coord {
+        let r = &self.board.rules;
+        if r.custom.is_empty() {
+            r.hole_to_hole
+        } else {
+            r.hole_to_hole_for(
+                self.board,
+                &ItemCtx::new(a, ItemType::Via),
+                &ItemCtx::new(b, ItemType::Via),
+            )
+        }
+    }
+
     fn geom(&self, net: NetId) -> ClassGeom {
         self.geoms[usize::from(self.board.nets[net.idx()].class).min(self.geoms.len() - 1)]
     }
@@ -269,7 +285,6 @@ impl Planner<'_> {
                 return false;
             }
         }
-        let hole = self.board.rules.hole_to_hole;
         let (plane_gap, fill_layers) = (self.plane_gap, self.fill_layers);
         for k in 0..self.accepted.len() {
             let other = self.accepted[k].net;
@@ -291,6 +306,7 @@ impl Planner<'_> {
                 if let Some((oc, od, ol)) = &a.via {
                     let shared = LayerSet(vl.0 & ol.0);
                     let gap = if shared.intersects(fill_layers) { clr.max(plane_gap) } else { clr };
+                    let hole = self.hole_to_hole(net, other);
                     if (!shared.is_empty() && vc.clearance_violated(oc, gap))
                         || vd.clearance_violated(od, hole)
                     {

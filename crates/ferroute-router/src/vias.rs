@@ -22,6 +22,7 @@ use crate::access::octilinear_paths;
 use crate::straighten::{
     Chain, Dynamic, Statics, moved_board, on_interior, quality, rebuild, score,
 };
+use ferroute_board::custom::{ItemCtx, ItemType};
 use ferroute_board::{Board, BoardEdit, NetId, Origin, PadId, PadShape, Track, Via};
 use ferroute_drc::ItemRef;
 use ferroute_drc::quality::{ViaTrace, is_sliver, polylines_jog_weight};
@@ -134,7 +135,7 @@ fn via_legal(
     }
     let same = |n: NetId| n == via.net && n != NetId::NONE;
     let clr_same = base.clearance_between(via.net, via.net);
-    let reach = st.reach.max(rules.hole_to_hole).max(clr_same) + 1;
+    let reach = st.reach.max(rules.effective_hole_to_hole()).max(clr_same) + 1;
     let window = Rect::new(via.pos, via.pos).inflate(via.diameter / 2 + reach);
     for k in st.query_items(window) {
         let it = &st.items[k as usize];
@@ -182,7 +183,16 @@ fn via_legal(
     let wide = Rect::new(via.pos, via.pos).inflate(via.diameter / 2 + reach);
     for k in st.query_holes(wide) {
         let h = &st.holes[k as usize];
-        if hole.clearance_violated(&h.hull, rules.hole_to_hole)
+        let h2h = if rules.custom.is_empty() {
+            rules.hole_to_hole
+        } else {
+            rules.hole_to_hole_for(
+                base,
+                &ItemCtx::new(via.net, ItemType::Via),
+                &ItemCtx { net: Some(h.net), kind: None, layer: None },
+            )
+        };
+        if hole.clearance_violated(&h.hull, h2h)
             || (!same(h.net) && hull.clearance_violated(&h.hull, rules.hole_clearance))
         {
             return false;

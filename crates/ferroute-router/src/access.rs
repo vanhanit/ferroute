@@ -313,7 +313,7 @@ pub fn via_terminals(
     {
         return Vec::new();
     }
-    let reach = via_reach(plan, cp, obs.rules.hole_clearance, obs.rules.hole_to_hole);
+    let reach = via_reach(plan, cp, obs.rules.hole_clearance, obs.rules.effective_hole_to_hole());
     let Some((i0, j0, i1, j1)) = grid.index_range(hull.bbox().inflate(3 * grid.pitch)) else {
         return Vec::new();
     };

@@ -11,6 +11,7 @@
 
 use crate::grid::{FORWARD, Grid, NodeIdx};
 use crate::vspan::ViaModel;
+use ferroute_board::custom::{ItemCtx, ItemType};
 use ferroute_board::{Board, DesignRules, LayerId, LayerSet, NetId, Origin};
 use ferroute_drc::BucketGrid;
 use ferroute_geom::{Coord, Hull, Point, Polygon, Rect, point_segment_dist};
@@ -48,8 +49,9 @@ pub const fn merge(state: u32, net: NetId) -> u32 {
 pub enum ObsKind {
     /// Copper of `net`; `clearance` is the obstacle's own net-class clearance.
     Copper { clearance: Coord, pad: bool },
-    /// A drilled hole (pad drill or via drill).
-    Hole,
+    /// A drilled hole (pad drill or via drill). `h2h` is the hole-to-hole distance a via
+    /// drill (net unknown, so conservative under custom rules) needs from it.
+    Hole { h2h: Coord },
     /// Board outline / cut-out edge segment.
     Edge,
     /// Keep-out area boundary segment.
@@ -123,6 +125,19 @@ impl Obstacles {
     pub fn from_board(board: &Board) -> Self {
         let all = board.all_layers();
         let class_c = |net: NetId| board.rules.class_of(board, net).clearance;
+        // Hole-to-hole needed between a new via and an existing hole (custom rules apply
+        // per pair; the new via's net is not known here, so it is a maybe-match).
+        let h2h = |net: NetId, kind: ItemType| {
+            if board.rules.custom.is_empty() {
+                board.rules.hole_to_hole
+            } else {
+                board.rules.hole_to_hole_for(
+                    board,
+                    &ItemCtx::new(net, kind),
+                    &ItemCtx { net: None, kind: Some(ItemType::Via), layer: None },
+                )
+            }
+        };
         let mut items = Vec::new();
         for id in board.pad_ids() {
             let pad = board.pad(id);
@@ -139,7 +154,7 @@ impl Obstacles {
                     hull: Hull::disk(board.pad_position(id), d.diameter / 2),
                     layers: all,
                     net: pad.net,
-                    kind: ObsKind::Hole,
+                    kind: ObsKind::Hole { h2h: h2h(pad.net, ItemType::Pad) },
                 });
             }
         }
@@ -162,7 +177,7 @@ impl Obstacles {
                 hull: Hull::disk(v.pos, v.drill / 2),
                 layers: v.layers,
                 net: v.net,
-                kind: ObsKind::Hole,
+                kind: ObsKind::Hole { h2h: h2h(v.net, ItemType::Via) },
             });
         }
         let edge_poly = std::iter::once(&board.outline.outer).chain(board.outline.holes.iter());
@@ -211,7 +226,7 @@ impl Obstacles {
         let reach = r
             .max_clearance()
             .max(r.hole_clearance)
-            .max(r.hole_to_hole)
+            .max(r.effective_hole_to_hole())
             .max(r.edge_clearance)
             .max(fills.iter().map(|f| f.clearance).max().unwrap_or(0))
             + 1;
@@ -293,7 +308,7 @@ impl Obstacles {
                         state = merge(state, o.net);
                     }
                 }
-                ObsKind::Hole => {
+                ObsKind::Hole { .. } => {
                     if o.layers.contains(layer)
                         && h.clearance_violated(&o.hull, self.rules.hole_clearance)
                     {
@@ -393,8 +408,8 @@ impl Obstacles {
                         state = merge(state, o.net);
                     }
                 }
-                ObsKind::Hole => {
-                    if drill.clearance_violated(&o.hull, self.rules.hole_to_hole) {
+                ObsKind::Hole { h2h } => {
+                    if drill.clearance_violated(&o.hull, h2h) {
                         return BLOCKED;
                     }
                     if on_span(o.layers)
@@ -430,7 +445,7 @@ impl Obstacles {
             .iter()
             .filter(|o| match o.kind {
                 ObsKind::Copper { .. } | ObsKind::KeepoutEdge { .. } => o.layers.contains(layer),
-                ObsKind::Hole | ObsKind::Edge => true,
+                ObsKind::Hole { .. } | ObsKind::Edge => true,
             })
             .map(|o| bounding_capsule(&o.hull))
             .collect();

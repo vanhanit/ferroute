@@ -818,6 +818,39 @@ pub fn impedance_unattainable(board: &Board, net: NetId) -> bool {
     outer || inner
 }
 
+/// Reports every custom `max` limit (`track_width`, `via_diameter`, `hole_size`) that the
+/// net's *required* minimum (class, current, impedance, custom minimums) exceeds. Such a
+/// rule cannot be honoured without breaking a minimum, and a trace is never narrowed
+/// (INV-RULE-1): the net is routed at the required size, the DRC flags it, and the note
+/// makes that outcome explicit instead of silent.
+fn report_unmet_max(
+    board: &Board,
+    net: NetId,
+    [width, via, drill]: [Coord; 3],
+    notes: &mut Vec<String>,
+) {
+    use crate::custom::{ConstraintKind as K, ItemType as T};
+    let rules = &board.rules;
+    let name = &board.nets[net.idx()].name;
+    let checks = [
+        (K::TrackWidth, T::Track, width),
+        (K::ViaDiameter, T::Via, via),
+        (K::HoleSize, T::Via, drill),
+    ];
+    for (kind, item, need) in checks {
+        if let Some(max) = rules.max_limit_for_net(board, kind, net, Some(item), false)
+            && need > max
+        {
+            notes.push(format!(
+                "net {name}: custom max {} {} mm is below the required {} mm; routing at the required size (unmet rule)",
+                kind.keyword(),
+                format_mm(max),
+                format_mm(need)
+            ));
+        }
+    }
+}
+
 /// Applies derived widths and custom-rule bounds: every net whose required width,
 /// clearance, via diameter or drill (per-net electrical rules, KiCad custom rules) exceeds
 /// its class moves to a derived class (`<class>/<net>`) with those values — never narrower
@@ -858,6 +891,9 @@ pub fn resolve(board: &mut Board) -> Vec<String> {
         let need_drill = base.via_drill.max(board.rules.min_hole_for_net(board, net));
         let need_via =
             base.via_diameter.max(board.rules.min_via_diameter_for_net(board, net, need_drill));
+        if !board.rules.custom.is_empty() {
+            report_unmet_max(board, net, [need_w, need_via, need_drill], &mut notes);
+        }
         if need_w <= base.track_width
             && need_c <= base.clearance
             && need_via <= base.via_diameter
@@ -958,6 +994,62 @@ mod tests {
         assert!(w >= width_for_current(2000, 35_000, true, 10.0));
         assert_eq!(board.rules.class_of(&board, s).track_width, 250_000);
         assert_eq!(required_width(&board, s), 250_000);
+    }
+
+    fn max_rule(kind: crate::custom::ConstraintKind, max: Coord) -> crate::custom::CustomRule {
+        crate::custom::CustomRule {
+            name: "cap".into(),
+            condition: crate::custom::Cond::True,
+            layer: None,
+            constraints: vec![(
+                kind,
+                crate::custom::Limits { max: Some(max), ..crate::custom::Limits::default() },
+            )],
+            severity: crate::custom::Severity::Error,
+        }
+    }
+
+    #[test]
+    fn max_limits_are_reported_when_unmet_and_silent_when_met() {
+        use crate::custom::ConstraintKind as K;
+        let mut b = BoardBuilder::new(mm(30), mm(20), 2);
+        let n = b.net("SIG");
+        let mut board = b.build();
+        let class_w = board.rules.class_of(&board, n).track_width;
+        let class_via = board.rules.class_of(&board, n).via_diameter;
+        // Caps above the class values: nothing changes, nothing is reported.
+        board.rules.custom = vec![
+            max_rule(K::TrackWidth, class_w + 100_000),
+            max_rule(K::ViaDiameter, class_via + 100_000),
+        ];
+        assert!(resolve(&mut board).is_empty());
+        assert_eq!(board.rules.class_of(&board, n).track_width, class_w);
+        // Caps below: never route narrower, report the unmet rule.
+        board.rules.custom = vec![
+            max_rule(K::TrackWidth, class_w - 50_000),
+            max_rule(K::ViaDiameter, class_via - 1),
+        ];
+        let notes = resolve(&mut board);
+        assert!(
+            notes.iter().any(|m| m.contains("max track_width") && m.contains("SIG")),
+            "{notes:?}"
+        );
+        assert!(notes.iter().any(|m| m.contains("max via_diameter")), "{notes:?}");
+        assert_eq!(board.rules.class_of(&board, n).track_width, class_w, "never narrowed");
+        assert_eq!(board.rules.class_of(&board, n).via_diameter, class_via);
+    }
+
+    #[test]
+    fn derived_width_above_max_is_reported() {
+        use crate::custom::ConstraintKind as K;
+        let mut b = BoardBuilder::new(mm(30), mm(20), 2);
+        let p = b.net("VBUS");
+        let mut board = b.build();
+        board.nets[p.idx()].constraints.max_current_ma = Some(2000);
+        board.rules.custom = vec![max_rule(K::TrackWidth, 400_000)];
+        let notes = resolve(&mut board);
+        assert!(notes.iter().any(|m| m.contains("max track_width")), "{notes:?}");
+        assert!(board.rules.class_of(&board, p).track_width > 400_000);
     }
 
     #[test]

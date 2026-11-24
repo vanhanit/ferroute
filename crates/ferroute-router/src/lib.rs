@@ -1098,3 +1098,6 @@ mod via_span_tests;
 
 #[cfg(test)]
 mod escape_tests;
+
+#[cfg(test)]
+mod custom_rule_tests;
