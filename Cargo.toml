@@ -4,6 +4,7 @@ members = [
     "crates/ferroute-geom",
     "crates/ferroute-board",
     "crates/ferroute-kicad",
+    "crates/ferroute-dsn",
     "crates/ferroute-drc",
     "crates/ferroute-router",
     "crates/ferroute-place",
@@ -17,6 +18,7 @@ default-members = [
     "crates/ferroute-geom",
     "crates/ferroute-board",
     "crates/ferroute-kicad",
+    "crates/ferroute-dsn",
     "crates/ferroute-drc",
     "crates/ferroute-router",
     "crates/ferroute-place",
@@ -42,6 +44,7 @@ categories = ["science", "command-line-utilities"]
 ferroute-geom = { path = "crates/ferroute-geom", version = "0.4.0" }
 ferroute-board = { path = "crates/ferroute-board", version = "0.4.0" }
 ferroute-kicad = { path = "crates/ferroute-kicad", version = "0.4.0" }
+ferroute-dsn = { path = "crates/ferroute-dsn", version = "0.4.0" }
 ferroute-drc = { path = "crates/ferroute-drc", version = "0.4.0" }
 ferroute-router = { path = "crates/ferroute-router", version = "0.4.0" }
 ferroute-place = { path = "crates/ferroute-place", version = "0.4.0" }

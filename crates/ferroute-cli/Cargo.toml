@@ -35,6 +35,7 @@ tracing-subscriber.workspace = true
 ferroute-geom.workspace = true
 ferroute-board.workspace = true
 ferroute-kicad.workspace = true
+ferroute-dsn.workspace = true
 ferroute-drc.workspace = true
 ferroute-router.workspace = true
 ferroute-place.workspace = true

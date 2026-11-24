@@ -3,6 +3,7 @@
 
 pub mod bench;
 pub mod drc;
+pub mod dsn;
 pub mod ipc;
 pub mod render;
 pub mod route;

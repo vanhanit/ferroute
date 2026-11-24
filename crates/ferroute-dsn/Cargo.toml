@@ -1,0 +1,22 @@
+[package]
+name = "ferroute-dsn"
+description = "Specctra DSN export and SES import (Freerouting interchange) for ferroute"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+keywords.workspace = true
+categories.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+ferroute-geom.workspace = true
+ferroute-board.workspace = true
+thiserror.workspace = true
+
+[dev-dependencies]
+ferroute-kicad.workspace = true

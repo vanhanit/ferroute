@@ -38,6 +38,9 @@ enum Command {
     /// KiCad IPC API (live KiCad 10 GUI / KiCad 11 headless `kicad-cli api-server`).
     #[command(subcommand)]
     Ipc(cmd::ipc::IpcCommand),
+    /// Specctra DSN export / SES import (Freerouting interchange).
+    #[command(subcommand)]
+    Dsn(cmd::dsn::DsnCommand),
     /// Show compute backends and build information.
     Info,
 }
@@ -59,6 +62,7 @@ fn main() -> ExitCode {
         Command::Gen(a) => cmd::bench::gen_run(&a),
         Command::Bench(a) => cmd::bench::run(&a),
         Command::Ipc(c) => cmd::ipc::run(&c),
+        Command::Dsn(c) => cmd::dsn::run(&c),
         Command::Info => cmd::info(),
     };
     match res {

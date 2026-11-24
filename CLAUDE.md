@@ -70,6 +70,7 @@ layout engineer accept this result without touching it?"
 | `crates/ferroute-place` | Movability policy + multi-start annealing nudger |
 | `crates/ferroute-engine` | Pipeline (nudge → route → LNS → gate), `synth` boards, `score` baselines, criterion bench |
 | `crates/ferroute-kicad` | Lossless `.kicad_pcb` S-expr reader/writer (KiCad 6–10 dialects), `.kicad_pro` rules |
+| `crates/ferroute-dsn` | Specctra DSN export / Freerouting SES import (transport crate) |
 | `crates/ferroute-ipc` | Pure-Rust NNG REQ0 over IPC, hand-written KiCad protobufs, capability negotiation, headless server |
 | `crates/ferroute-gpu` | `ClearanceBackend`: rayon CPU + wgpu WGSL GPU (feature `gpu`) with proven error bounds |
 | `crates/ferroute-render` | Deterministic SVG renderer (visual diffs) |
@@ -202,7 +203,7 @@ Completion and DRC come first; within that, every result must look hand-tuned:
 | 2 | Per-layer preferred directions + via minimisation pass | Lead | M2 |
 | 3 | Differential pairs: ✅ coupled routing (`router::diffpair`, `router::pairgeom`; constant gap, symmetric fans, `[[pair]]`/zdiff/`.kicad_dru` gaps, PairGap/PairUncoupled checks, fallback reported). Next: pairs across layers (via pairs), polarity swap, multi-pad ends, length equalisation inside the pair router, fan-out without the short horizontal step between the two 45° segments at the connector | Lead + worker | M2 |
 | 4 | Region-window LNS (rip-up + nudge around failures) | Lead | M2 |
-| 5 | Specctra DSN/SES import/export (Freerouting comparisons) | Worker | contract: `Board` ↔ DSN |
+| 5 | Specctra DSN/SES: ✅ `ferroute-dsn` (`write_dsn`, `read_ses` → additive `BoardEdit`, exact units, `ferroute dsn export` / `import-ses`). Next: validate against real Freerouting (2.5.0 on Maven Central, needs Java 21), pad holes, zones | Worker | |
 | 6 | Native IPC commits (`BeginCommit`/`CreateItems`/`EndCommit`) for live mode | Worker | needs KiCad 10 GUI test rig |
 | 7 | GPU A\* batches (GAMER-style sweeps) behind `ClearanceBackend`-like trait | Lead + worker | M3 |
 | 8 | ✅ Dense suite (`ferroute bench --suite dense`: bga_256_4l, bga_484_6l, qfn_dense_2l, mixed_8l). Findings drive #27–#29 | Worker | done |

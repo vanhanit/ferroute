@@ -176,3 +176,29 @@ fn bench_gates_against_a_baseline() {
     assert!(o.status.success(), "{}", stdout(&o));
     assert!(stdout(&o).contains("benchmark gate: PASS"), "{}", stdout(&o));
 }
+
+#[test]
+fn dsn_export_and_ses_import_round_trip() {
+    let dir = tempfile::tempdir().expect("tmp");
+    let dsn = dir.path().join("demo.dsn");
+    let o = ferroute(&["dsn", "export", s(&fixture("demo_2layer.kicad_pcb")), "-o", s(&dsn)]);
+    assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
+    let text = std::fs::read_to_string(&dsn).expect("dsn");
+    assert!(text.starts_with("(pcb ferroute"));
+    // An empty session imports nothing and leaves a loadable board.
+    let ses = dir.path().join("demo.ses");
+    std::fs::write(&ses, "(session demo (routes (resolution um 1000) (network_out)))")
+        .expect("ses");
+    let out = dir.path().join("out.kicad_pcb");
+    let o = ferroute(&[
+        "dsn",
+        "import-ses",
+        s(&fixture("demo_2layer.kicad_pcb")),
+        s(&ses),
+        "-o",
+        s(&out),
+    ]);
+    assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
+    assert!(stdout(&o).contains("imported 0 tracks and 0 vias"));
+    assert!(out.exists());
+}

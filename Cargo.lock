@@ -498,6 +498,7 @@ dependencies = [
  "clap",
  "ferroute-board",
  "ferroute-drc",
+ "ferroute-dsn",
  "ferroute-engine",
  "ferroute-geom",
  "ferroute-gpu",
@@ -525,6 +526,16 @@ dependencies = [
  "rayon",
  "rustc-hash 2.1.3",
  "serde",
+]
+
+[[package]]
+name = "ferroute-dsn"
+version = "0.4.0"
+dependencies = [
+ "ferroute-board",
+ "ferroute-geom",
+ "ferroute-kicad",
+ "thiserror",
 ]
 
 [[package]]
