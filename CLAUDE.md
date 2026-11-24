@@ -228,6 +228,7 @@ Completion and DRC come first; within that, every result must look hand-tuned:
 | 27 | ✅ Via-to-plane fan-out (`router::plane`, dog-bone vias inside the net's own fill; bga_256_4l fixed 60.4 % → 75.5 %, VCC complete; GND deep balls need #29) | Lead + worker | done |
 | 28 | P1 speed: mixed_8l 406 s, bga_484_6l > 25 min at default effort — profile (negotiation iterations, LNS/order rounds, oracle calls in post-passes), make post-passes incremental, scale effort with board size | Lead + worker | dense suite |
 | 29 | P1 BGA escape: ring-2+ balls fail with 2 signal layers — escape planning (ordered fan-out per ring, via-under-ball channels, layer assignment) | Lead | after #27 |
+| 30 | Blind / buried / micro vias (opt-in, HDI cost note): span-specific via sites reserving only spanned layers, KiCad 10 via types, microvia sizes, micro-in-pad, per-span DRC/DFM — in progress; then let the BGA escape planner (#29) pick via types per ring | Lead + worker | pulled forward from #10 |
 | 13 | Coverage ≥ 85 % per crate: CLI output via injected `&mut dyn Write`, ipc/render/kicad gaps | Worker | `make coverage` |
 
 ## Environment notes for cloud sessions
