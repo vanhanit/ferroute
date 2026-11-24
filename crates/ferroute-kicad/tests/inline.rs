@@ -274,3 +274,68 @@ fn project_patterns_and_inheritance() {
     assert_eq!(b.nets[3].class, 2);
     assert_eq!(b.nets[0].class, 0);
 }
+
+const L4: &str = r#"(layers (0 "F.Cu" signal) (1 "In1.Cu" signal) (2 "In2.Cu" signal) (31 "B.Cu" signal) (44 "Edge.Cuts" user))"#;
+
+fn stackup_src(setup: &str) -> String {
+    board_src("20240108", L4, &format!("(setup {setup})"))
+}
+
+const STACKUP4: &str = r#"(stackup
+  (layer "F.SilkS" (type "Top Silk Screen"))
+  (layer "F.Paste" (type "Top Solder Paste"))
+  (layer "F.Mask" (type "Top Solder Mask") (thickness 0.01))
+  (layer "F.Cu" (type "copper") (thickness 0.035))
+  (layer "dielectric 1" (type "prepreg") (thickness 0.2) (material "FR4") (epsilon_r 4.5) (loss_tangent 0.02))
+  (layer "In1.Cu" (type "copper") (thickness 0.0175))
+  (layer "dielectric 2" (type "core") (thickness 0.5 locked) (material "FR4") (epsilon_r 4.6) (loss_tangent 0.02)
+    addsublayer (thickness 0.3) (material "FR4") (epsilon_r 4.0) (loss_tangent 0.02))
+  (layer "In2.Cu" (type "copper") (thickness 0.0175))
+  (layer "dielectric 3" (type "prepreg") (thickness 0.2) (material "FR4") (epsilon_r 4.5) (loss_tangent 0.02))
+  (layer "B.Cu" (type "copper") (thickness 0.035))
+  (layer "B.Mask" (type "Bottom Solder Mask") (thickness 0.01))
+  (copper_finish "None")
+  (dielectric_constraints no))"#;
+
+#[test]
+fn stackup_is_read_from_setup() {
+    let kb = read_board(&stackup_src(STACKUP4), &ReadOptions::default()).unwrap();
+    let s = &kb.board.stackup;
+    assert_eq!(s.copper_thickness, [35_000, 17_500, 17_500, 35_000]);
+    assert_eq!(s.dielectrics.len(), 3);
+    assert_eq!(s.dielectrics[0].thickness, 200_000);
+    assert_eq!(s.dielectrics[0].epsilon_r_milli, 4500);
+    // Sub-layers merge: 0.5 + 0.3 mm, thickness-weighted εr (4.6*5 + 4.0*3) / 8 = 4.375.
+    assert_eq!(s.dielectrics[1].thickness, 800_000);
+    assert_eq!(s.dielectrics[1].epsilon_r_milli, 4375);
+    assert_eq!(s.dielectrics[1].between, (LayerId(1), LayerId(2)));
+    assert_eq!(s.outer_dielectric, 200_000);
+    // b of In1 = 0.2 + 0.0175 + 0.8.
+    assert_eq!(s.inner_dielectric, Some(1_017_500));
+    assert_eq!(s.board_thickness, 1_600_000);
+    assert!(!kb.warnings.iter().any(|w| w.contains("stackup")), "{:?}", kb.warnings);
+}
+
+#[test]
+fn missing_stackup_keeps_defaults() {
+    let kb = read_board(&board_src("20240108", L4, ""), &ReadOptions::default()).unwrap();
+    assert_eq!(kb.board.stackup, ferroute_board::constraints::Stackup::default());
+}
+
+#[test]
+fn malformed_stackup_warns_and_keeps_defaults() {
+    // Only two copper layers listed for a four-layer board.
+    let bad = r#"(stackup (layer "F.Cu" (type "copper") (thickness 0.035))
+        (layer "dielectric 1" (type "core") (thickness 1.5) (epsilon_r 4.5))
+        (layer "B.Cu" (type "copper") (thickness 0.035)))"#;
+    let kb = read_board(&stackup_src(bad), &ReadOptions::default()).unwrap();
+    assert_eq!(kb.board.stackup, ferroute_board::constraints::Stackup::default());
+    assert!(kb.warnings.iter().any(|w| w.contains("stackup")), "{:?}", kb.warnings);
+}
+
+#[test]
+fn general_thickness_sets_board_thickness_without_stackup() {
+    let src = board_src("20240108", LAYERS, "").replace("(thickness 1.6)", "(thickness 1.2)");
+    let kb = read_board(&src, &ReadOptions::default()).unwrap();
+    assert_eq!(kb.board.stackup.board_thickness, 1_200_000);
+}

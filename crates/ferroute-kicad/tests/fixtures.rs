@@ -227,3 +227,11 @@ fn legacy_numeric_dialect() {
     assert!((area - expect).abs() < 0.01, "area {area} vs {expect}");
     assert!(b.outline.outer.area2() > 0);
 }
+
+#[test]
+fn fixtures_without_stackup_keep_default_stackup() {
+    for name in ["demo_2layer.kicad_pcb", "legacy_v9_numeric.kicad_pcb"] {
+        let kb = load(name);
+        assert_eq!(kb.board.stackup, ferroute_board::constraints::Stackup::default(), "{name}");
+    }
+}

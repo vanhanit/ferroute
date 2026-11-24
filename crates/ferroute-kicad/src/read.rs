@@ -7,6 +7,7 @@ use crate::outline::{EdgeBuilder, Gfx, parse_gfx, point_child, poly_points};
 use crate::pad::{build_shape, offset_shape, shape_offset};
 use crate::sexpr::SExpr;
 use crate::util::{circumscribed_polygon, float, mm, same_angle};
+use ferroute_board::constraints::{Dielectric, Stackup};
 use ferroute_board::{
     Board, Drill, Footprint, FootprintId, IslandRemoval, Keepout, LayerId, LayerSet, Mobility, Net,
     NetId, Origin, Pad, PadConnection, PadId, Placement, Side, Track, Via, Zone, ZoneFill,
@@ -499,6 +500,88 @@ fn legacy_net_classes(root: &SExpr, board: &mut Board) {
     }
 }
 
+/// Parses `(setup (stackup …))` into a [`Stackup`]; `None` when absent. Sub-layers of one
+/// dielectric (`addsublayer`) are merged (thickness summed, εr thickness-weighted); mask,
+/// paste and silk entries are ignored. Anything inconsistent with `n_copper` copper layers
+/// yields a warning and `None` (defaults stay).
+fn read_stackup(
+    root: &SExpr,
+    n_copper: usize,
+    board_thickness: Option<Coord>,
+    warnings: &mut Vec<String>,
+) -> Option<Stackup> {
+    let node = root.child("setup")?.child("stackup")?;
+    let mut copper = Vec::new();
+    let mut dielectrics: Vec<Dielectric> = Vec::new();
+    let mut after_copper = false;
+    for layer in node.children("layer") {
+        let name = layer.atom(1).unwrap_or("");
+        let ty = layer.child("type").and_then(|t| t.atom(1)).unwrap_or("");
+        // Items with sub-layers repeat `(thickness)`/`(epsilon_r)` after `addsublayer`.
+        let mut parts: Vec<(Option<Coord>, Option<f64>)> = vec![(None, None)];
+        for item in layer.items().unwrap_or(&[]).iter().skip(2) {
+            if item.is_sym("addsublayer") {
+                parts.push((None, None));
+                continue;
+            }
+            let Some(cur) = parts.last_mut() else { continue };
+            match item.head() {
+                Some("thickness") => cur.0 = item.atom(1).and_then(|v| mm(v).ok()),
+                Some("epsilon_r") => cur.1 = item.atom(1).and_then(|v| v.parse::<f64>().ok()),
+                _ => {}
+            }
+        }
+        if ty == "copper" || name.ends_with(".Cu") {
+            if !after_copper && !copper.is_empty() {
+                warnings.push("stackup: two copper layers without a dielectric; ignored".into());
+                return None;
+            }
+            copper.push(parts[0].0.unwrap_or(0));
+            after_copper = false;
+        } else if matches!(ty, "core" | "prepreg") || name.starts_with("dielectric") {
+            if after_copper || copper.is_empty() {
+                warnings.push("stackup: consecutive dielectrics; ignored".into());
+                return None;
+            }
+            let mut total: Coord = 0;
+            let mut weighted = 0.0_f64;
+            for (t, e) in &parts {
+                let t = t.unwrap_or(0);
+                total += t;
+                #[allow(clippy::cast_precision_loss)]
+                {
+                    weighted += t as f64 * e.unwrap_or(4.3);
+                }
+            }
+            #[allow(
+                clippy::cast_precision_loss,
+                clippy::cast_possible_truncation,
+                clippy::cast_sign_loss
+            )]
+            let er_milli =
+                if total > 0 { (weighted / total as f64 * 1000.0).round() as u32 } else { 0 };
+            dielectrics.push(Dielectric {
+                thickness: total,
+                epsilon_r_milli: er_milli,
+                between: (LayerId(0), LayerId(0)),
+            });
+            after_copper = true;
+        }
+    }
+    if copper.len() != n_copper {
+        warnings.push(format!(
+            "stackup lists {} copper layers but the board has {n_copper}; using defaults",
+            copper.len()
+        ));
+        return None;
+    }
+    let s = Stackup::from_layers(copper, dielectrics, board_thickness);
+    if s.is_none() {
+        warnings.push("stackup is malformed (missing thickness or εr < 1); using defaults".into());
+    }
+    s
+}
+
 pub(crate) fn parse_board(root: &SExpr) -> Result<Parsed, KicadError> {
     if root.head() != Some("kicad_pcb") {
         return Err(KicadError::Format(
@@ -574,6 +657,17 @@ pub(crate) fn parse_board(root: &SExpr) -> Result<Parsed, KicadError> {
     board.nets = r.nets;
     board.outline = outline;
     legacy_net_classes(root, &mut board);
+    let general_t = root
+        .child("general")
+        .and_then(|g| g.child("thickness"))
+        .and_then(|t| t.atom(1))
+        .and_then(|v| mm(v).ok())
+        .filter(|&t| t > 0);
+    if let Some(s) = read_stackup(root, board.copper_layers.len(), general_t, &mut r.warnings) {
+        board.stackup = s;
+    } else if let Some(t) = general_t {
+        board.stackup.board_thickness = t;
+    }
     board.validate().map_err(|e| KicadError::Format(e.to_string()))?;
     Ok(Parsed { board, version, dialect, fp_nodes, warnings: r.warnings })
 }

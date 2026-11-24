@@ -464,6 +464,13 @@ impl RuleSet {
     pub fn apply(&self, board: &mut Board) -> Result<Vec<String>, RuleError> {
         self.validate()?;
         if let Some(s) = &self.stackup {
+            // A rules-file value overrides the file's per-dielectric detail.
+            if s.outer_dielectric_mm.is_some()
+                || s.inner_dielectric_mm.is_some()
+                || s.epsilon_r.is_some()
+            {
+                board.stackup.dielectrics.clear();
+            }
             if let Some(t) = s.copper_um {
                 let nm: Coord = mm_to_nm(t / 1000.0);
                 board.stackup.copper_thickness = vec![nm; usize::from(board.layer_count().max(1))];

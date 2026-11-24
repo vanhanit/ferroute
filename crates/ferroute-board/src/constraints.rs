@@ -190,13 +190,18 @@ pub fn match_delay_targets(board: &Board, delays_fs: &[i64]) -> Vec<i64> {
 #[must_use]
 pub fn layer_delay_ps_per_mm(board: &Board, layer: LayerId, width: Coord) -> f64 {
     let s = &board.stackup;
-    let er = f64::from(s.epsilon_r_milli) / 1000.0;
-    let last = board.layer_count().saturating_sub(1);
+    let n = board.layer_count();
+    let last = n.saturating_sub(1);
     let inner = layer.0 != 0 && layer.0 < last;
     let kind = if inner { LineKind::Stripline } else { LineKind::Microstrip };
     let t = s.copper_thickness.get(usize::from(layer.0)).copied().unwrap_or(35_000);
-    delay_ps_per_mm(kind, width, s.outer_dielectric, t, er)
-        .unwrap_or_else(|| er.sqrt() / C_MM_PER_PS)
+    let (h, er) = if inner {
+        let er = s.stripline_b_er(layer, n).map_or(f64::from(s.epsilon_r_milli) / 1000.0, |v| v.1);
+        (s.outer_dielectric, er)
+    } else {
+        s.outer_h_er(layer, n)
+    };
+    delay_ps_per_mm(kind, width, h, t, er).unwrap_or_else(|| er.sqrt() / C_MM_PER_PS)
 }
 
 /// Routed propagation delay of every net in femtoseconds (index = net id): the sum over
@@ -252,6 +257,23 @@ pub struct Stackup {
     /// Overall board thickness (nm); sets the barrel length of vias for delay matching.
     #[serde(default = "default_board_thickness")]
     pub board_thickness: Coord,
+    /// Per-dielectric detail read from the board file (empty = only the scalar fields
+    /// above are known). When non-empty, [`Stackup::outer_h_er`] and
+    /// [`Stackup::stripline_b_er`] use it in preference to the scalars.
+    #[serde(default)]
+    pub dielectrics: Vec<Dielectric>,
+}
+
+/// One dielectric (prepreg/core, all its sub-layers merged) between two adjacent copper
+/// layers.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Dielectric {
+    /// Total thickness (nm) of all sub-layers.
+    pub thickness: Coord,
+    /// Relative permittivity × 1000: the thickness-weighted mean of its sub-layers.
+    pub epsilon_r_milli: u32,
+    /// The copper layers it separates (adjacent: `.1 == .0 + 1`).
+    pub between: (LayerId, LayerId),
 }
 
 const fn default_board_thickness() -> Coord {
@@ -267,7 +289,101 @@ impl Default for Stackup {
             epsilon_r_milli: 4300,
             inner_dielectric: None,
             board_thickness: default_board_thickness(),
+            dielectrics: Vec::new(),
         }
+    }
+}
+
+impl Stackup {
+    /// Builds a stack-up from the file's copper thicknesses (top to bottom) and its
+    /// dielectrics (top to bottom; `dielectrics[k]` separates copper `k` and `k + 1`,
+    /// `between` is rewritten accordingly). Derived scalars:
+    /// * `outer_dielectric` = thickness of the dielectric adjacent to `F.Cu`;
+    /// * `epsilon_r_milli` = thickness-weighted mean over all dielectrics;
+    /// * `inner_dielectric` (for ≥ 3 copper layers) = plane spacing `b` of the first inner
+    ///   layer: the two dielectrics around it plus its copper thickness (adjacent copper
+    ///   layers act as references);
+    /// * `board_thickness` = `board_thickness` if given, else copper + dielectrics.
+    ///
+    /// Returns `None` unless there are exactly `copper.len() - 1` dielectrics, all with
+    /// positive thickness and `εr ≥ 1`.
+    #[must_use]
+    pub fn from_layers(
+        copper: Vec<Coord>,
+        mut dielectrics: Vec<Dielectric>,
+        board_thickness: Option<Coord>,
+    ) -> Option<Self> {
+        if copper.len() < 2
+            || dielectrics.len() + 1 != copper.len()
+            || copper.iter().any(|&t| t <= 0)
+            || dielectrics.iter().any(|d| d.thickness <= 0 || d.epsilon_r_milli < 1000)
+        {
+            return None;
+        }
+        for (k, d) in dielectrics.iter_mut().enumerate() {
+            let k = u8::try_from(k).ok()?;
+            d.between = (LayerId(k), LayerId(k + 1));
+        }
+        let total: Coord = dielectrics.iter().map(|d| d.thickness).sum();
+        let weighted: i128 = dielectrics
+            .iter()
+            .map(|d| i128::from(d.thickness) * i128::from(d.epsilon_r_milli))
+            .sum();
+        let er = u32::try_from((weighted + i128::from(total) / 2) / i128::from(total)).ok()?;
+        let mut s = Self {
+            outer_dielectric: dielectrics[0].thickness,
+            epsilon_r_milli: er,
+            inner_dielectric: None,
+            board_thickness: board_thickness
+                .unwrap_or_else(|| total + copper.iter().copied().sum::<Coord>()),
+            copper_thickness: copper,
+            dielectrics,
+        };
+        let n = u8::try_from(s.copper_thickness.len()).ok()?;
+        if n > 2 {
+            s.inner_dielectric = s.stripline_b_er(LayerId(1), n).map(|v| v.0);
+        }
+        Some(s)
+    }
+
+    fn dielectric_of(&self, a: u8, b: u8) -> Option<&Dielectric> {
+        self.dielectrics.iter().find(|d| d.between == (LayerId(a), LayerId(b)))
+    }
+
+    /// `(h, εr)` for a microstrip on outer layer `layer` of an `n`-layer board: the
+    /// dielectric between that layer and its neighbour, falling back to the scalar
+    /// `outer_dielectric` / `epsilon_r_milli` when the file gave no per-dielectric data.
+    #[must_use]
+    pub fn outer_h_er(&self, layer: LayerId, n: u8) -> (Coord, f64) {
+        let neighbour = if layer.0 == 0 { 1 } else { layer.0.saturating_sub(1) };
+        let (a, b) = (layer.0.min(neighbour), layer.0.max(neighbour));
+        let outer = layer.0 == 0 || layer.0 + 1 == n;
+        match self.dielectric_of(a, b) {
+            Some(d) if outer => (d.thickness, f64::from(d.epsilon_r_milli) / 1000.0),
+            _ => (self.outer_dielectric, f64::from(self.epsilon_r_milli) / 1000.0),
+        }
+    }
+
+    /// `(b, εr)` for a stripline on inner layer `layer` of an `n`-layer board: `b` is the
+    /// two adjacent dielectrics plus the layer's copper thickness, `εr` their
+    /// thickness-weighted mean. Without per-dielectric data: `inner_dielectric` and the
+    /// scalar `εr`. `None` for outer layers or when no inner spacing is known.
+    #[must_use]
+    pub fn stripline_b_er(&self, layer: LayerId, n: u8) -> Option<(Coord, f64)> {
+        if layer.0 == 0 || layer.0 + 1 >= n {
+            return None;
+        }
+        let l = layer.0;
+        if let (Some(u), Some(d)) = (self.dielectric_of(l - 1, l), self.dielectric_of(l, l + 1)) {
+            let t = self.copper_thickness.get(usize::from(l)).copied().unwrap_or(0);
+            let h = u.thickness + d.thickness;
+            let w = i128::from(u.thickness) * i128::from(u.epsilon_r_milli)
+                + i128::from(d.thickness) * i128::from(d.epsilon_r_milli);
+            #[allow(clippy::cast_precision_loss)]
+            let er = (w as f64) / (h as f64) / 1000.0;
+            return Some((h + t, er));
+        }
+        self.inner_dielectric.map(|b| (b, f64::from(self.epsilon_r_milli) / 1000.0))
     }
 }
 
@@ -624,6 +740,37 @@ pub fn delay_ps_per_mm(kind: LineKind, w: Coord, h: Coord, t: Coord, er: f64) ->
     Some(eeff.sqrt() / C_MM_PER_PS)
 }
 
+/// `(microstrip, stripline)` widths (nm) for impedance `z_ohm`: the widest over all outer
+/// layers (microstrip over their own dielectric) and over all inner layers (stripline in
+/// their own plane spacing; 0 on boards without inner layers or inner spacing).
+fn impedance_widths(board: &Board, z_ohm: f64) -> (Coord, Coord) {
+    let s = &board.stackup;
+    let n = board.layer_count();
+    let t_outer = s.copper_thickness.first().copied().unwrap_or(35_000);
+    let thick = |l: u8| s.copper_thickness.get(usize::from(l)).copied().unwrap_or(t_outer);
+    let micro = [0, n.saturating_sub(1)]
+        .into_iter()
+        .map(|l| {
+            let (h, er) = s.outer_h_er(LayerId(l), n);
+            microstrip_width_hj(z_ohm, h, thick(l), er).unwrap_or(0)
+        })
+        .max()
+        .unwrap_or(0);
+    let strip = if n > 2 {
+        (1..n - 1)
+            .filter_map(|l| {
+                let (b, er) = s.stripline_b_er(LayerId(l), n)?;
+                let t = s.copper_thickness.get(usize::from(l)).copied().unwrap_or(t_outer);
+                Some(stripline_width_cohn(z_ohm, b, t, er).unwrap_or(0))
+            })
+            .max()
+            .unwrap_or(0)
+    } else {
+        0
+    };
+    (micro, strip)
+}
+
 /// Width (nm) net `net` must have on every layer: the widest of its net-class width, the
 /// current-derived width (internal-layer formula when the board has inner layers — the
 /// conservative case), the Hammerstad–Jensen microstrip width (outer layers) and, on
@@ -639,19 +786,8 @@ pub fn required_width(board: &Board, net: NetId) -> Coord {
     let current_w = c
         .max_current_ma
         .map_or(0, |i| width_for_current(i, thin, external_only, DEFAULT_DELTA_T_C));
-    let t_outer = s.copper_thickness.first().copied().unwrap_or(35_000);
-    let er = f64::from(s.epsilon_r_milli) / 1000.0;
     let z_ohm = c.impedance_mohm.map(|z| f64::from(z) / 1000.0);
-    let micro_w =
-        z_ohm.and_then(|z| microstrip_width_hj(z, s.outer_dielectric, t_outer, er)).unwrap_or(0);
-    // Inner layers: stripline model when the stack-up declares an inner dielectric.
-    let t_inner = s.copper_thickness.get(1).copied().unwrap_or(t_outer);
-    let strip_w = match (z_ohm, s.inner_dielectric) {
-        (Some(z), Some(b)) if board.layer_count() > 2 => {
-            stripline_width_cohn(z, b, t_inner, er).unwrap_or(0)
-        }
-        _ => 0,
-    };
+    let (micro_w, strip_w) = z_ohm.map_or((0, 0), |z| impedance_widths(board, z));
     class_w.max(current_w).max(micro_w).max(strip_w).max(board.rules.min_width_for_net(board, net))
 }
 
@@ -663,17 +799,22 @@ pub fn impedance_unattainable(board: &Board, net: NetId) -> bool {
     let Some(z) = board.nets.get(net.idx()).and_then(|n| n.constraints.impedance_mohm) else {
         return false;
     };
+    let z = f64::from(z) / 1000.0;
     let s = &board.stackup;
-    let (z, er) = (f64::from(z) / 1000.0, f64::from(s.epsilon_r_milli) / 1000.0);
+    let n = board.layer_count();
     let t_outer = s.copper_thickness.first().copied().unwrap_or(35_000);
-    let outer = microstrip_width_hj(z, s.outer_dielectric, t_outer, er).is_none();
-    let inner = match s.inner_dielectric {
-        Some(b) if board.layer_count() > 2 => {
-            let t = s.copper_thickness.get(1).copied().unwrap_or(t_outer);
-            stripline_width_cohn(z, b, t, er).is_none()
-        }
-        _ => false,
-    };
+    let outer = [LayerId(0), LayerId(n.saturating_sub(1))].into_iter().any(|l| {
+        let (h, er) = s.outer_h_er(l, n);
+        let t = s.copper_thickness.get(usize::from(l.0)).copied().unwrap_or(t_outer);
+        microstrip_width_hj(z, h, t, er).is_none()
+    });
+    let inner = n > 2
+        && (1..n - 1).any(|l| {
+            s.stripline_b_er(LayerId(l), n).is_some_and(|(b, er)| {
+                let t = s.copper_thickness.get(usize::from(l)).copied().unwrap_or(t_outer);
+                stripline_width_cohn(z, b, t, er).is_none()
+            })
+        });
     outer || inner
 }
 
@@ -1174,5 +1315,72 @@ mod tests {
         assert_eq!(match_targets(&b, &l), vec![0, mm(5), mm(5) - mm(1) / 2, mm(5)]);
         assert_eq!(b.match_groups[0].spread(&l, &d), 40_000, "delay unit");
         assert_eq!(b.match_groups[1].spread(&l, &d), mm(4), "length unit");
+    }
+}
+
+#[cfg(test)]
+mod stackup_tests {
+    use super::*;
+    use crate::builder::BoardBuilder;
+    use ferroute_geom::units::mm_to_nm;
+
+    fn diel(t: f64, er: u32) -> Dielectric {
+        Dielectric {
+            thickness: mm_to_nm(t),
+            epsilon_r_milli: er,
+            between: (LayerId(0), LayerId(0)),
+        }
+    }
+
+    fn four(outer: f64) -> Stackup {
+        Stackup::from_layers(
+            vec![35_000, 17_500, 17_500, 35_000],
+            vec![diel(outer, 4500), diel(0.8, 4000), diel(outer, 4500)],
+            None,
+        )
+        .expect("valid")
+    }
+
+    #[test]
+    fn from_layers_derives_scalars_and_rejects_bad_input() {
+        let s = four(0.2);
+        assert_eq!(s.outer_dielectric, 200_000);
+        assert_eq!(s.board_thickness, 35_000 * 2 + 17_500 * 2 + 1_200_000);
+        assert_eq!(s.dielectrics[2].between, (LayerId(2), LayerId(3)));
+        assert_eq!(s.outer_h_er(LayerId(3), 4), (200_000, 4.5));
+        assert_eq!(s.stripline_b_er(LayerId(1), 4).map(|v| v.0), Some(1_017_500));
+        assert!(s.stripline_b_er(LayerId(0), 4).is_none());
+        assert!(Stackup::from_layers(vec![35_000; 4], vec![diel(0.2, 4500)], None).is_none());
+        assert!(Stackup::from_layers(vec![35_000; 2], vec![diel(0.2, 900)], None).is_none());
+    }
+
+    #[test]
+    fn impedance_width_follows_the_real_dielectric() {
+        let width = |outer: f64| {
+            let mut b = BoardBuilder::new(mm_to_nm(30.0), mm_to_nm(20.0), 4);
+            let n = b.net("CLK");
+            let mut board = b.build();
+            board.stackup = four(outer);
+            board.nets[n.idx()].constraints.impedance_mohm = Some(50_000);
+            required_width(&board, n)
+        };
+        let (thin, thick) = (width(0.1), width(0.2));
+        assert!(thick > thin, "thicker dielectric needs a wider trace: {thin} vs {thick}");
+        let hj = microstrip_width_hj(50.0, 200_000, 35_000, 4.5).expect("w");
+        assert!(thick >= hj);
+    }
+
+    #[test]
+    fn delay_uses_per_layer_er() {
+        let mut b = BoardBuilder::new(mm_to_nm(30.0), mm_to_nm(20.0), 4);
+        let _ = b.net("S");
+        let mut board = b.build();
+        board.stackup = four(0.2);
+        let inner = layer_delay_ps_per_mm(&board, LayerId(1), 150_000);
+        // Stripline delay = √εr / c with the weighted εr of the two neighbours.
+        let er: f64 = (0.2 * 4.5 + 0.8 * 4.0) / 1.0;
+        assert!((inner - er.sqrt() / C_MM_PER_PS).abs() < 1e-9, "{inner}");
+        let outer = layer_delay_ps_per_mm(&board, LayerId(0), 150_000);
+        assert!(outer < inner);
     }
 }
