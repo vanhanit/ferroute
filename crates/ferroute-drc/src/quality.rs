@@ -239,7 +239,7 @@ pub fn pad_wraps(board: &Board) -> Vec<PadWrap> {
         }
         let c = board.pad_position(id);
         let radius = wrap_radius(board, id);
-        for layer in (0..=u8::MAX).map(LayerId).filter(|&l| pad.layers.contains(l)) {
+        for layer in pad.layers.iter() {
             let Some(pieces) = groups.get(&(layer.0, pad.net.0)) else { continue };
             let touching = |p: Point, skip: Option<usize>| -> Vec<usize> {
                 (0..pieces.len())

@@ -481,7 +481,7 @@ pub fn relocate_vias(base: &Board, edit: &BoardEdit, via_in_pad: bool) -> BoardE
         || after.2 > before.2
         || slivers(&cur) > slivers(edit)
     {
-        tracing::error!(?before, ?after, "via relocation made the result worse; keeping the input");
+        tracing::warn!(?before, ?after, "via relocation made the result worse; keeping the input");
         return edit.clone();
     }
     cur

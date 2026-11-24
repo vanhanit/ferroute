@@ -103,7 +103,8 @@ impl LayerSet {
 
     #[must_use]
     pub const fn contains(self, l: LayerId) -> bool {
-        self.0 & (1 << l.0) != 0
+        // Ids ≥ 64 are never in the set (a plain shift would wrap in release builds).
+        l.0 < 64 && self.0 & (1 << l.0) != 0
     }
 
     #[must_use]
@@ -935,3 +936,17 @@ mod tests;
 
 #[cfg(test)]
 mod via_tests;
+
+#[cfg(test)]
+mod layerset_tests {
+    use super::*;
+
+    #[test]
+    fn contains_never_aliases_ids_beyond_the_set_width() {
+        let s = LayerSet::single(LayerId(0));
+        assert!(s.contains(LayerId(0)));
+        for id in 64..=u8::MAX {
+            assert!(!s.contains(LayerId(id)), "LayerId({id}) aliases bit {}", id % 64);
+        }
+    }
+}
