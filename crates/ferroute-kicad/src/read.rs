@@ -33,6 +33,11 @@ pub(crate) struct Parsed {
     pub dialect: NetDialect,
     /// Index in the root list of every footprint, in `Board::footprints` order.
     pub fp_nodes: Vec<usize>,
+    /// Root-list index of the source node of every `Board::tracks` entry (an arc node
+    /// appears once per chord).
+    pub track_nodes: Vec<usize>,
+    /// Root-list index of the source node of every `Board::vias` entry.
+    pub via_nodes: Vec<usize>,
     pub warnings: Vec<String>,
 }
 
@@ -643,10 +648,17 @@ pub(crate) fn parse_board(root: &SExpr) -> Result<Parsed, KicadError> {
             r.read_footprint(child)?;
         }
     }
-    for child in root.items().unwrap_or(&[]).iter().skip(1) {
+    let (mut track_nodes, mut via_nodes) = (Vec::new(), Vec::new());
+    for (i, child) in root.items().unwrap_or(&[]).iter().enumerate().skip(1) {
         match child.head() {
-            Some("segment" | "arc") => r.read_track(child)?,
-            Some("via") => r.read_via(child)?,
+            Some("segment" | "arc") => {
+                r.read_track(child)?;
+                track_nodes.resize(r.board.tracks.len(), i);
+            }
+            Some("via") => {
+                r.read_via(child)?;
+                via_nodes.resize(r.board.vias.len(), i);
+            }
             Some("zone") => r.read_zone(child, None, "")?,
             Some(h) if h.starts_with("gr_") => {
                 if child.child("layer").and_then(|l| l.atom(1)) == Some("Edge.Cuts")
@@ -678,5 +690,5 @@ pub(crate) fn parse_board(root: &SExpr) -> Result<Parsed, KicadError> {
         board.stackup.board_thickness = t;
     }
     board.validate().map_err(|e| KicadError::Format(e.to_string()))?;
-    Ok(Parsed { board, version, dialect, fp_nodes, warnings: r.warnings })
+    Ok(Parsed { board, version, dialect, fp_nodes, track_nodes, via_nodes, warnings: r.warnings })
 }

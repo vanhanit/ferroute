@@ -109,7 +109,7 @@ Update the benchmark baseline only on purpose:
 - [ ] **INV-DRC-1** shapes are convex *supersets* of true copper; oracle is exact and deterministic.
 - [ ] **INV-DRC-2** routed fixtures pass KiCad 10 `kicad-cli pcb drc` (CI lane).
 - [ ] **INV-ROUTE-1** no base node of one net inside another net's ring; `routing_never_introduces_violations` proptest green; `drc_gate_rips == 0`.
-- [ ] **INV-EDIT-1** edits are additive; only `Movable` footprints move, within bounds (`BoardEdit::check_invariants`).
+- [ ] **INV-EDIT-1** edits are additive except an explicit user rip-up of unlocked existing tracks/vias/arcs (`--ripup-all` / `--ripup-nets`; `RemovedItems::check_invariants`); only `Movable` footprints move, within bounds (`BoardEdit::check_invariants`).
 - [ ] **INV-PLACE-1** locked/fixed parts never move; nudged parts satisfy every hard constraint.
 - [ ] **INV-PLACE-3** translated footprints land on the absolute placement grid (`PlaceConfig::grid`, `--move-grid`).
 - [ ] **INV-ROUTE-2** every routed connection ends exactly at the pad centre, crosses the pad edge on an axis through the centre (side midpoint for rectangular pads, any 0/45/90° line for circular pads), and every segment is 0°/45°/90°.

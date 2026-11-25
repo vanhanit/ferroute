@@ -18,9 +18,11 @@ pub mod constraints;
 pub mod custom;
 pub mod netrules;
 pub mod pairs;
+pub mod ripup;
 pub mod rules;
 pub mod text;
 pub use pairs::DiffPair;
+pub use ripup::{RemovedItems, Ripup, RipupReport, RipupScope, ripup};
 pub use rules::{DesignRules, NetClass};
 pub use text::glob;
 
@@ -874,7 +876,11 @@ pub struct FootprintMove {
 
 /// The output of a ferroute run: purely additive copper plus footprint moves.
 /// INV-EDIT-1: an edit never deletes or modifies `Origin::Existing` items and never
-/// moves a footprint whose mobility is not `Movable`.
+/// moves a footprint whose mobility is not `Movable`. The single exception is an explicit
+/// user rip-up of unlocked existing tracks/vias/arcs: it travels *next to* the edit as
+/// [`RemovedItems`] + [`RipupScope`] (see [`ripup()`]) and is checked by
+/// [`RemovedItems::check_invariants`]. (Kept out of this struct so every producer of
+/// edits stays purely additive by construction.)
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct BoardEdit {
     pub moves: Vec<FootprintMove>,

@@ -39,7 +39,7 @@ mod teardrop;
 mod util;
 mod write;
 
-pub use doc::KicadDocument;
+pub use doc::{KicadDocument, Removal};
 pub use error::KicadError;
 pub use write::{KICAD10_VERSION, write_new_board};
 
@@ -90,7 +90,16 @@ pub fn read_board(src: &str, opts: &ReadOptions) -> Result<KicadBoard, KicadErro
         board.rules.custom = parsed.rules;
         rules_warnings = parsed.warnings;
     }
-    let doc = KicadDocument::new(root, parsed.version, parsed.dialect, parsed.fp_nodes);
+    let doc = KicadDocument::new(
+        root,
+        parsed.version,
+        parsed.dialect,
+        doc::SourceNodes {
+            footprints: parsed.fp_nodes,
+            tracks: parsed.track_nodes,
+            vias: parsed.via_nodes,
+        },
+    );
     Ok(KicadBoard { board, doc, warnings, rules_warnings })
 }
 

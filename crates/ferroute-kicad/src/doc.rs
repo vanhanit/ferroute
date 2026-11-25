@@ -7,8 +7,11 @@ use crate::read::NetDialect;
 use crate::sexpr::SExpr;
 use crate::util::{float, format_angle, kq, kv, node, norm180, same_angle, uuid_for, xy_node};
 use crate::write::KICAD10_VERSION;
-use ferroute_board::{ArcTrack, Board, BoardEdit, Placement, Track, Via, ViaKind};
+use ferroute_board::{
+    ArcTrack, Board, BoardEdit, Placement, RemovedItems, RipupScope, Track, Via, ViaKind,
+};
 use ferroute_geom::units::{format_mm, parse_mm};
+use std::collections::BTreeSet;
 
 /// UUID kinds (domain separation for [`uuid_for`]).
 pub(crate) const KIND_TRACK: u64 = 1;
@@ -23,6 +26,10 @@ pub struct KicadDocument {
     pub(crate) dialect: NetDialect,
     /// Root-list index of every footprint, in `Board::footprints` order.
     pub(crate) fp_nodes: Vec<usize>,
+    /// Root-list index of the source node of every `Board::tracks` entry (arcs: one per
+    /// chord) and `Board::vias` entry, as read. Emptied by a rip-up (indices go stale).
+    pub(crate) track_nodes: Vec<usize>,
+    pub(crate) via_nodes: Vec<usize>,
     /// Number of tracks / vias this document has appended (keeps UUIDs unique across
     /// successive edits with the same seed).
     pub(crate) added_tracks: u64,
@@ -297,14 +304,74 @@ fn apply_zone_fills(root: &mut SExpr, board: &Board, edit: &BoardEdit) -> Result
     Ok(())
 }
 
+/// Root-list positions of the nodes a [`Board`] was read from.
+pub(crate) struct SourceNodes {
+    pub footprints: Vec<usize>,
+    pub tracks: Vec<usize>,
+    pub vias: Vec<usize>,
+}
+
+/// An explicit user rip-up to apply together with an edit (see
+/// [`KicadDocument::apply_edit_removing`]).
+#[derive(Clone, Copy, Debug)]
+pub struct Removal<'a> {
+    /// The board as read from this document (the removed indices refer to it).
+    pub original: &'a Board,
+    pub removed: &'a RemovedItems,
+    pub scope: &'a RipupScope,
+}
+
 impl KicadDocument {
-    pub(crate) fn new(
-        root: SExpr,
-        version: u32,
-        dialect: NetDialect,
-        fp_nodes: Vec<usize>,
-    ) -> Self {
-        Self { root, version, dialect, fp_nodes, added_tracks: 0, added_arcs: 0, added_vias: 0 }
+    pub(crate) fn new(root: SExpr, version: u32, dialect: NetDialect, src: SourceNodes) -> Self {
+        Self {
+            root,
+            version,
+            dialect,
+            fp_nodes: src.footprints,
+            track_nodes: src.tracks,
+            via_nodes: src.vias,
+            added_tracks: 0,
+            added_arcs: 0,
+            added_vias: 0,
+        }
+    }
+
+    /// Root-list indices of the nodes `removed` refers to (an arc node counts once).
+    fn removal_nodes(
+        &self,
+        board: &Board,
+        removed: &RemovedItems,
+    ) -> Result<BTreeSet<usize>, KicadError> {
+        if removed.is_empty() {
+            return Ok(BTreeSet::new());
+        }
+        if self.track_nodes.len() != board.tracks.len() || self.via_nodes.len() != board.vias.len()
+        {
+            return Err(KicadError::Format(
+                "board does not match this document for a rip-up (copper changed since reading)"
+                    .into(),
+            ));
+        }
+        if !removed.arcs.is_empty() {
+            return Err(KicadError::Format(
+                "rip-up of pre-existing arc items is not supported (the reader produces none)"
+                    .into(),
+            ));
+        }
+        let mut nodes = BTreeSet::new();
+        for t in &removed.tracks {
+            nodes.insert(self.track_nodes[t.idx()]);
+        }
+        for v in &removed.vias {
+            nodes.insert(self.via_nodes[v.idx()]);
+        }
+        // An arc node is read as several chords: all of them must be removed together.
+        for (i, n) in self.track_nodes.iter().enumerate() {
+            if nodes.contains(n) && !removed.tracks.iter().any(|t| t.idx() == i) {
+                return Err(KicadError::Format("rip-up removes only part of an arc track".into()));
+            }
+        }
+        Ok(nodes)
     }
 
     /// The `(version N)` of the file (KiCad 10 writes 20260206).
@@ -373,7 +440,44 @@ impl KicadDocument {
         edit: &BoardEdit,
         seed: u64,
     ) -> Result<(), KicadError> {
+        self.apply_edit_inner(board_before, edit, None, seed)
+    }
+
+    /// As [`Self::apply_edit`], and additionally deletes exactly the nodes of the
+    /// explicitly ripped-up copper (`removal.removed`, indices into `removal.original`,
+    /// produced by [`ferroute_board::ripup`]). `board_before` is the board the edit was
+    /// computed on (normally the ripped board, with placement policy applied). Nothing else
+    /// is touched; with empty `removed` the result is byte-identical to [`Self::apply_edit`].
+    /// A document accepts one rip-up (node positions go stale afterwards).
+    ///
+    /// # Errors
+    /// As [`Self::apply_edit`], plus [`KicadError::Format`] when `removed` violates
+    /// INV-EDIT-1 (no scope, locked or out-of-scope copper) or does not match this document.
+    pub fn apply_edit_removing(
+        &mut self,
+        board_before: &Board,
+        edit: &BoardEdit,
+        removal: &Removal<'_>,
+        seed: u64,
+    ) -> Result<(), KicadError> {
+        self.apply_edit_inner(board_before, edit, Some(removal), seed)
+    }
+
+    fn apply_edit_inner(
+        &mut self,
+        board_before: &Board,
+        edit: &BoardEdit,
+        removal: Option<&Removal<'_>>,
+        seed: u64,
+    ) -> Result<(), KicadError> {
         edit.check_invariants(board_before).map_err(KicadError::Format)?;
+        let gone = match removal {
+            Some(r) => {
+                r.removed.check_invariants(r.original, r.scope).map_err(KicadError::Format)?;
+                self.removal_nodes(r.original, r.removed)?
+            }
+            None => BTreeSet::new(),
+        };
         if board_before.footprints.len() != self.fp_nodes.len() {
             return Err(KicadError::Format(
                 "board does not match this document (footprint count differs)".into(),
@@ -418,6 +522,21 @@ impl KicadDocument {
             move_footprint(fp, m.to)?;
         }
         apply_zone_fills(&mut edited, board_before, edit)?;
+        if !gone.is_empty() {
+            if let Some(items) = edited.items_mut() {
+                let mut i = 0usize;
+                items.retain(|_| {
+                    let keep = !gone.contains(&i);
+                    i += 1;
+                    keep
+                });
+            }
+            for f in &mut self.fp_nodes {
+                *f -= gone.range(..*f).count();
+            }
+            self.track_nodes.clear();
+            self.via_nodes.clear();
+        }
         self.root = edited;
         if !new_nodes.is_empty() {
             let at = self.insertion_index();

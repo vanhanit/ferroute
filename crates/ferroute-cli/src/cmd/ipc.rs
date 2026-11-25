@@ -56,6 +56,12 @@ pub enum IpcCommand {
         /// Enable KiCad teardrops on pads and vias that get new copper.
         #[arg(long)]
         teardrops: bool,
+        /// Delete every unlocked existing track/arc/via before routing (see `ferroute route`).
+        #[arg(long, conflicts_with = "ripup_nets")]
+        ripup_all: bool,
+        /// Delete unlocked existing copper of nets matching these globs before routing.
+        #[arg(long, value_delimiter = ',', value_name = "PATTERN", conflicts_with = "ripup_all")]
+        ripup_nets: Vec<String>,
     },
     /// KiCad 11+: export the open (or given) board to SVG via the IPC job API.
     ExportSvg {
@@ -115,7 +121,16 @@ pub fn run(c: &IpcCommand) -> Result<ExitCode> {
             }
             Ok(ExitCode::SUCCESS)
         }
-        IpcCommand::Route { socket, seed, allow_move, rules, allow_via_in_pad, teardrops } => {
+        IpcCommand::Route {
+            socket,
+            seed,
+            allow_move,
+            rules,
+            allow_via_in_pad,
+            teardrops,
+            ripup_all,
+            ripup_nets,
+        } => {
             let mut client = connect(socket.as_ref(), Duration::from_secs(30))?;
             let caps = negotiate(&mut client)?;
             let docs = client.get_open_documents(DocumentType::Pcb)?;
@@ -149,6 +164,8 @@ pub fn run(c: &IpcCommand) -> Result<ExitCode> {
                 micro_in_pad: false,
                 teardrops: *teardrops,
                 no_refill_zones: false,
+                ripup_all: *ripup_all,
+                ripup_nets: ripup_nets.clone(),
             };
             let code = route_run(&args)?;
             client.revert_document(doc).context("RevertDocument (reload)")?;

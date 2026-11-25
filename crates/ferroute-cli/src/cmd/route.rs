@@ -5,9 +5,10 @@ use super::{item_label, load, out, render_opts};
 use crate::length::parse_length;
 use anyhow::{Context, Result, bail};
 use ferroute_board::netrules::RuleSet;
-use ferroute_board::{LayerSet, ViaKind, ViaPolicy};
+use ferroute_board::{LayerSet, RipupScope, ViaKind, ViaPolicy, ripup};
 use ferroute_engine::{PipelineConfig, run as run_pipeline};
 use ferroute_geom::Coord;
+use ferroute_kicad::Removal;
 use ferroute_place::{MovePolicy, PlaceConfig};
 use ferroute_router::{Accel, RouterConfig};
 use serde_json::json;
@@ -112,6 +113,25 @@ pub struct RouteArgs {
     /// to routed copper and their stored fill is recomputed around it).
     #[arg(long)]
     pub no_refill_zones: bool,
+    /// Delete every unlocked existing track, arc and via before routing, then route the
+    /// board from scratch. Locked copper, pours, pads and no-net copper are kept. The
+    /// deleted copper is gone from the output file (also `[routing] ripup = "all"`).
+    /// Connectivity/completion is reported against the ripped board.
+    #[arg(long, conflicts_with = "ripup_nets")]
+    pub ripup_all: bool,
+    /// Delete unlocked existing copper of the nets matching these globs (`*`, `?`,
+    /// case-sensitive) before routing; repeatable and/or comma separated, e.g.
+    /// `--ripup-nets 'USB_*' --ripup-nets GND` (also `[routing] ripup = ["USB_*"]`).
+    #[arg(long, value_delimiter = ',', value_name = "PATTERN", conflicts_with = "ripup_all")]
+    pub ripup_nets: Vec<String>,
+}
+
+/// The rip-up scope: command-line flags win over the rules file.
+fn resolve_ripup<S: AsRef<str>>(all: bool, nets: &[S], from_rules: &RipupScope) -> RipupScope {
+    match RipupScope::from_patterns(all, nets) {
+        RipupScope::None => from_rules.clone(),
+        cli => cli,
+    }
 }
 
 /// Number of new vias per [`ViaKind`] (in `ViaKind::ALL` order).
@@ -148,6 +168,7 @@ pub fn run(a: &RouteArgs) -> Result<ExitCode> {
     let mut board = kb.board;
     let mut via_in_pad = a.allow_via_in_pad;
     let mut teardrops = a.teardrops;
+    let mut rules_ripup = RipupScope::None;
     let mut via_policy = ViaPolicy::default();
     if !a.via_types.is_empty() {
         via_policy = ViaPolicy::from_names(a.via_types.iter().map(String::as_str))
@@ -165,9 +186,31 @@ pub fn run(a: &RouteArgs) -> Result<ExitCode> {
             via_policy = ViaPolicy { micro_in_pad: via_policy.micro_in_pad || p.micro_in_pad, ..p };
         }
         teardrops |= rules.teardrops();
+        rules_ripup = rules.ripup_scope();
         for w in rules.apply(&mut board)? {
             out(&format!("rules warning: {w}"));
         }
+    }
+    let rip = ripup(&board, &resolve_ripup(a.ripup_all, &a.ripup_nets, &rules_ripup));
+    if !rip.scope.is_none() {
+        out(&format!(
+            "rip-up: removed {} track segment(s), {} arc(s), {} via(s) on {} net(s){}",
+            rip.report.tracks,
+            rip.report.arcs,
+            rip.report.vias,
+            rip.report.nets.len(),
+            if rip.report.nets.is_empty() {
+                String::new()
+            } else {
+                format!(" ({})", rip.report.nets.join(", "))
+            }
+        ));
+        for w in rip.report.warnings() {
+            out(&format!("rip-up warning: {w}"));
+        }
+        out(
+            "warning: ripped copper is deleted from the output file; completion is reported against the ripped board",
+        );
     }
     let layers = if a.layers.is_empty() {
         None
@@ -212,15 +255,20 @@ pub fn run(a: &RouteArgs) -> Result<ExitCode> {
         refill_zones: !a.no_refill_zones,
         ..PipelineConfig::default()
     };
-    let res = run_pipeline(&board, &cfg).context("routing")?;
+    let res = run_pipeline(&rip.board, &cfg).context("routing")?;
     if !res.metrics.drc_clean {
         bail!(
             "internal error: DRC gate reported {} introduced violations; refusing to write output",
             res.metrics.introduced_violations
         );
     }
-    doc.apply_edit(&res.policy_board, &res.edit, a.seed)
-        .context("applying edit to the KiCad document")?;
+    doc.apply_edit_removing(
+        &res.policy_board,
+        &res.edit,
+        &Removal { original: &board, removed: &rip.removed, scope: &rip.scope },
+        a.seed,
+    )
+    .context("applying edit to the KiCad document")?;
     let teardrop_nodes =
         if teardrops { doc.enable_teardrops(&res.policy_board, &res.edit) } else { 0 };
     if a.output == a.input {
@@ -302,6 +350,7 @@ pub fn run(a: &RouteArgs) -> Result<ExitCode> {
             "via_kinds": via_kinds_json(&kinds),
             "rule_notes": res.rule_notes, "rule_issues": issues,
             "teardrops": teardrops.then_some(teardrop_nodes), "dfm_issues": dfm,
+            "ripup": (!rip.scope.is_none()).then_some(&rip.report),
             "drc": { "violations": res.drc.violations.len(), "connectivity": res.drc.connectivity },
         });
         std::fs::write(p, serde_json::to_string_pretty(&report)?)?;
@@ -343,6 +392,31 @@ mod tests {
         let err = parse_rules("[routing]\nvia_types = [\"stacked\"]").expect_err("unknown kind");
         assert!(format!("{err:#}").contains("stacked"), "{err:#}");
         assert!(parse_rules("[routing]\nvia_types = []").is_err(), "empty list rejected");
+    }
+
+    #[test]
+    fn routing_table_selects_ripup() {
+        use ferroute_board::RipupScope;
+        assert_eq!(parse_rules("").expect("empty").ripup_scope(), RipupScope::None);
+        let all = parse_rules("[routing]\nripup = \"all\"").expect("all");
+        assert_eq!(all.ripup_scope(), RipupScope::All);
+        let nets = parse_rules("[routing]\nripup = [\"USB_*\", \"GND\"]").expect("nets");
+        assert_eq!(nets.ripup_scope(), RipupScope::Nets(vec!["USB_*".into(), "GND".into()]));
+        assert_eq!(
+            parse_rules("[routing]\nripup = \"none\"").expect("none").ripup_scope(),
+            RipupScope::None
+        );
+        assert!(parse_rules("[routing]\nripup = \"everything\"").is_err());
+    }
+
+    #[test]
+    fn cli_ripup_wins_over_the_rules_file() {
+        use ferroute_board::RipupScope;
+        let rules = RipupScope::Nets(vec!["A".into()]);
+        let pick = |all, nets: &[&str]| super::resolve_ripup(all, nets, &rules);
+        assert_eq!(pick(false, &[]), rules, "rules file applies without flags");
+        assert_eq!(pick(true, &[]), RipupScope::All);
+        assert_eq!(pick(false, &["B, C"]), RipupScope::Nets(vec!["B".into(), "C".into()]));
     }
 
     #[test]

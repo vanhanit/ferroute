@@ -80,6 +80,19 @@ cargo build --release -p ferroute-cli          # add --features gpu for wgpu acc
 ./target/release/ferroute drc board.routed.kicad_pcb --fail-on-violation
 ```
 
+Re-route from scratch, or only some nets (existing copper is otherwise kept as-is):
+
+```bash
+ferroute route board.kicad_pcb -o out.kicad_pcb --ripup-all                       # every unlocked track/arc/via
+ferroute route board.kicad_pcb -o out.kicad_pcb --ripup-nets 'USB_*' --ripup-nets GND   # net globs, repeatable / comma separated
+```
+
+Rip-up deletes only *unlocked* existing tracks, arcs and vias of the selected nets; locked
+copper, pours, pads, footprints and no-net copper are never touched, and unknown patterns
+are reported as warnings. The ripped copper is gone from the output file, and completion is
+reported against the ripped board. Also available as `[routing] ripup = "all"` /
+`ripup = ["USB_*"]` in `--rules` (the flags win) and on `ferroute ipc route`.
+
 Or with nothing but Docker and make:
 
 ```bash

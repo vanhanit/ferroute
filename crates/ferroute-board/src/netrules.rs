@@ -43,6 +43,17 @@ pub struct RoutingSpec {
     /// Switch on KiCad's native teardrops for every pad and via that gets new copper
     /// (KiCad generates the teardrop copper itself on refill).
     pub teardrops: Option<bool>,
+    /// Rip up existing copper before routing: `"all"`, or a list of net globs
+    /// (`["USB_*", "GND"]`). The `--ripup-all` / `--ripup-nets` flags override it.
+    pub ripup: Option<RipupSpec>,
+}
+
+/// `[routing] ripup`: the keyword `"all"` (or `"none"`) or a list of net globs.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum RipupSpec {
+    Keyword(String),
+    Nets(Vec<String>),
 }
 
 /// One rule: selector globs plus the constraints it sets.
@@ -237,6 +248,8 @@ pub enum RuleError {
     ViaType(String),
     #[error("[routing] via_types must list at least one kind")]
     ViaTypesEmpty,
+    #[error("[routing] ripup: expected \"all\", \"none\" or a list of net globs, got {0:?}")]
+    RipupKeyword(String),
 }
 
 fn positive(v: Option<f64>, index: usize, field: &'static str) -> Result<(), RuleError> {
@@ -322,6 +335,16 @@ impl RuleSet {
         Some(p)
     }
 
+    /// `[routing] ripup` as a scope ([`crate::RipupScope::None`] when absent).
+    #[must_use]
+    pub fn ripup_scope(&self) -> crate::RipupScope {
+        match self.routing.as_ref().and_then(|r| r.ripup.as_ref()) {
+            Some(RipupSpec::Keyword(k)) if k == "all" => crate::RipupScope::All,
+            Some(RipupSpec::Nets(p)) => crate::RipupScope::from_patterns(false, p),
+            _ => crate::RipupScope::None,
+        }
+    }
+
     /// `[routing] teardrops` (`false` when absent).
     #[must_use]
     pub fn teardrops(&self) -> bool {
@@ -345,6 +368,12 @@ impl RuleSet {
                     return Err(RuleError::Stackup { field });
                 }
             }
+        }
+        if let Some(RipupSpec::Keyword(k)) = self.routing.as_ref().and_then(|r| r.ripup.as_ref())
+            && k != "all"
+            && k != "none"
+        {
+            return Err(RuleError::RipupKeyword(k.clone()));
         }
         if let Some(types) = self.routing.as_ref().and_then(|r| r.via_types.as_ref()) {
             if types.is_empty() {
