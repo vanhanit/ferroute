@@ -13,7 +13,7 @@
 use std::fmt::Write as _;
 use std::path::Path;
 
-use ferroute_board::{ArcTrack, Board, LayerId, LayerSet, NetId, Origin};
+use ferroute_board::{ArcTrack, Board, LayerId, LayerSet, NetId, Origin, Zone};
 use ferroute_geom::{Coord, Hull, Point, Rect};
 
 /// A DRC marker: a red ring with an X at `at`, carrying `label` as its `<title>`.
@@ -77,6 +77,8 @@ const MOVE: &str = "#ffd000";
 const MARKER: &str = "#ff3040";
 const LABEL: &str = "#dcdcdc";
 const COPPER_OPACITY: &str = "0.85";
+const ZONE_OPACITY: &str = "0.30";
+const ZONE_HATCH_OPACITY: &str = "0.60";
 const ROUTED_OPACITY: &str = "1";
 const INNER_COLOURS: [&str; 4] = ["#c2c23a", "#34b07a", "#b05ad0", "#e0803a"];
 const FRONT_COLOUR: &str = "#c83434";
@@ -125,6 +127,7 @@ pub fn render_svg(board: &Board, opts: &RenderOptions) -> String {
         keepout = KEEPOUT,
         moves = MOVE
     );
+    s.push_str(&zone_hatch_defs(board, sel));
     let _ = writeln!(
         s,
         r#"<rect x="{}" y="{}" width="{}" height="{}" fill="{BACKGROUND}"/>"#,
@@ -173,6 +176,10 @@ pub fn render_svg(board: &Board, opts: &RenderOptions) -> String {
         let colour = layer_colour(board, layer);
         let name = esc(&board.copper_layers[li].name);
         let _ = writeln!(s, r#"<g id="layer-{name}">"#);
+        // Pours sit below every track and pad of their layer.
+        for z in &board.zones {
+            emit_zone(&mut s, board, z, layer, colour);
+        }
         for t in board.tracks.iter().filter(|t| t.layer == layer) {
             let attrs = net_attr(board, t.net);
             let op = copper_opacity(t.origin, opts.highlight_routed);
@@ -440,6 +447,66 @@ fn arc_element(a: &ArcTrack, colour: &str, opacity: &str, attrs: &str) -> String
         r#"<path d="{d}" fill="none" stroke="{colour}" stroke-width="{}" stroke-linecap="round" opacity="{opacity}"{attrs}/>"#,
         mm(a.width)
     )
+}
+
+/// Appends the SVG for one zone on `layer`: its stored fill polygons (even-odd, so
+/// cut-outs are holes), or its outline hatched when the zone was never filled.
+fn emit_zone(out: &mut String, board: &Board, z: &Zone, layer: LayerId, colour: &str) {
+    if z.is_unfilled() {
+        if z.layers.contains(layer) && z.outline.pts.len() >= 3 {
+            let mut d = String::new();
+            push_path(&mut d, &z.outline.pts, true);
+            let _ = writeln!(
+                out,
+                r#"<path class="zone-unfilled" d="{d}" fill="url(#zone-hatch-{})" stroke="{colour}" stroke-width="{}" opacity="{ZONE_HATCH_OPACITY}"{}/>"#,
+                layer.0,
+                mm(LINE_THIN),
+                net_attr(board, z.net)
+            );
+        }
+        return;
+    }
+    let mut d = String::new();
+    for f in z.fills.iter().filter(|f| f.layer == layer) {
+        for poly in f.polys.iter().filter(|p| p.pts.len() >= 3) {
+            push_path(&mut d, &poly.pts, true);
+        }
+    }
+    if d.is_empty() {
+        return;
+    }
+    let _ = writeln!(
+        out,
+        r#"<path class="zone" d="{d}" fill="{colour}" fill-opacity="{ZONE_OPACITY}" fill-rule="evenodd"{}/>"#,
+        net_attr(board, z.net)
+    );
+}
+
+/// `<defs>` with one hatch pattern per layer that carries an unfilled zone, in that
+/// layer's colour. Empty (so the output is unchanged) when no zone needs it.
+fn zone_hatch_defs(board: &Board, sel: LayerSet) -> String {
+    let mut out = String::new();
+    for li in 0..board.copper_layers.len() {
+        let Ok(id) = u8::try_from(li) else { continue };
+        let layer = LayerId(id);
+        let needed = sel.contains(layer)
+            && board.zones.iter().any(|z| z.is_unfilled() && z.layers.contains(layer));
+        if !needed {
+            continue;
+        }
+        if out.is_empty() {
+            out.push_str("<defs>\n");
+        }
+        let _ = writeln!(
+            out,
+            r#"<pattern id="zone-hatch-{id}" width="0.5000" height="0.5000" patternUnits="userSpaceOnUse"><path d="M 0.0000 0.0000 L 0.5000 0.5000" stroke="{}" stroke-width="0.0500" fill="none"/></pattern>"#,
+            layer_colour(board, layer)
+        );
+    }
+    if !out.is_empty() {
+        out.push_str("</defs>\n");
+    }
+    out
 }
 
 fn emit(out: &mut String, el: Option<String>) {

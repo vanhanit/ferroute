@@ -1,8 +1,9 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 use super::*;
 use ferroute_board::{
-    CopperLayer, Drill, Footprint, FootprintId, Keepout, LayerId, Mobility, Net, Outline, Pad,
-    PadId, PadShape, Placement, Side, Track, Via,
+    CopperLayer, Drill, Footprint, FootprintId, IslandRemoval, Keepout, LayerId, LayerSet,
+    Mobility, Net, Outline, Pad, PadConnection, PadId, PadShape, Placement, Side, Track, Via, Zone,
+    ZoneFill,
 };
 use ferroute_geom::{Angle, Point, Polygon, Rect};
 
@@ -337,4 +338,124 @@ fn boards_without_arcs_have_no_arc_paths_and_arcs_extend_bbox() {
     let svg = render_svg(&b, &RenderOptions::default());
     assert_eq!(arc_paths(&svg).len(), 1);
     assert!(svg.contains("viewBox=\"7.8735 2.8735 "), "{svg}");
+}
+
+/// A zone on net 1 covering the test board's outline.
+fn zone_with(fills: Vec<ZoneFill>) -> Zone {
+    Zone {
+        net: NetId(1),
+        layers: LayerSet::single(LayerId(0)),
+        outline: Polygon::from_rect(Rect::new(
+            Point::new(0, 0),
+            Point::new(20_000_000, 10_000_000),
+        )),
+        fills,
+        clearance: 200_000,
+        min_thickness: 250_000,
+        priority: 0,
+        pad_connection: PadConnection::Solid,
+        islands: IslandRemoval::Always,
+        yields: false,
+    }
+}
+
+fn mm_rect(x0: i64, y0: i64, x1: i64, y1: i64) -> Polygon {
+    Polygon::from_rect(Rect::new(Point::new(x0, y0), Point::new(x1, y1)))
+}
+
+#[test]
+fn zone_fill_is_drawn_with_expected_points_below_copper() {
+    let mut b = test_board();
+    b.zones.push(zone_with(vec![ZoneFill {
+        layer: LayerId(0),
+        polys: vec![mm_rect(1_000_000, 1_000_000, 4_000_000, 3_000_000)],
+    }]));
+    let svg = render_svg(&b, &RenderOptions::default());
+    assert!(
+        svg.contains(
+            r##"<path class="zone" d="M1.0000 1.0000 L4.0000 1.0000 L4.0000 3.0000 L1.0000 3.0000 Z" fill="#c83434" fill-opacity="0.30" fill-rule="evenodd" data-net="SIG&amp;&lt;&gt;"/>"##
+        ),
+        "{svg}"
+    );
+    let doc = parse(&svg);
+    let zone = doc
+        .descendants()
+        .find(|n| n.attribute("class") == Some("zone"))
+        .expect("zone path present");
+    let group = zone.parent_element().expect("zone sits in a layer group");
+    assert_eq!(group.attribute("id"), Some("layer-F.Cu"));
+    let first = group.children().find(|n| n.is_element()).unwrap();
+    assert_eq!(first.attribute("class"), Some("zone"), "zone must paint before tracks/pads");
+}
+
+#[test]
+fn zone_on_back_layer_only_draws_on_back_group() {
+    let mut b = test_board();
+    let mut z = zone_with(vec![ZoneFill {
+        layer: LayerId(1),
+        polys: vec![mm_rect(1_000_000, 1_000_000, 4_000_000, 3_000_000)],
+    }]);
+    z.layers = LayerSet::single(LayerId(1));
+    b.zones.push(z);
+    let svg = render_svg(&b, &RenderOptions::default());
+    let doc = parse(&svg);
+    let zone = doc.descendants().find(|n| n.attribute("class") == Some("zone")).unwrap();
+    assert_eq!(zone.parent_element().unwrap().attribute("id"), Some("layer-B.Cu"));
+    assert_eq!(zone.attribute("fill"), Some("#3a6fd8"));
+}
+
+#[test]
+fn zone_cutouts_become_evenodd_subpaths() {
+    let mut b = test_board();
+    b.zones.push(zone_with(vec![ZoneFill {
+        layer: LayerId(0),
+        polys: vec![
+            mm_rect(1_000_000, 1_000_000, 8_000_000, 8_000_000),
+            mm_rect(3_000_000, 3_000_000, 4_000_000, 4_000_000),
+        ],
+    }]));
+    let svg = render_svg(&b, &RenderOptions::default());
+    assert!(
+        svg.contains(
+            r#"d="M1.0000 1.0000 L8.0000 1.0000 L8.0000 8.0000 L1.0000 8.0000 Z M3.0000 3.0000 L4.0000 3.0000 L4.0000 4.0000 L3.0000 4.0000 Z""#
+        ),
+        "{svg}"
+    );
+    assert!(svg.contains(r#"fill-rule="evenodd""#));
+}
+
+#[test]
+fn unfilled_zone_outline_is_hatched_in_layer_colour() {
+    let mut b = test_board();
+    b.zones.push(zone_with(Vec::new()));
+    let svg = render_svg(&b, &RenderOptions::default());
+    let doc = parse(&svg);
+    let hatched = doc
+        .descendants()
+        .find(|n| n.attribute("class") == Some("zone-unfilled"))
+        .expect("unfilled zone drawn as outline");
+    assert_eq!(hatched.attribute("fill"), Some("url(#zone-hatch-0)"));
+    assert!(svg.contains(
+        r##"<pattern id="zone-hatch-0" width="0.5000" height="0.5000" patternUnits="userSpaceOnUse"><path d="M 0.0000 0.0000 L 0.5000 0.5000" stroke="#c83434""##
+    ));
+    assert!(!svg.contains("zone-hatch-1"), "back layer has no unfilled zone");
+}
+
+#[test]
+fn zone_rendering_is_deterministic() {
+    let mut b = test_board();
+    b.zones.push(zone_with(vec![ZoneFill {
+        layer: LayerId(0),
+        polys: vec![mm_rect(1_000_000, 1_000_000, 4_000_000, 3_000_000)],
+    }]));
+    b.zones.push(zone_with(Vec::new()));
+    let opts = RenderOptions::default();
+    assert_eq!(render_svg(&b, &opts), render_svg(&b, &opts));
+}
+
+#[test]
+fn boards_without_zones_have_no_zone_markup() {
+    let svg = render_svg(&test_board(), &RenderOptions::default());
+    assert!(!svg.contains("zone"), "{svg}");
+    assert!(!svg.contains("<pattern id=\"zone-hatch"));
 }
