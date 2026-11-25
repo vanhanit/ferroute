@@ -30,7 +30,7 @@ default-members = [
 ]
 
 [workspace.package]
-version = "0.9.0"
+version = "0.9.1"
 edition = "2024"
 rust-version = "1.100"
 license = "AGPL-3.0-only"
@@ -41,17 +41,17 @@ categories = ["science", "command-line-utilities"]
 
 [workspace.dependencies]
 # Internal crates
-ferroute-geom = { path = "crates/ferroute-geom", version = "0.9.0" }
-ferroute-board = { path = "crates/ferroute-board", version = "0.9.0" }
-ferroute-kicad = { path = "crates/ferroute-kicad", version = "0.9.0" }
-ferroute-dsn = { path = "crates/ferroute-dsn", version = "0.9.0" }
-ferroute-drc = { path = "crates/ferroute-drc", version = "0.9.0" }
-ferroute-router = { path = "crates/ferroute-router", version = "0.9.0" }
-ferroute-place = { path = "crates/ferroute-place", version = "0.9.0" }
-ferroute-render = { path = "crates/ferroute-render", version = "0.9.0" }
-ferroute-ipc = { path = "crates/ferroute-ipc", version = "0.9.0" }
-ferroute-gpu = { path = "crates/ferroute-gpu", version = "0.9.0" }
-ferroute-engine = { path = "crates/ferroute-engine", version = "0.9.0" }
+ferroute-geom = { path = "crates/ferroute-geom", version = "0.9.1" }
+ferroute-board = { path = "crates/ferroute-board", version = "0.9.1" }
+ferroute-kicad = { path = "crates/ferroute-kicad", version = "0.9.1" }
+ferroute-dsn = { path = "crates/ferroute-dsn", version = "0.9.1" }
+ferroute-drc = { path = "crates/ferroute-drc", version = "0.9.1" }
+ferroute-router = { path = "crates/ferroute-router", version = "0.9.1" }
+ferroute-place = { path = "crates/ferroute-place", version = "0.9.1" }
+ferroute-render = { path = "crates/ferroute-render", version = "0.9.1" }
+ferroute-ipc = { path = "crates/ferroute-ipc", version = "0.9.1" }
+ferroute-gpu = { path = "crates/ferroute-gpu", version = "0.9.1" }
+ferroute-engine = { path = "crates/ferroute-engine", version = "0.9.1" }
 
 # Third-party (minimums = latest stable on crates.io at setup time, 2026-11-19;
 # exact versions are pinned by the committed Cargo.lock and bumped by Renovate).
