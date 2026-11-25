@@ -534,6 +534,7 @@ name = "ferroute-dsn"
 version = "0.5.0"
 dependencies = [
  "ferroute-board",
+ "ferroute-drc",
  "ferroute-geom",
  "ferroute-kicad",
  "thiserror",

@@ -8,8 +8,25 @@ use ferroute_geom::{Angle, Coord, Point, Polygon};
 use std::collections::BTreeMap;
 use std::fmt::Write as _;
 
-/// Design units per micrometre (`(resolution um 1000)`: one unit = one nanometre).
-pub(crate) const RESOLUTION: i64 = 1000;
+/// Design units per micrometre (`(resolution um 1)`: one unit = 1 um). Freerouting 2.5.0
+/// overflows its coordinates at nanometre resolution (diameters read -1, keep-outs
+/// "degenerate", nothing routes) and writes SES numbers multiplied by the resolution twice
+/// for any resolution other than `um 1` (`um 10` gives 10x too large coordinates), so
+/// `um 1` is the only resolution that round-trips.
+pub(crate) const RESOLUTION: i64 = 1;
+/// Nanometres per design unit.
+pub(crate) const UNIT_NM: i64 = 1000 / RESOLUTION;
+
+/// Position in design units, rounded half away from zero.
+pub(crate) fn q(c: Coord) -> Coord {
+    let h = UNIT_NM / 2;
+    if c >= 0 { (c + h) / UNIT_NM } else { -((-c + h) / UNIT_NM) }
+}
+
+/// Size in design units, rounded up (never narrower/smaller than the true value).
+pub(crate) fn qc(c: Coord) -> Coord {
+    (c + UNIT_NM - 1) / UNIT_NM
+}
 
 /// A through/blind/buried via padstack identity.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
@@ -58,7 +75,7 @@ fn tok(s: &str) -> Result<String, DsnError> {
 }
 
 fn pt(p: Point) -> String {
-    format!("{} {}", p.x, -p.y)
+    format!("{} {}", q(p.x), q(-p.y))
 }
 
 fn pts(ps: &[Point]) -> String {
@@ -76,20 +93,20 @@ fn pad_items(shape: &PadShape, rot: Angle, layers: LayerSet, names: &[String]) -
     for l in layers.iter() {
         let ln = &names[l.0 as usize];
         let item = match (shape, quarter) {
-            (PadShape::Circle { diameter }, _) => format!("(circle {ln} {diameter} 0 0)"),
+            (PadShape::Circle { diameter }, _) => format!("(circle {ln} {} 0 0)", qc(*diameter)),
             (PadShape::Rect { w, h } | PadShape::RoundRect { w, h, .. }, Some(odd)) => {
                 let (w, h) = if odd { (*h, *w) } else { (*w, *h) };
-                let (hw, hh) = ((w + 1) / 2, (h + 1) / 2);
+                let (hw, hh) = (qc((w + 1) / 2), qc((h + 1) / 2));
                 format!("(rect {ln} {} {} {hw} {hh})", -hw, -hh)
             }
             (PadShape::Oval { w, h }, Some(odd)) => {
                 let (w, h) = if odd { (*h, *w) } else { (*w, *h) };
                 if w >= h {
                     let d = (w - h) / 2;
-                    format!("(path {ln} {h} {} 0 {d} 0)", -d)
+                    format!("(path {ln} {} {} 0 {} 0)", qc(h), -qc(d), qc(d))
                 } else {
                     let d = (h - w) / 2;
-                    format!("(path {ln} {w} 0 {} 0 {d})", -d)
+                    format!("(path {ln} {} 0 {} 0 {})", qc(w), -qc(d), qc(d))
                 }
             }
             (PadShape::Rect { w, h } | PadShape::RoundRect { w, h, .. }, None) => {
@@ -211,11 +228,31 @@ pub fn write_dsn(board: &Board, out: &mut dyn std::io::Write) -> Result<(), DsnE
             .unwrap_or(());
         }
     }
+    // Copper pours: KiCad's own export uses `(plane net polygon)` on the zone outline, so the
+    // pour is a conduction area (own-net pins connect, other nets keep clear) instead of
+    // invisible copper that Freerouting routes straight through.
+    for z in board.zones.iter().filter(|z| z.net != NetId::NONE) {
+        for l in z.layers.iter() {
+            writeln!(
+                s,
+                "    (plane {} (polygon {} 0 {}))",
+                tok(&board.nets[z.net.idx()].name)?,
+                tok(&layer_names[l.0 as usize])?,
+                pts(&z.outline.pts)
+            )
+            .unwrap_or(());
+        }
+    }
     let via_list: Vec<String> =
         via_keys.iter().map(|k| tok(&k.name())).collect::<Result<_, _>>()?;
     writeln!(s, "    (via {})", via_list.join(" ")).unwrap_or(());
-    writeln!(s, "    (rule (width {}) (clearance {}))", class0.track_width, class0.clearance)
-        .unwrap_or(());
+    writeln!(
+        s,
+        "    (rule (width {}) (clearance {}))",
+        qc(class0.track_width),
+        qc(class0.clearance)
+    )
+    .unwrap_or(());
     writeln!(s, "  )").unwrap_or(());
 
     // --- placement -------------------------------------------------------------------
@@ -280,7 +317,7 @@ pub fn write_dsn(board: &Board, out: &mut dyn std::io::Write) -> Result<(), DsnE
                 Ok(format!(
                     "(shape (circle {} {} 0 0))",
                     tok(&layer_names[l.0 as usize])?,
-                    k.diameter
+                    qc(k.diameter)
                 ))
             })
             .collect::<Result<_, DsnError>>()?;
@@ -327,11 +364,12 @@ pub fn write_dsn(board: &Board, out: &mut dyn std::io::Write) -> Result<(), DsnE
             ViaKey { first: 0, last: n_layers - 1, diameter: c.via_diameter, drill: c.via_drill };
         writeln!(
             s,
-            "    (class {} {} (circuit (use_via {})) (rule (width {width}) (clearance {})))",
+            "    (class {} {} (circuit (use_via {})) (rule (width {}) (clearance {})))",
             tok(&name)?,
             names.join(" "),
             tok(&via.name())?,
-            c.clearance
+            qc(*width),
+            qc(c.clearance)
         )
         .unwrap_or(());
     }
@@ -351,7 +389,7 @@ pub fn write_dsn(board: &Board, out: &mut dyn std::io::Write) -> Result<(), DsnE
             s,
             "    (wire (path {} {} {}){} (type protect))",
             tok(&layer_names[t.layer.0 as usize])?,
-            t.width,
+            qc(t.width),
             pts(&[t.start, t.end]),
             net_clause(t.net)?
         )
@@ -362,7 +400,7 @@ pub fn write_dsn(board: &Board, out: &mut dyn std::io::Write) -> Result<(), DsnE
             s,
             "    (wire (path {} {} {}){} (type protect))",
             tok(&layer_names[a.layer.0 as usize])?,
-            a.width,
+            qc(a.width),
             pts(&[a.start, a.mid, a.end]),
             net_clause(a.net)?
         )

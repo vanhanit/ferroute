@@ -31,27 +31,27 @@ fn sample() -> Board {
 fn export_has_expected_sections_and_exact_units() {
     let d = dsn(&sample());
     assert!(d.starts_with("(pcb ferroute\n  (parser\n    (string_quote \")"));
-    assert!(d.contains("(resolution um 1000)"));
+    assert!(d.contains("(resolution um 1)"));
     assert!(d.contains("(layer F.Cu (type signal) (property (index 0)))"));
     assert!(d.contains("(layer B.Cu (type signal) (property (index 1)))"));
-    // 40 x 20 mm outline in nm, y negated, ring closed.
-    assert!(
-        d.contains("(boundary (path pcb 0 0 0 40000000 0 40000000 -20000000 0 -20000000 0 0))")
-    );
+    // 40 x 20 mm outline in um, y negated, ring closed.
+    assert!(d.contains("(boundary (path pcb 0 0 0 40000 0 40000 -20000 0 -20000 0 0))"));
     assert!(d.contains("(keepout KO1 (polygon F.Cu 0 "));
     assert!(d.contains("(via Via[0-1]_600000:300000_nm)"));
     // Locked part, quoted net names, protected existing copper.
-    assert!(d.contains("(place R1 10000000 -10000000 front 0 (lock_type position))"));
-    assert!(d.contains("(place R2 25000000 -10000000 front 0)"));
+    assert!(d.contains("(place R1 10000 -10000 front 0 (lock_type position))"));
+    assert!(d.contains("(place R2 25000 -10000 front 0)"));
     assert!(d.contains("(net \"SIG A\" (pins R1-1 R2-1 J1-1))"));
-    assert!(d.contains("(wire (path F.Cu 250000 10000000 -6000000 15000000 -6000000) (net \"SIG A\") (type protect))"));
-    assert!(d.contains(
-        "(via Via[0-1]_600000:300000_nm 15000000 -6000000 (net \"SIG A\") (type protect))"
-    ));
-    assert!(d.contains("(class Default \"SIG A\" GND (circuit (use_via Via[0-1]_600000:300000_nm)) (rule (width 250000) (clearance 200000)))"));
+    assert!(
+        d.contains("(wire (path F.Cu 250 10000 -6000 15000 -6000) (net \"SIG A\") (type protect))")
+    );
+    assert!(
+        d.contains("(via Via[0-1]_600000:300000_nm 15000 -6000 (net \"SIG A\") (type protect))")
+    );
+    assert!(d.contains("(class Default \"SIG A\" GND (circuit (use_via Via[0-1]_600000:300000_nm)) (rule (width 250) (clearance 200)))"));
     // Through-hole header pad exists on both layers; rotated SMD pad swaps its extents.
-    assert!(d.contains("(shape (circle F.Cu 1700000 0 0)) (shape (circle B.Cu 1700000 0 0))"));
-    assert!(d.contains("(shape (rect F.Cu -475000 -450000 475000 450000))"));
+    assert!(d.contains("(shape (circle F.Cu 1700 0 0)) (shape (circle B.Cu 1700 0 0))"));
+    assert!(d.contains("(shape (rect F.Cu -475 -450 475 450))"));
 }
 
 #[test]
@@ -197,7 +197,7 @@ fn demo_board_export_is_byte_identical_and_complete() {
     let (x, y) = (dsn(&kb.board), dsn(&kb.board));
     assert_eq!(x, y, "byte-identical across runs");
     assert!(x.starts_with("(pcb ferroute\n"));
-    assert!(x.contains("(resolution um 1000)"));
+    assert!(x.contains("(resolution um 1)"));
     for fp in &kb.board.footprints {
         assert!(x.contains(&format!("(place {} ", fp.reference)), "{} placed", fp.reference);
     }
@@ -220,6 +220,47 @@ fn demo_board_export_is_byte_identical_and_complete() {
     // Golden head: the first structure lines are stable.
     let head: Vec<&str> = x.lines().take(9).collect();
     assert_eq!(head[0], "(pcb ferroute");
-    assert_eq!(head[7], "  (resolution um 1000)");
+    assert_eq!(head[7], "  (resolution um 1)");
     assert_eq!(head[8], "  (structure");
+}
+
+#[test]
+fn units_are_freerouting_safe_and_round_conservatively() {
+    // Regression: at (resolution um 1000) Freerouting 2.5 overflowed its coordinates
+    // (circle diameters read -1, keep-outs "degenerate", nothing routed). `um 10` makes its SES
+    // writer scale twice, so `um 1` is used; sizes round up, positions to nearest.
+    let mut b = BoardBuilder::new(mm(40), mm(20), 2);
+    let a = b.net("A");
+    b.track(Point::new(1_049, 0), Point::new(2_051, 0), 250_001, 0, a, Origin::Existing);
+    let d = dsn(&b.build());
+    assert!(d.contains("(resolution um 1)"));
+    assert!(d.contains("(path F.Cu 251 1 0 2 0)"), "{d}");
+}
+
+#[test]
+fn freerouting_session_for_demo_imports_clean() {
+    // `testdata/dsn/demo_2layer.freerouting.ses` is the real Freerouting 2.5.0 output for
+    // our DSN export of the demo board (regenerate with scripts/freerouting_compare.sh).
+    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../testdata");
+    let kb = ferroute_kicad::read_board_file(&root.join("boards/demo_2layer.kicad_pcb"))
+        .expect("read demo");
+    let ses = std::fs::read_to_string(root.join("dsn/demo_2layer.freerouting.ses")).expect("ses");
+    let edit = read_ses(&ses, &kb.board).expect("Freerouting SES parses");
+    assert!(!edit.new_tracks.is_empty() && !edit.new_vias.is_empty());
+    // Resolution regression: Freerouting echoes `um 1`; widths stay plausible.
+    assert!(edit.new_tracks.iter().all(|t| (100_000..=2_000_000).contains(&t.width)));
+    let mut routed = kb.board;
+    routed.apply(&edit);
+    let report = ferroute_drc::check(&routed, &ferroute_drc::DrcConfig::default());
+    let errors: Vec<_> = report.errors().collect();
+    assert!(errors.is_empty(), "{errors:?}");
+}
+
+#[test]
+fn pours_are_exported_as_planes() {
+    // Regression: Freerouting routed straight through other-net pours (DRC shorts).
+    let p = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../testdata/boards/pour_gnd.kicad_pcb");
+    let kb = ferroute_kicad::read_board_file(&p).expect("read pour board");
+    let d = dsn(&kb.board);
+    assert!(d.contains("(plane GND (polygon "), "{d}");
 }
