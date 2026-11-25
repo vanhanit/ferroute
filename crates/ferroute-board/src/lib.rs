@@ -16,6 +16,7 @@ use serde::{Deserialize, Serialize};
 pub mod builder;
 pub mod constraints;
 pub mod custom;
+pub mod electrical;
 pub mod netrules;
 pub mod pairs;
 pub mod ripup;

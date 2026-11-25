@@ -67,6 +67,8 @@ pub struct NetRule {
     #[serde(default)]
     pub classes: Vec<String>,
     pub max_current_a: Option<f64>,
+    /// Current model for `max_current_a`: `"ipc2221"` (default), `"ipc2152"` or `"max"`.
+    pub current_model: Option<crate::electrical::CurrentModel>,
     pub frequency_mhz: Option<f64>,
     pub impedance_ohm: Option<f64>,
     pub length_min_mm: Option<f64>,
@@ -146,6 +148,9 @@ pub struct PairRule {
     /// Differential impedance (Ω): solves the width (for a given gap) or the gap (for a
     /// given width) from the stack-up.
     pub zdiff_ohm: Option<f64>,
+    /// Coupled-microstrip model for `zdiff_ohm`: `"ipc2141a"` (default) or `"kj"`
+    /// (Kirschning–Jansen, unverified, see CLAUDE.md #20b).
+    pub coupled_model: Option<crate::electrical::CoupledModel>,
     /// Longest uncoupled copper per trace (mm).
     pub max_uncoupled_mm: Option<f64>,
     /// Allowed intra-pair length skew (mm; default 0.1).
@@ -288,6 +293,9 @@ impl NetRule {
     fn overlay(&self, c: &mut NetConstraints) {
         if let Some(a) = self.max_current_a {
             c.max_current_ma = scaled(a, 1000.0);
+        }
+        if let Some(m) = self.current_model {
+            c.current_model = m;
         }
         if let Some(f) = self.frequency_mhz {
             c.frequency_hz = scaled(f, 1e6);
@@ -450,7 +458,7 @@ impl RuleSet {
     /// Resolves the `[[pair]]` rules into `board.diff_pairs` (and one match group per pair
     /// for its intra-pair skew). A net belongs to at most one pair; the first rule wins.
     fn apply_pairs(&self, board: &mut Board, warnings: &mut Vec<String>) {
-        use crate::constraints::{LineKind, PairFixed, diff_pair_geometry, required_width};
+        use crate::constraints::{LineKind, PairFixed, diff_pair_geometry_with, required_width};
         use crate::pairs::{DEFAULT_PAIR_SKEW, DiffPair};
         for (index, r) in self.pairs.iter().enumerate() {
             let found: Vec<(NetId, NetId)> = if r.auto {
@@ -487,7 +495,8 @@ impl RuleSet {
                     };
                     let t = s.copper_thickness.first().copied().unwrap_or(35_000);
                     let er = f64::from(s.epsilon_r_milli) / 1000.0;
-                    let r = diff_pair_geometry(
+                    let r = diff_pair_geometry_with(
+                        r.coupled_model.unwrap_or_default(),
                         z,
                         LineKind::Microstrip,
                         fixed,

@@ -6,6 +6,7 @@
 //! (`ferroute_geom::detmath`) and are rounded **up** to a 10 µm fabrication step, so a
 //! derived width is never narrower than the formula requires (INV-RULE-1).
 
+use crate::electrical::CoupledModel;
 use crate::{Board, LayerId, NetClass, NetId};
 use ferroute_geom::Coord;
 use ferroute_geom::detmath::{exp, ln, pow};
@@ -25,6 +26,10 @@ pub const DEFAULT_DELTA_T_C: f64 = 10.0;
 pub struct NetConstraints {
     /// Maximum continuous current (mA) → minimum trace width (IPC-2221).
     pub max_current_ma: Option<u32>,
+    /// Current model for `max_current_ma` (`current_model` in the rules file; default
+    /// IPC-2221 so existing outputs are unchanged).
+    #[serde(default)]
+    pub current_model: crate::electrical::CurrentModel,
     /// Highest signal frequency (Hz); ≥ [`HIGH_SPEED_HZ`] selects the high-speed policy.
     pub frequency_hz: Option<u64>,
     /// Target single-ended characteristic impedance (mΩ, e.g. 50 000 = 50 Ω).
@@ -437,12 +442,12 @@ pub fn stripline_width(z0_ohm: f64, b: Coord, t: Coord, epsilon_r: f64) -> Optio
 // ---------------------------------------------------------------------------------------
 // Transmission-line models. Everything below uses only `+ − × ÷ √` (IEEE-exact) and
 // `detmath::{exp, ln, pow}` (INV-DET-3). Lengths are nm in the API, dimensionless ratios
-// inside. IPC-2152 (current vs. width with planes/airflow) is *not* implemented: its charts
-// are proprietary; IPC-2221 above stays the current model.
+// inside. IPC-2152 is a chart fit in `crate::electrical::current` (opt-in); IPC-2221 above
+// stays the default current model.
 // ---------------------------------------------------------------------------------------
 
 /// Free-space wave impedance η0 (Ω).
-const ETA0: f64 = 376.730_313_668;
+pub(crate) const ETA0: f64 = 376.730_313_668;
 /// Speed of light in mm/ps.
 const C_MM_PER_PS: f64 = 0.299_792_458;
 /// Euler's number (used by the Hammerstad–Bekkadal thickness term).
@@ -471,26 +476,26 @@ fn f(v: Coord) -> f64 {
     v as f64
 }
 
-fn coth(x: f64) -> f64 {
+pub(crate) fn coth(x: f64) -> f64 {
     let q = exp(-2.0 * x);
     (1.0 + q) / (1.0 - q)
 }
 
-fn tanh(x: f64) -> f64 {
+pub(crate) fn tanh(x: f64) -> f64 {
     let q = exp(-2.0 * x);
     (1.0 - q) / (1.0 + q)
 }
 
 /// Hammerstad–Jensen air-filled microstrip impedance `Z01(u)` (Ω), `u = w/h`:
 /// `(η0/2π)·ln(f(u)/u + √(1+(2/u)²))`, `f(u) = 6+(2π−6)·exp(−(30.666/u)^0.7528)`.
-fn z01(u: f64) -> f64 {
+pub(crate) fn z01(u: f64) -> f64 {
     let tau = std::f64::consts::TAU;
     let fu = 6.0 + (tau - 6.0) * exp(-pow(30.666 / u, 0.7528));
     ETA0 / tau * ln(fu / u + (1.0 + (2.0 / u) * (2.0 / u)).sqrt())
 }
 
 /// Hammerstad–Jensen effective permittivity of a zero-thickness microstrip.
-fn eps_eff_u(u: f64, er: f64) -> f64 {
+pub(crate) fn eps_eff_u(u: f64, er: f64) -> f64 {
     let u4 = u * u * u * u;
     let a = 1.0
         + ln((u4 + (u / 52.0) * (u / 52.0)) / (u4 + 0.432)) / 49.0
@@ -531,7 +536,7 @@ pub fn microstrip_hj(w: Coord, h: Coord, t: Coord, er: f64) -> Option<(f64, f64)
 
 /// Smallest `x` in `[lo, hi]` (nm) with `pred(x)`, for a `pred` that is false then true
 /// (monotone). Pure integer bisection: deterministic with nm resolution.
-fn bisect(lo: Coord, hi: Coord, pred: impl Fn(Coord) -> bool) -> Option<Coord> {
+pub(crate) fn bisect(lo: Coord, hi: Coord, pred: impl Fn(Coord) -> bool) -> Option<Coord> {
     if !pred(hi) {
         return None;
     }
@@ -550,7 +555,7 @@ fn bisect(lo: Coord, hi: Coord, pred: impl Fn(Coord) -> bool) -> Option<Coord> {
     Some(hi)
 }
 
-fn round_up_nm(nm: Coord) -> Coord {
+pub(crate) fn round_up_nm(nm: Coord) -> Coord {
     (nm + WIDTH_STEP - 1) / WIDTH_STEP * WIDTH_STEP
 }
 
@@ -576,7 +581,8 @@ pub fn microstrip_width_hj(z0_ohm: f64, h: Coord, t: Coord, er: f64) -> Option<C
 /// Handbook* (1991) §4.3 form with finite thickness:
 /// `Z0 = η0/(4√εr) / (w/(b−t) + Cf)`, `x = 1/(1−t/b)`,
 /// `Cf = (1/π)[2x·ln(x+1) − (x−1)·ln(x²−1)]` (→ 2 ln2/π = 0.441 at t = 0, Cohn's wide-strip
-/// limit). Valid for `t/b < 0.25` and `w/(b−t) ≥ 0.35`; `None` outside that range.
+/// limit). Valid for `t/b < 0.25`; strips with `w/(b−t) < 0.35` use the narrow-strip
+/// formula of [`crate::electrical::stripline_z0_narrow`]; `None` outside `t/b < 0.25`.
 #[must_use]
 pub fn stripline_z0(w: Coord, b: Coord, t: Coord, er: f64) -> Option<f64> {
     if w <= 0 || b <= 0 || t < 0 || !(er.is_finite() && er >= 1.0) || 4 * t >= b {
@@ -584,7 +590,7 @@ pub fn stripline_z0(w: Coord, b: Coord, t: Coord, er: f64) -> Option<f64> {
     }
     let (wf, bt) = (f(w), f(b - t));
     if wf / bt < 0.35 {
-        return None;
+        return crate::electrical::stripline_z0_narrow(w, b, t, er);
     }
     let x = 1.0 / (1.0 - f(t) / f(b));
     let second = if t == 0 { 0.0 } else { (x - 1.0) * ln(x * x - 1.0) };
@@ -593,18 +599,18 @@ pub fn stripline_z0(w: Coord, b: Coord, t: Coord, er: f64) -> Option<f64> {
 }
 
 /// Stripline width (nm) for `z0_ohm` between planes `b` apart, by bisection on
-/// [`stripline_z0`], rounded **up** to [`WIDTH_STEP`]. `None` if outside its validity range.
+/// [`stripline_z0`] (wide and narrow strip), rounded **up** to [`WIDTH_STEP`]. `None` if
+/// the impedance needs a strip narrower than 1 µm or the plane spacing is outside validity.
 #[must_use]
 pub fn stripline_width_cohn(z0_ohm: f64, b: Coord, t: Coord, er: f64) -> Option<Coord> {
     if !(z0_ohm.is_finite() && z0_ohm > 0.0) || b <= 0 || t < 0 || 4 * t >= b {
         return None;
     }
-    // Smallest width inside the model's validity range (w/(b−t) ≥ 0.35).
-    let lo = (f(b - t) * 0.35).ceil() as Coord;
-    if stripline_z0(lo, b, t, er)? < z0_ohm {
-        return None; // would need a narrower strip than the model is valid for
-    }
-    bisect(lo, 100 * b, |w| stripline_z0(w, b, t, er).is_some_and(|z| z <= z0_ohm)).map(round_up_nm)
+    // Narrowest strip inside the model's validity (the narrow-strip model needs `w ≥ t`).
+    let lo = t.max(1_000);
+    bisect(lo, 100 * b, |w| stripline_z0(w, b, t, er).is_some_and(|z| z <= z0_ohm))
+        .filter(|&w| w > lo)
+        .map(round_up_nm)
 }
 
 /// Arithmetic–geometric mean (fixed 40 iterations: converged, deterministic).
@@ -617,7 +623,7 @@ fn agm(mut a: f64, mut b: f64) -> f64 {
 
 /// `K(k')/K(k)` of the complete elliptic integral from the modulus `k` and complement
 /// `kp = √(1−k²)`, via `K(k) = π/(2·AGM(1, k'))`.
-fn k_ratio(k: f64, kp: f64) -> f64 {
+pub(crate) fn k_ratio(k: f64, kp: f64) -> f64 {
     agm(1.0, kp) / agm(1.0, k)
 }
 
@@ -658,9 +664,9 @@ pub fn stripline_coupled_cohn(w: Coord, s: Coord, b: Coord, er: f64) -> Option<(
 /// dielectric height `h`): IPC-2141A, `Zdiff = 2·Z0·(1 − 0.48·exp(−0.96·s/h))` with `Z0` the
 /// thickness-corrected Hammerstad–Jensen single-line impedance ([`microstrip_hj`]).
 /// This is an engineering approximation (IPC-2141A quotes it for loosely to moderately
-/// coupled pairs, roughly `0.5 ≤ s/h`, `0.1 ≤ w/h ≤ 3`); the exact Kirschning–Jansen
-/// odd-mode equations are intentionally not implemented (their coefficient set could not be
-/// cited verbatim). It is monotone: wider trace → lower, larger gap → higher, and
+/// coupled pairs, roughly `0.5 ≤ s/h`, `0.1 ≤ w/h ≤ 3`). Kept as the **fallback** of
+/// [`diff_impedance`]; the primary model is Kirschning–Jansen
+/// ([`crate::electrical::coupled_microstrip_kj`]). It is monotone: wider trace → lower, larger gap → higher, and
 /// `Zdiff → 2·Z0` as `s → ∞`.
 #[must_use]
 pub fn microstrip_diff_ipc2141a(w: Coord, s: Coord, h: Coord, t: Coord, er: f64) -> Option<f64> {
@@ -671,9 +677,8 @@ pub fn microstrip_diff_ipc2141a(w: Coord, s: Coord, h: Coord, t: Coord, er: f64)
     Some(2.0 * z0 * (1.0 - 0.48 * exp(-0.96 * f(s) / f(h))))
 }
 
-/// Differential impedance (Ω) of an edge-coupled pair (width `w`, gap `s`): microstrip
-/// ([`microstrip_diff_ipc2141a`], `h` = dielectric height) or stripline (`2·Z0o`, Cohn,
-/// [`stripline_coupled_cohn`], `h` = plane spacing `b`, thickness ignored).
+/// Differential impedance (Ω) of an edge-coupled pair (width `w`, gap `s`) with the default
+/// coupled model ([`CoupledModel::Ipc2141a`]): see [`diff_impedance_with`].
 #[must_use]
 pub fn diff_impedance(
     kind: LineKind,
@@ -683,8 +688,32 @@ pub fn diff_impedance(
     t: Coord,
     er: f64,
 ) -> Option<f64> {
+    diff_impedance_with(CoupledModel::default(), kind, w, s, h, t, er)
+}
+
+/// Differential impedance (Ω) of an edge-coupled pair: microstrip by `model`
+/// ([`CoupledModel::Ipc2141a`] = [`microstrip_diff_ipc2141a`], the default; opt-in
+/// [`CoupledModel::Kj`] = `2·Z0o` of [`crate::electrical::coupled_microstrip_kj`], **unverified,
+/// see CLAUDE.md #20b**, falling back to IPC-2141A when `εr ∉ [1, 20]`; `h` = dielectric
+/// height) or stripline (`2·Z0o`, Cohn, [`stripline_coupled_cohn`], `h` = plane spacing `b`,
+/// thickness ignored; `model` is ignored).
+#[must_use]
+pub fn diff_impedance_with(
+    model: CoupledModel,
+    kind: LineKind,
+    w: Coord,
+    s: Coord,
+    h: Coord,
+    t: Coord,
+    er: f64,
+) -> Option<f64> {
     match kind {
-        LineKind::Microstrip => microstrip_diff_ipc2141a(w, s, h, t, er),
+        LineKind::Microstrip => match model {
+            CoupledModel::Ipc2141a => microstrip_diff_ipc2141a(w, s, h, t, er),
+            CoupledModel::Kj => crate::electrical::coupled_microstrip_kj(w, s, h, t, er)
+                .map(|c| c.zdiff())
+                .or_else(|| microstrip_diff_ipc2141a(w, s, h, t, er)),
+        },
         LineKind::Stripline => stripline_coupled_cohn(w, s, h, er).map(|r| 2.0 * r.1),
     }
 }
@@ -704,19 +733,33 @@ pub fn diff_pair_geometry(
     t: Coord,
     er: f64,
 ) -> Option<(Coord, Coord)> {
+    diff_pair_geometry_with(CoupledModel::default(), zdiff_ohm, kind, fixed, h, t, er)
+}
+
+/// [`diff_pair_geometry`] with an explicit coupled-microstrip model.
+#[must_use]
+pub fn diff_pair_geometry_with(
+    model: CoupledModel,
+    zdiff_ohm: f64,
+    kind: LineKind,
+    fixed: PairFixed,
+    h: Coord,
+    t: Coord,
+    er: f64,
+) -> Option<(Coord, Coord)> {
     if !(zdiff_ohm.is_finite() && zdiff_ohm > 0.0) || h <= 0 {
         return None;
     }
     match fixed {
         PairFixed::Gap(s) => {
             let w = bisect(h / 20, 20 * h, |w| {
-                diff_impedance(kind, w, s, h, t, er).is_some_and(|z| z <= zdiff_ohm)
+                diff_impedance_with(model, kind, w, s, h, t, er).is_some_and(|z| z <= zdiff_ohm)
             })?;
             Some((round_up_nm(w), s))
         }
         PairFixed::Width(w) => {
             let s = bisect(h / 20, 20 * h, |s| {
-                diff_impedance(kind, w, s, h, t, er).is_some_and(|z| z >= zdiff_ohm)
+                diff_impedance_with(model, kind, w, s, h, t, er).is_some_and(|z| z >= zdiff_ohm)
             })?;
             Some((w, round_up_nm(s)))
         }
@@ -783,9 +826,15 @@ pub fn required_width(board: &Board, net: NetId) -> Coord {
     let s = &board.stackup;
     let thin = s.copper_thickness.iter().copied().filter(|&t| t > 0).min().unwrap_or(35_000);
     let external_only = board.layer_count() <= 2;
-    let current_w = c
-        .max_current_ma
-        .map_or(0, |i| width_for_current(i, thin, external_only, DEFAULT_DELTA_T_C));
+    let current_w = c.max_current_ma.map_or(0, |i| {
+        crate::electrical::width_for_current_model(
+            c.current_model,
+            i,
+            thin,
+            external_only,
+            DEFAULT_DELTA_T_C,
+        )
+    });
     let z_ohm = c.impedance_mohm.map(|z| f64::from(z) / 1000.0);
     let (micro_w, strip_w) = z_ohm.map_or((0, 0), |z| impedance_widths(board, z));
     class_w.max(current_w).max(micro_w).max(strip_w).max(board.rules.min_width_for_net(board, net))
@@ -1215,9 +1264,10 @@ mod tests {
                 < stripline_z0(200_000, 400_000, 0, 4.3).expect("z")
         );
         // Out of validity range / bad input.
-        assert!(stripline_z0(50_000, 400_000, 0, 4.3).is_none(), "w/b < 0.35");
+        assert!(stripline_z0(50_000, 400_000, 0, 4.3).is_some(), "narrow-strip model");
+        assert!(stripline_z0(10_000, 400_000, 17_500, 4.3).is_none(), "w < t");
         assert!(stripline_z0(200_000, 400_000, 120_000, 4.3).is_none(), "t/b ≥ 0.25");
-        assert!(stripline_width_cohn(150.0, 400_000, 17_500, 4.3).is_none(), "needs narrow strip");
+        assert!(stripline_width_cohn(150.0, 400_000, 17_500, 4.3).is_none(), "narrower than thick");
         assert!(stripline_width_cohn(0.0, 400_000, 17_500, 4.3).is_none());
         let wide = |z| stripline_width_cohn(z, 400_000, 17_500, 4.3).expect("w");
         assert!(wide(40.0) > wide(45.0) && wide(45.0) >= wide(50.0));
