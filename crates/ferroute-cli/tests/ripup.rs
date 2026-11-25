@@ -149,3 +149,36 @@ fn rules_file_ripup_applies_and_cli_wins() {
     let said = route(s(&first), &second, &["--rules", s(&rules), "--ripup-nets", "SCL"]);
     assert!(said.contains("(SCL)"), "{said}");
 }
+
+const POUR: &str = "testdata/boards/pour_gnd.kicad_pcb";
+
+#[test]
+fn ripup_all_keeps_pour_net_copper_and_the_pours_stay_refilled() {
+    let dir = tempfile::tempdir().expect("tmp");
+    let first = dir.path().join("first.kicad_pcb");
+    let second = dir.path().join("second.kicad_pcb");
+    route(POUR, &first, &[]);
+    let said = route(s(&first), &second, &["--ripup-all"]);
+    assert!(said.contains("kept: owns a copper pour"), "{said}");
+    assert!(said.contains("kept 1 pour net(s) (GND)"), "{said}");
+    assert!(said.contains("completion 100.0%"), "{said}");
+    assert!(!said.contains("copper pours kept as obstacles"), "{said}");
+    assert_drc_clean(&second);
+    let (before, after) = (copper(&first), copper(&second));
+    for (k, n) in before.iter().filter(|(k, _)| net_of(k) == "GND") {
+        assert_eq!(after.get(k), Some(n), "lost pour-net copper {k}");
+    }
+}
+
+#[test]
+fn ripup_pour_nets_flag_rips_them_and_needs_a_scope() {
+    let dir = tempfile::tempdir().expect("tmp");
+    let first = dir.path().join("first.kicad_pcb");
+    let second = dir.path().join("second.kicad_pcb");
+    route(POUR, &first, &[]);
+    let said = route(s(&first), &second, &["--ripup-all", "--ripup-pour-nets"]);
+    assert!(said.contains("plane fan-out"), "{said}");
+    assert!(said.contains("completion 100.0%"), "{said}");
+    let o = ferroute(&["route", POUR, "-o", s(&second), "--ripup-pour-nets"]);
+    assert!(!o.status.success(), "--ripup-pour-nets alone is invalid");
+}

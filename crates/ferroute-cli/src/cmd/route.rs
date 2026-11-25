@@ -5,7 +5,7 @@ use super::{item_label, load, out, render_opts};
 use crate::length::parse_length;
 use anyhow::{Context, Result, bail};
 use ferroute_board::netrules::RuleSet;
-use ferroute_board::{LayerSet, RipupScope, ViaKind, ViaPolicy, ripup};
+use ferroute_board::{LayerSet, PourNetPolicy, RipupScope, ViaKind, ViaPolicy, ripup_with};
 use ferroute_engine::{PipelineConfig, run as run_pipeline};
 use ferroute_geom::Coord;
 use ferroute_kicad::Removal;
@@ -124,6 +124,11 @@ pub struct RouteArgs {
     /// `--ripup-nets 'USB_*' --ripup-nets GND` (also `[routing] ripup = ["USB_*"]`).
     #[arg(long, value_delimiter = ',', value_name = "PATTERN", conflicts_with = "ripup_all")]
     pub ripup_nets: Vec<String>,
+    /// With `--ripup-all` / `--ripup-nets`: also rip up nets that own a copper pour (their
+    /// stitching vias and support tracks). Off by default: pour nets keep their copper so
+    /// pour connectivity survives the refill (also `[routing] ripup_pour_nets = true`).
+    #[arg(long)]
+    pub ripup_pour_nets: bool,
 }
 
 /// The rip-up scope: command-line flags win over the rules file.
@@ -132,6 +137,11 @@ fn resolve_ripup<S: AsRef<str>>(all: bool, nets: &[S], from_rules: &RipupScope) 
         RipupScope::None => from_rules.clone(),
         cli => cli,
     }
+}
+
+/// The pour-net policy: the flag or the rules file switches to [`PourNetPolicy::Rip`].
+fn resolve_pour_policy(flag: bool, from_rules: bool) -> PourNetPolicy {
+    if flag || from_rules { PourNetPolicy::Rip } else { PourNetPolicy::Keep }
 }
 
 /// Number of new vias per [`ViaKind`] (in `ViaKind::ALL` order).
@@ -169,6 +179,7 @@ pub fn run(a: &RouteArgs) -> Result<ExitCode> {
     let mut via_in_pad = a.allow_via_in_pad;
     let mut teardrops = a.teardrops;
     let mut rules_ripup = RipupScope::None;
+    let mut rules_pour_nets = false;
     let mut via_policy = ViaPolicy::default();
     if !a.via_types.is_empty() {
         via_policy = ViaPolicy::from_names(a.via_types.iter().map(String::as_str))
@@ -187,14 +198,19 @@ pub fn run(a: &RouteArgs) -> Result<ExitCode> {
         }
         teardrops |= rules.teardrops();
         rules_ripup = rules.ripup_scope();
+        rules_pour_nets = rules.ripup_pour_nets();
         for w in rules.apply(&mut board)? {
             out(&format!("rules warning: {w}"));
         }
     }
-    let rip = ripup(&board, &resolve_ripup(a.ripup_all, &a.ripup_nets, &rules_ripup));
+    if a.ripup_pour_nets && !a.ripup_all && a.ripup_nets.is_empty() {
+        anyhow::bail!("--ripup-pour-nets requires --ripup-all or --ripup-nets");
+    }
+    let policy = resolve_pour_policy(a.ripup_pour_nets, rules_pour_nets);
+    let rip = ripup_with(&board, &resolve_ripup(a.ripup_all, &a.ripup_nets, &rules_ripup), policy);
     if !rip.scope.is_none() {
         out(&format!(
-            "rip-up: removed {} track segment(s), {} arc(s), {} via(s) on {} net(s){}",
+            "rip-up: removed {} track segment(s), {} arc(s), {} via(s) on {} net(s){}; kept {} pour net(s){}",
             rip.report.tracks,
             rip.report.arcs,
             rip.report.vias,
@@ -203,8 +219,19 @@ pub fn run(a: &RouteArgs) -> Result<ExitCode> {
                 String::new()
             } else {
                 format!(" ({})", rip.report.nets.join(", "))
+            },
+            rip.report.kept_pour_nets.len(),
+            if rip.report.kept_pour_nets.is_empty() {
+                String::new()
+            } else {
+                format!(" ({})", rip.report.kept_pour_nets.join(", "))
             }
         ));
+        if policy == PourNetPolicy::Rip {
+            out(
+                "rip-up warning: pour nets are ripped too; pour connectivity may now depend on the router's plane fan-out",
+            );
+        }
         for w in rip.report.warnings() {
             out(&format!("rip-up warning: {w}"));
         }
@@ -407,6 +434,17 @@ mod tests {
             RipupScope::None
         );
         assert!(parse_rules("[routing]\nripup = \"everything\"").is_err());
+    }
+
+    #[test]
+    fn pour_policy_from_flag_or_rules() {
+        use ferroute_board::PourNetPolicy::{Keep, Rip};
+        assert_eq!(super::resolve_pour_policy(false, false), Keep);
+        assert_eq!(super::resolve_pour_policy(true, false), Rip);
+        assert_eq!(super::resolve_pour_policy(false, true), Rip);
+        let rs = parse_rules("[routing]\nripup_pour_nets = true").expect("rules");
+        assert!(rs.ripup_pour_nets());
+        assert!(!parse_rules("").expect("empty").ripup_pour_nets());
     }
 
     #[test]

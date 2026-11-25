@@ -90,7 +90,11 @@ ferroute route board.kicad_pcb -o out.kicad_pcb --ripup-nets 'USB_*' --ripup-net
 Rip-up deletes only *unlocked* existing tracks, arcs and vias of the selected nets; locked
 copper, pours, pads, footprints and no-net copper are never touched, and unknown patterns
 are reported as warnings. The ripped copper is gone from the output file, and completion is
-reported against the ripped board. Also available as `[routing] ripup = "all"` /
+reported against the ripped board. Nets that own a copper pour (a zone on any layer) keep
+their copper by default, so stitching vias and support tracks keep the pour connected; they
+are listed as "kept: owns a copper pour". `--ripup-pour-nets` (or
+`[routing] ripup_pour_nets = true`) rips them too, after which pour connectivity may depend
+on the router's plane fan-out. Also available as `[routing] ripup = "all"` /
 `ripup = ["USB_*"]` in `--rules` (the flags win) and on `ferroute ipc route`.
 
 Or with nothing but Docker and make:

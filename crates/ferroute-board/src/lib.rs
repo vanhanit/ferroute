@@ -23,7 +23,7 @@ pub mod ripup;
 pub mod rules;
 pub mod text;
 pub use pairs::DiffPair;
-pub use ripup::{RemovedItems, Ripup, RipupReport, RipupScope, ripup};
+pub use ripup::{PourNetPolicy, RemovedItems, Ripup, RipupReport, RipupScope, ripup, ripup_with};
 pub use rules::{DesignRules, NetClass};
 pub use text::glob;
 

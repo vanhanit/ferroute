@@ -61,6 +61,33 @@ impl RipupScope {
     }
 }
 
+/// What to do with nets that own a copper pour (a zone with that net on any layer).
+///
+/// Their stitching vias and short support tracks keep the pour connected after the refill
+/// (INV-CONN-1), so removing them is opt-in.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum PourNetPolicy {
+    /// Never remove copper of a net that owns a pour (default).
+    #[default]
+    Keep,
+    /// Treat pour nets like any other selected net.
+    Rip,
+}
+
+/// Nets (by index) that own a zone on any layer.
+#[must_use]
+pub fn pour_nets(board: &Board) -> Vec<bool> {
+    let mut v = vec![false; board.nets.len()];
+    for z in &board.zones {
+        if let Some(f) = v.get_mut(z.net.idx())
+            && z.net != NetId::NONE
+        {
+            *f = true;
+        }
+    }
+    v
+}
+
 /// Items of the ORIGINAL board that a rip-up removes (indices into its collections).
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RemovedItems {
@@ -131,6 +158,12 @@ pub struct RipupReport {
     pub skipped_locked: usize,
     /// Patterns that matched no net.
     pub unmatched_patterns: Vec<String>,
+    /// Selected nets whose copper was kept because they own a copper pour.
+    #[serde(default)]
+    pub kept_pour_nets: Vec<String>,
+    /// Subset of `kept_pour_nets` that a `--ripup-nets` pattern matched (user asked for them).
+    #[serde(default)]
+    pub named_pour_nets: Vec<String>,
 }
 
 impl RipupReport {
@@ -144,6 +177,18 @@ impl RipupReport {
             .collect();
         if self.skipped_locked > 0 {
             w.push(format!("{} locked track/via item(s) kept", self.skipped_locked));
+        }
+        if !self.kept_pour_nets.is_empty() {
+            w.push(format!(
+                "kept: owns a copper pour (use --ripup-pour-nets to include): {}",
+                self.kept_pour_nets.join(", ")
+            ));
+        }
+        if !self.named_pour_nets.is_empty() {
+            w.push(format!(
+                "--ripup-nets names pour net(s) {}: their copper is still kept because they own a copper pour; pass --ripup-pour-nets to rip them (pour connectivity then depends on the router's plane fan-out)",
+                self.named_pour_nets.join(", ")
+            ));
         }
         w
     }
@@ -174,14 +219,33 @@ fn drop_indices<T>(v: &mut Vec<T>, gone: &[usize]) {
     });
 }
 
-/// Removes unlocked existing tracks, arcs and vias of the nets selected by `scope`.
+/// Removes unlocked existing tracks, arcs and vias of the nets selected by `scope`,
+/// keeping pour nets ([`PourNetPolicy::Keep`]).
 #[must_use]
 pub fn ripup(board: &Board, scope: &RipupScope) -> Ripup {
+    ripup_with(board, scope, PourNetPolicy::Keep)
+}
+
+/// [`ripup`] with an explicit [`PourNetPolicy`].
+#[must_use]
+pub fn ripup_with(board: &Board, scope: &RipupScope, pours: PourNetPolicy) -> Ripup {
     let mut removed = RemovedItems::default();
     let mut skipped = 0usize;
     let mut touched = vec![false; board.nets.len()];
-    let selected: Vec<bool> =
+    let mut selected: Vec<bool> =
         (0..board.nets.len()).map(|i| scope.selects(board, NetId(id32(i)))).collect();
+    let (mut kept_pour_nets, mut named_pour_nets) = (Vec::new(), Vec::new());
+    if pours == PourNetPolicy::Keep {
+        for (i, is_pour) in pour_nets(board).into_iter().enumerate() {
+            if is_pour && selected[i] {
+                selected[i] = false;
+                kept_pour_nets.push(board.nets[i].name.clone());
+                if matches!(scope, RipupScope::Nets(_)) {
+                    named_pour_nets.push(board.nets[i].name.clone());
+                }
+            }
+        }
+    }
     let mut take = |net: NetId, locked: bool, origin: Origin| -> bool {
         if origin != Origin::Existing || !selected.get(net.idx()).copied().unwrap_or(false) {
             return false;
@@ -229,6 +293,8 @@ pub fn ripup(board: &Board, scope: &RipupScope) -> Ripup {
             .collect(),
         skipped_locked: skipped,
         unmatched_patterns,
+        kept_pour_nets,
+        named_pour_nets,
     };
     let mut out = board.clone();
     drop_indices(&mut out.tracks, &removed.tracks.iter().map(|t| t.idx()).collect::<Vec<_>>());
@@ -361,5 +427,58 @@ mod tests {
             RipupScope::from_patterns(false, &["USB_*, GND", " ", "A"]),
             RipupScope::Nets(vec!["USB_*".into(), "GND".into(), "A".into()])
         );
+    }
+
+    /// GND (zone + stitching via + track) and SIG (track).
+    fn pour_board() -> Board {
+        let mut b = BoardBuilder::new(mm(50), mm(30), 2);
+        let (gnd, sig) = (b.net("GND"), b.net("SIG"));
+        b.track(pt10(10, 20), pt10(100, 20), 200_000, 0, gnd, Origin::Existing);
+        b.via(pt10(100, 20), 600_000, 300_000, gnd, Origin::Existing);
+        b.track(pt10(10, 60), pt10(100, 60), 200_000, 0, sig, Origin::Existing);
+        let mut b = b.build();
+        b.zones.push(Zone {
+            net: gnd,
+            layers: LayerSet::single(crate::LayerId(1)),
+            outline: Polygon::default(),
+            fills: vec![],
+            clearance: 0,
+            min_thickness: 0,
+            priority: 0,
+            pad_connection: PadConnection::Solid,
+            islands: IslandRemoval::default(),
+            yields: false,
+        });
+        b
+    }
+
+    #[test]
+    fn keep_policy_spares_pour_nets_on_all() {
+        let b = pour_board();
+        let r = ripup(&b, &RipupScope::All);
+        assert_eq!(names(&r.board), ["GND"]);
+        assert_eq!(r.board.vias.len(), 1);
+        assert_eq!(r.report.nets, ["SIG"]);
+        assert_eq!(r.report.kept_pour_nets, ["GND"]);
+        assert!(r.report.named_pour_nets.is_empty());
+        assert!(r.report.warnings().iter().any(|w| w.contains("owns a copper pour")));
+        assert!(r.removed.check_invariants(&b, &r.scope).is_ok());
+    }
+
+    #[test]
+    fn rip_policy_removes_pour_nets_too() {
+        let b = pour_board();
+        let r = ripup_with(&b, &RipupScope::All, PourNetPolicy::Rip);
+        assert!(r.board.tracks.is_empty() && r.board.vias.is_empty());
+        assert!(r.report.kept_pour_nets.is_empty());
+    }
+
+    #[test]
+    fn explicit_pour_net_pattern_is_kept_with_a_clear_warning() {
+        let b = pour_board();
+        let r = ripup(&b, &RipupScope::Nets(vec!["GND".into()]));
+        assert!(r.removed.is_empty());
+        assert_eq!(r.report.named_pour_nets, ["GND"]);
+        assert!(r.report.warnings().iter().any(|w| w.contains("--ripup-nets names pour net")));
     }
 }

@@ -62,6 +62,9 @@ pub enum IpcCommand {
         /// Delete unlocked existing copper of nets matching these globs before routing.
         #[arg(long, value_delimiter = ',', value_name = "PATTERN", conflicts_with = "ripup_all")]
         ripup_nets: Vec<String>,
+        /// Also rip up nets that own a copper pour (see `ferroute route --ripup-pour-nets`).
+        #[arg(long)]
+        ripup_pour_nets: bool,
     },
     /// KiCad 11+: export the open (or given) board to SVG via the IPC job API.
     ExportSvg {
@@ -130,6 +133,7 @@ pub fn run(c: &IpcCommand) -> Result<ExitCode> {
             teardrops,
             ripup_all,
             ripup_nets,
+            ripup_pour_nets,
         } => {
             let mut client = connect(socket.as_ref(), Duration::from_secs(30))?;
             let caps = negotiate(&mut client)?;
@@ -166,6 +170,7 @@ pub fn run(c: &IpcCommand) -> Result<ExitCode> {
                 no_refill_zones: false,
                 ripup_all: *ripup_all,
                 ripup_nets: ripup_nets.clone(),
+                ripup_pour_nets: *ripup_pour_nets,
             };
             let code = route_run(&args)?;
             client.revert_document(doc).context("RevertDocument (reload)")?;

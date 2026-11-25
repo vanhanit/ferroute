@@ -46,6 +46,9 @@ pub struct RoutingSpec {
     /// Rip up existing copper before routing: `"all"`, or a list of net globs
     /// (`["USB_*", "GND"]`). The `--ripup-all` / `--ripup-nets` flags override it.
     pub ripup: Option<RipupSpec>,
+    /// Also rip up copper of nets that own a copper pour (default `false`: kept).
+    /// `--ripup-pour-nets` overrides it.
+    pub ripup_pour_nets: Option<bool>,
 }
 
 /// `[routing] ripup`: the keyword `"all"` (or `"none"`) or a list of net globs.
@@ -351,6 +354,12 @@ impl RuleSet {
             Some(RipupSpec::Nets(p)) => crate::RipupScope::from_patterns(false, p),
             _ => crate::RipupScope::None,
         }
+    }
+
+    /// `[routing] ripup_pour_nets` (`false` when absent).
+    #[must_use]
+    pub fn ripup_pour_nets(&self) -> bool {
+        self.routing.as_ref().and_then(|r| r.ripup_pour_nets).unwrap_or(false)
     }
 
     /// `[routing] teardrops` (`false` when absent).
