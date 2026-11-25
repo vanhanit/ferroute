@@ -32,6 +32,7 @@ pub(crate) fn tiny_board() -> Board {
             Point::new(-1_500_000, -800_000),
             Point::new(1_500_000, 800_000),
         )),
+        has_courtyard: true,
         pads: vec![PadId(0), PadId(1)],
     });
     for (i, x) in [-800_000, 800_000].into_iter().enumerate() {

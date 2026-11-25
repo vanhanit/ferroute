@@ -296,6 +296,21 @@ impl Parser {
 
     fn term(&mut self) -> Cond {
         let start = self.i;
+        if let (Some(Tok::Ident(id)), Some(Tok::LParen), Some(Tok::Str(v)), Some(Tok::RParen)) =
+            (self.t.get(start), self.t.get(start + 1), self.t.get(start + 2), self.t.get(start + 3))
+            && let Some(side) = id.split_once('.').and_then(|(s, f)| {
+                let side = match s {
+                    "A" => RuleSide::A,
+                    "B" => RuleSide::B,
+                    _ => return None,
+                };
+                f.eq_ignore_ascii_case("memberOfFootprint").then_some(side)
+            })
+            && matches!(self.t.get(start + 4), None | Some(Tok::And | Tok::Or | Tok::RParen))
+        {
+            self.i = start + 4;
+            return Cond::MemberOfFootprint { side, pattern: v.clone() };
+        }
         if let (Some(Tok::Ident(id)), Some(op), Some(Tok::Str(v))) =
             (self.t.get(start), self.t.get(start + 1), self.t.get(start + 2))
         {
@@ -387,6 +402,31 @@ mod tests {
             && matches!(v[1], Cond::Cmp { op: CmpOp::Ne, .. })));
         assert!(d.warnings.iter().any(|w| w.contains("insideArea")), "{:?}", d.warnings);
         assert!(d.warnings.iter().any(|w| w.contains("courtyard_clearance")));
+    }
+
+    #[test]
+    fn member_of_footprint_conditions_parse() {
+        let d = parse_dru(
+            r#"(version 1)
+(rule "RJ45 shell tabs at locating posts"
+	(condition "A.memberOfFootprint('RJ*') && B.memberOfFootprint('RJ*')")
+	(constraint hole_clearance (min 0mm)))
+(rule "USB-C pads to locating posts"
+	(condition "A.memberOfFootprint('USB1') && B.memberOfFootprint('USB1')")
+	(constraint hole_clearance (min 0.2mm)))"#,
+        )
+        .unwrap();
+        assert!(d.warnings.is_empty(), "{:?}", d.warnings);
+        let fp = |side, p: &str| Cond::MemberOfFootprint { side, pattern: p.into() };
+        assert_eq!(
+            d.rules[0].condition,
+            Cond::And(vec![fp(RuleSide::A, "RJ*"), fp(RuleSide::B, "RJ*")])
+        );
+        assert_eq!(
+            d.rules[1].condition,
+            Cond::And(vec![fp(RuleSide::A, "USB1"), fp(RuleSide::B, "USB1")])
+        );
+        assert_eq!(d.rules[0].limits(ConstraintKind::HoleClearance).unwrap().min, Some(0));
     }
 
     #[test]

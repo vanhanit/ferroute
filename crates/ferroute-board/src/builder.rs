@@ -100,7 +100,7 @@ impl BoardBuilder {
                 local_rot: Angle::ZERO,
                 shape: spec.shape.clone(),
                 layers,
-                drill: spec.drill.map(|d| Drill { diameter: d, plated: true }),
+                drill: spec.drill.map(|d| Drill::round(d, true)),
             };
             let local_bb = pad.shape.local_hull().bbox().translate(spec.local_pos);
             bbox = Some(bbox.map_or(local_bb, |b| b.union(local_bb)));
@@ -117,6 +117,7 @@ impl BoardBuilder {
             locked: false,
             mobility: Mobility::Fixed,
             courtyard_local: Polygon::from_rect(court),
+            has_courtyard: true,
             pads: pad_ids,
         });
         fid

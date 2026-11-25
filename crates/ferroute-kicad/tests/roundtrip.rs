@@ -75,7 +75,7 @@ fn rich_board() -> Board {
         local_rot: Angle::ZERO,
         shape: PadShape::Circle { diameter: mm(2.2) },
         layers: ferroute_board::LayerSet::EMPTY,
-        drill: Some(Drill { diameter: mm(2.2), plated: false }),
+        drill: Some(Drill::round(mm(2.2), false)),
     });
     b.footprints[j1.idx()].pads.push(pid);
     b.keepouts.push(ferroute_board::Keepout {

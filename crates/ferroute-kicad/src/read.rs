@@ -146,7 +146,13 @@ impl Reader {
                     .filter_map(|n| n.text().and_then(|t| mm(t).ok()))
                     .collect();
                 let dia = nums.iter().copied().max().unwrap_or(0);
-                (dia > 0).then_some(Drill { diameter: dia, plated: kind != "np_thru_hole" })
+                // Oval drill `(drill oval w h)`: keep the long side as the (superset) hole
+                // diameter and the short side as the slot width.
+                let slot = match nums.as_slice() {
+                    &[w, h] if w > 0 && h > 0 && w != h => Some([w, h]),
+                    _ => None,
+                };
+                (dia > 0).then_some(Drill { diameter: dia, plated: kind != "np_thru_hole", slot })
             }
             None => None,
         };
@@ -336,7 +342,8 @@ impl Reader {
                 _ => {}
             }
         }
-        let courtyard_local = if court.len() >= 3 {
+        let has_courtyard = court.len() >= 3;
+        let courtyard_local = if has_courtyard {
             Polygon::new(convex_hull(&court))
         } else {
             let mut bb: Option<Rect> = None;
@@ -365,6 +372,7 @@ impl Reader {
             locked,
             mobility: if locked { Mobility::Locked } else { Mobility::Fixed },
             courtyard_local,
+            has_courtyard,
             pads: pad_ids,
         });
         Ok(())

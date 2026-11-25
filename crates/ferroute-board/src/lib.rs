@@ -211,7 +211,16 @@ pub struct Footprint {
     /// Courtyard in footprint-local coordinates (union approximated by convex hull or
     /// pad bounding box + margin when the footprint has no courtyard).
     pub courtyard_local: Polygon,
+    /// `true` when `courtyard_local` was drawn in the footprint; `false` when it is the
+    /// synthetic pad-bbox fallback (used for placement spacing, never reported as overlap:
+    /// KiCad only flags a missing courtyard).
+    #[serde(default = "default_true")]
+    pub has_courtyard: bool,
     pub pads: Vec<PadId>,
+}
+
+const fn default_true() -> bool {
+    true
 }
 
 impl Footprint {
@@ -295,8 +304,29 @@ fn rect_corners(w: Coord, h: Coord) -> [Point; 4] {
 /// Plated or non-plated drill hole.
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Drill {
+    /// Drill diameter; for a slot (oval drill) the *longer* dimension, so the hole hull
+    /// (a disk of this diameter) stays a superset of the slot (INV-DRC-1).
     pub diameter: Coord,
     pub plated: bool,
+    /// Slot size `[w, h]` of an oval drill `(drill oval w h)` in the pad's own frame
+    /// (`w` along the pad's x axis); `None` for round holes.
+    #[serde(default)]
+    pub slot: Option<[Coord; 2]>,
+}
+
+impl Drill {
+    /// Round drill.
+    #[must_use]
+    pub const fn round(diameter: Coord, plated: bool) -> Self {
+        Self { diameter, plated, slot: None }
+    }
+
+    /// Smallest hole dimension (the slot width for oval drills): what an annular ring is
+    /// measured against.
+    #[must_use]
+    pub fn min_dimension(&self) -> Coord {
+        self.slot.map_or(self.diameter, |[w, h]| w.min(h))
+    }
 }
 
 /// A pad. Geometry is stored footprint-local so placement edits stay exact.
@@ -322,6 +352,21 @@ impl Pad {
     #[must_use]
     pub fn position(&self, fp: Placement) -> Point {
         fp.apply(self.local_pos)
+    }
+
+    /// Absolute hull of the drilled hole for the given footprint placement: a disk for round
+    /// drills, the exact capsule for slots. `None` without a drill.
+    #[must_use]
+    pub fn hole_hull(&self, fp: Placement) -> Option<Hull> {
+        let d = self.drill?;
+        let c = self.position(fp);
+        let Some([w, h]) = d.slot else { return Some(Hull::disk(c, d.diameter / 2)) };
+        let r = (w.min(h) + 1) / 2; // rounded up: never smaller than the true slot
+        let half = (w.max(h) / 2 - r).max(0);
+        let axis = if w >= h { Point::new(half, 0) } else { Point::new(0, half) };
+        let rot = fp.rot.add(self.local_rot);
+        let a = axis.rotated(rot);
+        Some(Hull::capsule(c - a, c + a, r))
     }
 
     /// Absolute copper hull for the given footprint placement.
@@ -725,6 +770,13 @@ impl Board {
     #[must_use]
     pub fn pad(&self, id: PadId) -> &Pad {
         &self.pads[id.idx()]
+    }
+
+    /// Absolute hull of a pad's drilled hole (disk or slot capsule) at the current placement.
+    #[must_use]
+    pub fn footprint_pad_hole(&self, id: PadId) -> Option<Hull> {
+        let pad = self.pad(id);
+        pad.hole_hull(self.footprint(pad.footprint).placement)
     }
 
     /// Absolute hull of a pad at its footprint's current placement.

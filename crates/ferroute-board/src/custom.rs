@@ -167,6 +167,16 @@ pub enum Cond {
         op: CmpOp,
         value: String,
     },
+    /// `A.memberOfFootprint('R*')`: the item belongs to a footprint whose reference matches
+    /// the KiCad wildcard `pattern` (`*`, `?`, case-sensitive like `wxString::Matches`).
+    /// True for pads, footprint graphics and footprint holes; false for tracks, vias and
+    /// zones (no parent footprint). Pads / footprint items match by reference when the
+    /// evaluator knows their owner (`ItemCtx` wiring pending, task #15b); until then
+    /// they maybe-match, and so do `${CLASS:..}` selectors.
+    MemberOfFootprint {
+        side: RuleSide,
+        pattern: String,
+    },
     /// An expression we cannot evaluate (kept for diagnostics); maybe-matches.
     Unsupported(String),
 }
@@ -279,6 +289,24 @@ fn layer_is_outer(board: &Board, l: LayerId) -> bool {
 }
 
 impl Cond {
+    /// `memberOfFootprint(pattern)` for an item of `kind` whose owning footprint reference
+    /// is `owner` (`None` = unknown). KiCad matches with `wxString::Matches` (case-sensitive
+    /// `*` / `?`); an empty pattern is an error and evaluates to false.
+    #[must_use]
+    pub fn member_of_footprint(pattern: &str, kind: Option<ItemType>, owner: Option<&str>) -> Tri {
+        if pattern.is_empty() {
+            return Tri::False;
+        }
+        if pattern.to_ascii_uppercase().starts_with("${CLASS:") {
+            return Tri::Maybe;
+        }
+        match (owner, kind) {
+            (Some(r), _) => Tri::from(glob(pattern, r)),
+            (None, Some(ItemType::Track | ItemType::Via | ItemType::Zone)) => Tri::False,
+            (None, _) => Tri::Maybe,
+        }
+    }
+
     fn cmp(board: &Board, field: Field, op: CmpOp, value: &str, ctx: &ItemCtx) -> Tri {
         let r = match field {
             Field::NetClass => ctx.net.map(|n| {
@@ -312,6 +340,13 @@ impl Cond {
             Self::Or(v) => v.iter().fold(Tri::False, |t, c| t.or(c.eval(board, a, b))),
             Self::Not(c) => c.eval(board, a, b).not(),
             Self::Unsupported(_) => Tri::Maybe,
+            Self::MemberOfFootprint { side, pattern } => {
+                let ctx = match side {
+                    RuleSide::A => Some(a),
+                    RuleSide::B => b,
+                };
+                ctx.map_or(Tri::False, |c| Self::member_of_footprint(pattern, c.kind, None))
+            }
             Self::Cmp { side, field, op, value } => {
                 let ctx = match side {
                     RuleSide::A => Some(a),
@@ -643,6 +678,35 @@ mod tests {
     use super::*;
     use crate::NetClass;
     use crate::builder::{BoardBuilder, mm};
+
+    #[test]
+    fn member_of_footprint_semantics() {
+        let m = Cond::member_of_footprint;
+        let pad = Some(ItemType::Pad);
+        assert_eq!(m("RJ*", pad, Some("RJ1")), Tri::True);
+        assert_eq!(m("USB1", pad, Some("USB1")), Tri::True);
+        assert_eq!(m("USB1", pad, Some("USB10")), Tri::False);
+        assert_eq!(m("rj*", pad, Some("RJ1")), Tri::False, "case-sensitive like wxString::Matches");
+        assert_eq!(m("R?1", pad, Some("RJ1")), Tri::True);
+        // Items without a parent footprint never match.
+        for k in [ItemType::Track, ItemType::Via, ItemType::Zone] {
+            assert_eq!(m("RJ*", Some(k), None), Tri::False);
+        }
+        // Unknown owner of a pad / footprint item: maybe; empty pattern: false.
+        assert_eq!(m("RJ*", pad, None), Tri::Maybe);
+        assert_eq!(m("RJ*", None, None), Tri::Maybe);
+        assert_eq!(m("${CLASS:foo}", pad, Some("RJ1")), Tri::Maybe);
+        assert_eq!(m("", pad, Some("RJ1")), Tri::False);
+    }
+
+    #[test]
+    fn member_of_footprint_condition_on_tracks_is_false() {
+        let board = BoardBuilder::new(mm(10), mm(10), 2).build();
+        let c = Cond::MemberOfFootprint { side: RuleSide::A, pattern: "RJ*".into() };
+        let track = ItemCtx { net: None, kind: Some(ItemType::Track), layer: None };
+        assert_eq!(c.eval(&board, &track, None), Tri::False);
+        assert_eq!(c.eval(&board, &ItemCtx::UNKNOWN, None), Tri::Maybe);
+    }
 
     fn eq(side: RuleSide, field: Field, v: &str) -> Cond {
         Cond::Cmp { side, field, op: CmpOp::Eq, value: v.into() }

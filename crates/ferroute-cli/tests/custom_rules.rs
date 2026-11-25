@@ -86,3 +86,70 @@ fn fixed_placement_honours_custom_rules() {
 fn nudging_honours_custom_rules() {
     assert_honoured(&route(&["--allow-move"]));
 }
+
+fn run_route(input: &Path, output: &Path) -> std::process::Output {
+    Command::new(env!("CARGO_BIN_EXE_ferroute"))
+        .arg("route")
+        .arg(input)
+        .arg("-o")
+        .arg(output)
+        .current_dir(root())
+        .output()
+        .expect("run ferroute")
+}
+
+#[test]
+fn route_writes_sidecars_named_after_the_output_stem() {
+    let fixture = root().join("testdata/boards/demo_dru.kicad_pcb");
+    let dir = tempfile::tempdir().expect("tmp");
+    let out = dir.path().join("sub").join("renamed.kicad_pcb");
+    // A stale, different sidecar at the target is overwritten.
+    std::fs::create_dir_all(out.parent().unwrap()).unwrap();
+    std::fs::write(out.with_extension("kicad_dru"), "stale").unwrap();
+    let res = run_route(&fixture, &out);
+    assert!(res.status.success(), "{}", String::from_utf8_lossy(&res.stderr));
+    for ext in ["kicad_pro", "kicad_dru"] {
+        assert_eq!(
+            std::fs::read(out.with_extension(ext)).expect(ext),
+            std::fs::read(fixture.with_extension(ext)).expect(ext),
+            "{ext} copied byte for byte"
+        );
+    }
+    assert!(String::from_utf8_lossy(&res.stdout).contains("wrote sidecar"));
+}
+
+#[test]
+fn in_place_routing_never_touches_the_input_sidecars() {
+    let dir = tempfile::tempdir().expect("tmp");
+    let board = dir.path().join("b.kicad_pcb");
+    for ext in ["kicad_pcb", "kicad_pro", "kicad_dru"] {
+        std::fs::copy(
+            root().join("testdata/boards/demo_dru").with_extension(ext),
+            board.with_extension(ext),
+        )
+        .unwrap();
+    }
+    let read = || -> Vec<Vec<u8>> {
+        ["kicad_pro", "kicad_dru"]
+            .iter()
+            .map(|e| std::fs::read(board.with_extension(e)).unwrap())
+            .collect()
+    };
+    let before = read();
+    let res = run_route(&board, &board);
+    assert!(res.status.success(), "{}", String::from_utf8_lossy(&res.stderr));
+    assert!(!String::from_utf8_lossy(&res.stdout).contains("wrote sidecar"));
+    assert_eq!(before, read());
+}
+
+#[test]
+fn missing_input_sidecars_are_not_invented() {
+    let dir = tempfile::tempdir().expect("tmp");
+    let input = dir.path().join("in.kicad_pcb");
+    std::fs::copy(root().join("testdata/boards/demo_dru.kicad_pcb"), &input).unwrap();
+    let out = dir.path().join("out.kicad_pcb");
+    let res = run_route(&input, &out);
+    assert!(res.status.success(), "{}", String::from_utf8_lossy(&res.stderr));
+    assert!(!out.with_extension("kicad_pro").exists());
+    assert!(!out.with_extension("kicad_dru").exists());
+}

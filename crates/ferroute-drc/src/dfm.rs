@@ -205,9 +205,11 @@ pub fn check(board: &Board, cfg: &DfmConfig) -> Vec<DfmIssue> {
     for id in board.pad_ids() {
         let pad = board.pad(id);
         let Some(d) = pad.drill.filter(|d| d.plated) else { continue };
+        // A slot's ring is measured against its width, not its length.
+        let dim = d.min_dimension();
         let ring = pad_min_dimension(&pad.shape)
-            .map(|m| ((m - d.diameter) / 2, required_ring(pad.net, ItemType::Pad)));
-        hole(ItemRef::Pad(id), board.pad_position(id), d.diameter, ring, full, false);
+            .map(|m| ((m - dim) / 2, required_ring(pad.net, ItemType::Pad)));
+        hole(ItemRef::Pad(id), board.pad_position(id), dim, ring, full, false);
     }
     let spans = i64::from(board.layer_count().saturating_sub(1)).max(1);
     for (i, v) in board.vias.iter().enumerate() {
@@ -327,6 +329,25 @@ mod tests {
     }
 
     #[test]
+    fn slot_ring_uses_the_slot_width_not_its_length() {
+        let mut b = BoardBuilder::new(mm(20), mm(20), 2);
+        let n = b.net("N");
+        b.header("J1", pt10(100, 100), 0.0, &[n, n]);
+        let mut board = b.build();
+        // Oval 1.0 x 2.4 mm pad with a 0.6 x 1.8 mm slot: ring = (1.0 - 0.6) / 2 = 0.2 mm.
+        board.pads[1].shape = PadShape::Oval { w: 1_000_000, h: 2_400_000 };
+        board.pads[1].drill =
+            Some(Drill { diameter: 1_800_000, plated: true, slot: Some([600_000, 1_800_000]) });
+        let cfg = DfmConfig::default();
+        assert!(kinds(&board, &cfg).is_empty(), "{:?}", check(&board, &cfg));
+        // A 0.9 mm wide slot leaves only 0.05 mm.
+        board.pads[1].drill =
+            Some(Drill { diameter: 1_800_000, plated: true, slot: Some([1_800_000, 900_000]) });
+        let got = check(&board, &cfg);
+        assert_eq!(got[0].kind, DfmKind::AnnularRing { actual: 50_000, required: 130_000 });
+    }
+
+    #[test]
     fn pad_annular_ring_uses_the_smallest_copper_dimension() {
         let mut b = BoardBuilder::new(mm(20), mm(20), 2);
         let n = b.net("N");
@@ -335,7 +356,7 @@ mod tests {
         let cfg = DfmConfig::default();
         assert!(kinds(&board, &cfg).is_empty(), "1.7 mm pad, 1.0 mm drill");
         // Pad 2 is a 1.7 mm circle; a 1.5 mm drill leaves 0.1 mm of ring.
-        board.pads[1].drill = Some(Drill { diameter: 1_500_000, plated: true });
+        board.pads[1].drill = Some(Drill::round(1_500_000, true));
         let got = check(&board, &cfg);
         assert_eq!(got.len(), 1, "{got:?}");
         assert_eq!(got[0].kind, DfmKind::AnnularRing { actual: 100_000, required: 130_000 });
@@ -427,7 +448,7 @@ mod tests {
         b.via(pt10(130, 100), 600_000, 300_000, n, Origin::Existing);
         let mut board = b.build();
         // Turn the header pad into a 3.2 mm NPTH mounting hole with no copper.
-        board.pads[0].drill = Some(Drill { diameter: 3_200_000, plated: false });
+        board.pads[0].drill = Some(Drill::round(3_200_000, false));
         board.pads[0].layers = ferroute_board::LayerSet::EMPTY;
         let cfg = DfmConfig { min_annular: 0, ..DfmConfig::default() };
         // Via at 3.0 mm: its edge is 3.0 - 0.3 - 1.6 = 1.1 mm from the hole edge.

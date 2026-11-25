@@ -12,7 +12,7 @@ use ferroute_kicad::Removal;
 use ferroute_place::{MovePolicy, PlaceConfig};
 use ferroute_router::{Accel, RouterConfig};
 use serde_json::json;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 #[derive(clap::ValueEnum, Clone, Copy, Debug, PartialEq, Eq)]
@@ -159,6 +159,36 @@ fn via_kinds_json(c: &[usize; 4]) -> serde_json::Value {
         m.insert(k.name().to_owned(), serde_json::json!(n));
     }
     serde_json::Value::Object(m)
+}
+
+/// Board sidecars KiCad resolves by the board's file stem: net classes / rules
+/// (`.kicad_pro`) and custom DRC rules (`.kicad_dru`).
+const SIDECAR_EXTENSIONS: [&str; 2] = ["kicad_pro", "kicad_dru"];
+
+/// Copies the input's sidecars next to the output, renamed to the output's stem (byte for
+/// byte, always overwriting the target). Nothing is copied when the output sits on the
+/// input's own stem (in-place routing), so the input's files are never touched.
+///
+/// # Errors
+/// Fails when a sidecar cannot be copied.
+pub(crate) fn copy_sidecars(input: &Path, output: &Path) -> Result<()> {
+    for ext in SIDECAR_EXTENSIONS {
+        let (from, to) = (input.with_extension(ext), output.with_extension(ext));
+        if !from.is_file() || is_same_file(&from, &to) {
+            continue;
+        }
+        std::fs::copy(&from, &to)
+            .with_context(|| format!("copying {} to {}", from.display(), to.display()))?;
+        out(&format!("wrote sidecar {} (from {})", to.display(), from.display()));
+    }
+    Ok(())
+}
+
+fn is_same_file(a: &Path, b: &Path) -> bool {
+    match (std::fs::canonicalize(a), std::fs::canonicalize(b)) {
+        (Ok(x), Ok(y)) => x == y,
+        _ => a == b,
+    }
 }
 
 /// Parses a rules file (`[stackup]` + `[[net]]` tables).
@@ -310,12 +340,7 @@ pub fn run(a: &RouteArgs) -> Result<ExitCode> {
     }
     std::fs::write(&a.output, doc.to_kicad_string())
         .with_context(|| format!("writing {}", a.output.display()))?;
-    // Keep the rules next to the output so KiCad / kicad-cli DRC see the same classes.
-    let pro_in = a.input.with_extension("kicad_pro");
-    let pro_out = a.output.with_extension("kicad_pro");
-    if pro_in.exists() && pro_in != pro_out {
-        std::fs::copy(&pro_in, &pro_out)?;
-    }
+    copy_sidecars(&a.input, &a.output)?;
     let m = &res.metrics;
     let failed: Vec<&str> =
         res.failed_nets.iter().map(|n| res.board_after.nets[n.idx()].name.as_str()).collect();

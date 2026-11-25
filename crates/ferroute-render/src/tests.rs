@@ -41,6 +41,7 @@ fn test_board() -> Board {
             Point::new(-1_500_000, -2_500_000),
             Point::new(1_500_000, 2_500_000),
         )),
+        has_courtyard: true,
         pads: vec![PadId(0), PadId(1), PadId(2)],
     });
     let smd = |x: i64, net: NetId| Pad {
@@ -63,7 +64,7 @@ fn test_board() -> Board {
         local_rot: Angle::ZERO,
         shape: PadShape::Circle { diameter: 1_600_000 },
         layers: LayerSet::all(2),
-        drill: Some(Drill { diameter: 800_000, plated: true }),
+        drill: Some(Drill::round(800_000, true)),
     });
     b.tracks.push(Track {
         start: Point::new(5_000_000, 5_000_000),

@@ -614,7 +614,9 @@ fn holes(board: &Board, items: &[CopperItem]) -> Vec<Hole> {
                 board.footprint(pad.footprint).placement != board.footprint(pad.footprint).original;
             v.push(Hole {
                 item: ItemRef::Pad(id),
-                hull: Hull::disk(board.pad_position(id), d.diameter / 2),
+                hull: board
+                    .footprint_pad_hole(id)
+                    .unwrap_or_else(|| Hull::disk(board.pad_position(id), d.diameter / 2)),
                 layers: board.all_layers(),
                 net: pad.net,
                 introduced: moved,
@@ -745,6 +747,49 @@ fn check_keepouts(board: &Board, items: &[CopperItem]) -> Vec<Violation> {
     out
 }
 
+/// `true` when the interiors of two courtyards overlap. Courtyards that merely touch
+/// (shared edge or corner) do not count, like KiCad's `courtyards_overlap`. Exact (i128)
+/// separating-axis test for convex polygons; non-convex ones fall back to the inclusive
+/// polygon test (conservative).
+fn courtyards_overlap(a: &ferroute_geom::Polygon, b: &ferroute_geom::Polygon) -> bool {
+    fn convex(p: &ferroute_geom::Polygon) -> bool {
+        let n = p.pts.len();
+        let mut sign = 0i128;
+        for i in 0..n {
+            let (u, v, w) = (p.pts[i], p.pts[(i + 1) % n], p.pts[(i + 2) % n]);
+            let c = i128::from(v.x - u.x) * i128::from(w.y - v.y)
+                - i128::from(v.y - u.y) * i128::from(w.x - v.x);
+            if c != 0 {
+                if sign != 0 && (c > 0) != (sign > 0) {
+                    return false;
+                }
+                sign = c;
+            }
+        }
+        true
+    }
+    // `p` separates when every vertex of `o` lies on or beyond one of its edges.
+    fn separated_by(p: &ferroute_geom::Polygon, o: &ferroute_geom::Polygon) -> bool {
+        let n = p.pts.len();
+        let ccw = p.area2() > 0;
+        (0..n).any(|i| {
+            let (u, v) = (p.pts[i], p.pts[(i + 1) % n]);
+            o.pts.iter().all(|&q| {
+                let c = i128::from(v.x - u.x) * i128::from(q.y - u.y)
+                    - i128::from(v.y - u.y) * i128::from(q.x - u.x);
+                if ccw { c <= 0 } else { c >= 0 }
+            })
+        })
+    }
+    if a.pts.len() < 3 || b.pts.len() < 3 {
+        return false;
+    }
+    if !convex(a) || !convex(b) {
+        return a.intersects(b);
+    }
+    a.intersects(b) && !separated_by(a, b) && !separated_by(b, a)
+}
+
 /// Courtyard overlap between footprints on the same side (exact polygon test).
 #[must_use]
 pub fn check_courtyards(board: &Board) -> Vec<Violation> {
@@ -756,7 +801,11 @@ pub fn check_courtyards(board: &Board) -> Vec<Violation> {
         .into_iter()
         .filter_map(|(i, j)| {
             let (fa, fb) = (&board.footprints[i as usize], &board.footprints[j as usize]);
-            if fa.side != fb.side || !cys[i as usize].intersects(&cys[j as usize]) {
+            if fa.side != fb.side
+                || !fa.has_courtyard
+                || !fb.has_courtyard
+                || !courtyards_overlap(&cys[i as usize], &cys[j as usize])
+            {
                 return None;
             }
             Some(Violation {
@@ -912,24 +961,32 @@ fn pad_hole_violations(board: &Board) -> Vec<Violation> {
     for id in board.pad_ids() {
         let pad = board.pad(id);
         let Some(d) = pad.drill else { continue };
+        let dd = d.min_dimension(); // a slot is judged by its width
         let fp = board.footprint(pad.footprint);
         let origin = if fp.placement != fp.original { Origin::Routed } else { Origin::Existing };
         let at = board.pad_position(id);
         let item = ItemRef::Pad(id);
         let ctx = ItemCtx::new(pad.net, ItemType::Pad);
         let min = r.custom_min_for(board, ConstraintKind::HoleSize, &ctx, None);
-        if d.diameter < min {
-            out.push(size_violation(ViolationKind::PadDrill, item, at, d.diameter, min, origin));
+        if dd < min {
+            out.push(size_violation(ViolationKind::PadDrill, item, at, dd, min, origin));
         }
         if let Some(mx) =
-            r.max_limit_for(board, ConstraintKind::HoleSize, &ctx, None).filter(|&m| d.diameter > m)
+            r.max_limit_for(board, ConstraintKind::HoleSize, &ctx, None).filter(|&m| dd > m)
         {
-            out.push(size_violation(ViolationKind::PadDrillMax, item, at, d.diameter, mx, origin));
+            out.push(size_violation(ViolationKind::PadDrillMax, item, at, dd, mx, origin));
         }
         if d.plated
             && let Some(m) = dfm::pad_min_dimension(&pad.shape)
         {
-            out.extend(annular_violations(board, &ctx, item, at, (m - d.diameter) / 2, origin));
+            out.extend(annular_violations(
+                board,
+                &ctx,
+                item,
+                at,
+                (m - d.min_dimension()) / 2,
+                origin,
+            ));
         }
     }
     out

@@ -171,3 +171,62 @@ proptest! {
         prop_assert_eq!(fast_sorted, slow);
     }
 }
+
+/// A plated 0.6 x 1.8 mm slot (long axis along the pad's x) next to a 0.3 mm via.
+fn slot_board(via_offset: Point) -> Board {
+    let mut b = BoardBuilder::new(mm(30), mm(20), 2);
+    let (n, m) = (b.net("N"), b.net("M"));
+    b.smd2("J1", pt10(100, 100), 0.0, n, n);
+    b.via(pt10(200, 150), 600_000, 300_000, m, Origin::Routed);
+    let mut board = b.build();
+    board.pads[0].drill = Some(ferroute_board::Drill {
+        diameter: 1_800_000,
+        plated: true,
+        slot: Some([1_800_000, 600_000]),
+    });
+    let c = board.pad_position(ferroute_board::PadId(0));
+    board.vias[0].pos = c + via_offset;
+    board
+}
+
+#[test]
+fn slot_hole_uses_the_capsule_not_a_disk_of_its_length() {
+    let h2h = |board: &Board| check(board, &DrcConfig::default()).count(ViolationKind::HoleToHole);
+    // 1.0 mm off the slot's flank: capsule gap 0.55 mm is fine (a 1.8 mm disk would hit).
+    assert_eq!(h2h(&slot_board(Point::new(0, 1_000_000))), 0);
+    // 1.0 mm beyond the slot's end: gap -0.05 mm.
+    assert_eq!(h2h(&slot_board(Point::new(1_000_000, 0))), 1);
+}
+
+#[test]
+fn touching_courtyards_do_not_overlap_but_overlapping_ones_do() {
+    let place = |dx_mm: i64| {
+        let mut b = BoardBuilder::new(mm(30), mm(20), 2);
+        let n = b.net("N");
+        b.smd2("R1", pt10(100, 100), 0.0, n, n);
+        b.smd2("R2", Point::new(mm(10) + dx_mm, mm(10)), 0.0, n, n);
+        let mut board = b.build();
+        for f in &mut board.footprints {
+            f.courtyard_local = ferroute_geom::Polygon::from_rect(ferroute_geom::Rect::new(
+                Point::new(-1_000_000, -1_000_000),
+                Point::new(1_000_000, 1_000_000),
+            ));
+        }
+        check_courtyards(&board).len()
+    };
+    assert_eq!(place(2_000_000), 0, "shared edge");
+    assert_eq!(place(1_999_999), 1, "1 nm of overlap");
+    assert_eq!(place(3_000_000), 0);
+}
+
+#[test]
+fn footprints_without_a_drawn_courtyard_never_overlap() {
+    let mut b = BoardBuilder::new(mm(30), mm(20), 2);
+    let n = b.net("N");
+    b.smd2("R1", pt10(100, 100), 0.0, n, n);
+    b.smd2("R2", pt10(110, 100), 0.0, n, n);
+    let mut board = b.build();
+    assert_eq!(check_courtyards(&board).len(), 1);
+    board.footprints[1].has_courtyard = false;
+    assert!(check_courtyards(&board).is_empty());
+}
