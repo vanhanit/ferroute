@@ -134,7 +134,7 @@ impl Obstacles {
                 board.rules.hole_to_hole_for(
                     board,
                     &ItemCtx::new(net, kind),
-                    &ItemCtx { net: None, kind: Some(ItemType::Via), layer: None },
+                    &ItemCtx { kind: Some(ItemType::Via), ..ItemCtx::UNKNOWN },
                 )
             }
         };

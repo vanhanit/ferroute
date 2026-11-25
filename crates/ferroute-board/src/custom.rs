@@ -8,7 +8,7 @@
 //! under test. Conditions we cannot evaluate ([`Cond::Unsupported`]) are *maybe-matching*:
 //! they are applied only where that makes a check stricter (never lowers a requirement).
 
-use crate::{Board, LayerId, LayerSet, NetId, glob};
+use crate::{Board, FootprintId, LayerId, LayerSet, NetId, glob};
 use ferroute_geom::Coord;
 use serde::{Deserialize, Serialize};
 
@@ -171,8 +171,8 @@ pub enum Cond {
     /// the KiCad wildcard `pattern` (`*`, `?`, case-sensitive like `wxString::Matches`).
     /// True for pads, footprint graphics and footprint holes; false for tracks, vias and
     /// zones (no parent footprint). Pads / footprint items match by reference when the
-    /// evaluator knows their owner (`ItemCtx` wiring pending, task #15b); until then
-    /// they maybe-match, and so do `${CLASS:..}` selectors.
+    /// evaluator knows their owner (`ItemCtx::footprint`); while it is unknown they
+    /// maybe-match, and so do `${CLASS:..}` selectors.
     MemberOfFootprint {
         side: RuleSide,
         pattern: String,
@@ -221,15 +221,24 @@ pub struct ItemCtx {
     pub net: Option<NetId>,
     pub kind: Option<ItemType>,
     pub layer: Option<LayerId>,
+    /// Owning footprint (pads, footprint graphics and holes); `None` = unknown, which
+    /// `memberOfFootprint` treats as a maybe for footprint-borne kinds.
+    pub footprint: Option<FootprintId>,
 }
 
 impl ItemCtx {
     /// Nothing known about the item.
-    pub const UNKNOWN: Self = Self { net: None, kind: None, layer: None };
+    pub const UNKNOWN: Self = Self { net: None, kind: None, layer: None, footprint: None };
 
     #[must_use]
     pub const fn new(net: NetId, kind: ItemType) -> Self {
-        Self { net: Some(net), kind: Some(kind), layer: None }
+        Self { net: Some(net), kind: Some(kind), layer: None, footprint: None }
+    }
+
+    /// The item belongs to footprint `fp` (`memberOfFootprint` is then decided exactly).
+    #[must_use]
+    pub const fn in_footprint(self, fp: FootprintId) -> Self {
+        Self { footprint: Some(fp), ..self }
     }
 
     #[must_use]
@@ -345,7 +354,13 @@ impl Cond {
                     RuleSide::A => Some(a),
                     RuleSide::B => b,
                 };
-                ctx.map_or(Tri::False, |c| Self::member_of_footprint(pattern, c.kind, None))
+                ctx.map_or(Tri::False, |c| {
+                    let owner = c
+                        .footprint
+                        .and_then(|f| board.footprints.get(f.idx()))
+                        .map(|f| f.reference.as_str());
+                    Self::member_of_footprint(pattern, c.kind, owner)
+                })
             }
             Self::Cmp { side, field, op, value } => {
                 let ctx = match side {
@@ -463,7 +478,7 @@ impl crate::DesignRules {
         item: Option<ItemType>,
         pair: bool,
     ) -> Option<Coord> {
-        let a = ItemCtx { net: Some(net), kind: item, layer: None };
+        let a = ItemCtx { net: Some(net), kind: item, ..ItemCtx::UNKNOWN };
         let other = pair.then_some(ItemCtx::UNKNOWN);
         self.custom
             .iter()
@@ -602,7 +617,7 @@ impl crate::DesignRules {
         item: Option<ItemType>,
         pair: bool,
     ) -> Option<Coord> {
-        let a = ItemCtx { net: Some(net), kind: item, layer: None };
+        let a = ItemCtx { net: Some(net), kind: item, ..ItemCtx::UNKNOWN };
         let other = pair.then_some(ItemCtx::UNKNOWN);
         self.custom
             .iter()
@@ -703,7 +718,7 @@ mod tests {
     fn member_of_footprint_condition_on_tracks_is_false() {
         let board = BoardBuilder::new(mm(10), mm(10), 2).build();
         let c = Cond::MemberOfFootprint { side: RuleSide::A, pattern: "RJ*".into() };
-        let track = ItemCtx { net: None, kind: Some(ItemType::Track), layer: None };
+        let track = ItemCtx { kind: Some(ItemType::Track), ..ItemCtx::UNKNOWN };
         assert_eq!(c.eval(&board, &track, None), Tri::False);
         assert_eq!(c.eval(&board, &ItemCtx::UNKNOWN, None), Tri::Maybe);
     }

@@ -53,22 +53,27 @@ fn track_of_another_net_crossing_a_fill_is_a_violation() {
 }
 
 #[test]
-fn clearance_to_the_fill_edge_uses_the_zone_clearance() {
+fn clearance_to_the_fill_edge_uses_the_rules_not_the_zone_local_clearance() {
+    // KiCad 10 never consults a zone's own `(connect_pads (clearance ..))` for other-net
+    // copper (neither DRC nor the filler do): only net class / custom rules apply.
     let (mut board, _, a, _) = board(PadConnection::ThermalRelief);
     board.rules.classes[0].clearance = 100_000;
-    // Fill edge at y = 12 mm; track copper edge (half width 0.125) at gap 0.3 mm.
+    // Fill edge at y = 12 mm; track copper edge (half width 0.125) at the given gap.
     let y = |gap: i64| 12_000_000 - gap - 125_000;
     let at = |gap: i64| {
         track(Point::new(15_000_000, y(gap)), Point::new(25_000_000, y(gap)), a, 0, Origin::Routed)
     };
     board.tracks.push(at(300_000));
     assert!(check(&board, &DrcConfig::default()).is_clean());
-    // Gap 0.1 mm: below the zone clearance (0.2) though not below the board clearance.
-    board.tracks[0] = at(100_000);
+    // Gap 0.15 mm: below the zone's own 0.2 mm but above the 0.1 mm rule: clean.
+    board.tracks[0] = at(150_000);
+    assert!(check(&board, &DrcConfig::default()).is_clean());
+    // Gap 0.05 mm: below the rule clearance.
+    board.tracks[0] = at(50_000);
     let r = check(&board, &DrcConfig::default());
     assert_eq!(r.count(ViolationKind::Clearance), 1, "{:#?}", r.violations);
-    assert!((r.violations[0].actual - 100_000.0).abs() < 1.0);
-    assert_eq!(r.violations[0].required, 200_000);
+    assert!((r.violations[0].actual - 50_000.0).abs() < 1.0);
+    assert_eq!(r.violations[0].required, 100_000);
 }
 
 #[test]

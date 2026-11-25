@@ -189,7 +189,7 @@ fn via_legal(
             rules.hole_to_hole_for(
                 base,
                 &ItemCtx::new(via.net, ItemType::Via),
-                &ItemCtx { net: Some(h.net), kind: None, layer: None },
+                &ItemCtx { net: Some(h.net), ..ItemCtx::UNKNOWN },
             )
         };
         if hole.clearance_violated(&h.hull, h2h)

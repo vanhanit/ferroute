@@ -390,7 +390,7 @@ fn dedup_arc_pieces(violations: &mut Vec<Violation>) {
 }
 
 /// Rule-evaluation context of a board item (`A.Type`, `A.NetName`, ...).
-fn item_ctx(item: ItemRef, net: NetId) -> ItemCtx {
+fn item_ctx(board: &Board, item: ItemRef, net: NetId) -> ItemCtx {
     let kind = match item {
         ItemRef::Pad(_) => ItemType::Pad,
         ItemRef::Via(_) => ItemType::Via,
@@ -401,7 +401,12 @@ fn item_ctx(item: ItemRef, net: NetId) -> ItemCtx {
         | ItemRef::Zone(_)
         | ItemRef::BoardEdge => ItemType::Track,
     };
-    ItemCtx::new(net, kind)
+    let ctx = ItemCtx::new(net, kind);
+    match item {
+        ItemRef::Pad(p) => ctx.in_footprint(board.pad(p).footprint),
+        ItemRef::Footprint(f) => ctx.in_footprint(f),
+        _ => ctx,
+    }
 }
 
 fn first_common_layer(a: LayerSet, b: LayerSet) -> Option<LayerId> {
@@ -498,7 +503,7 @@ fn apply_severity(board: &Board, violations: &mut Vec<Violation>) {
         return;
     }
     let ctx = |item: ItemRef, layer: Option<LayerId>| {
-        let c = item_ctx(item, net_of(board, item));
+        let c = item_ctx(board, item, net_of(board, item));
         layer.map_or(c, |l| c.on(l))
     };
     violations.retain_mut(|v| {
@@ -536,8 +541,8 @@ fn check_copper(
             } else {
                 board.rules.clearance_for_layers(
                     board,
-                    &item_ctx(a.item, a.net),
-                    &item_ctx(b.item, b.net),
+                    &item_ctx(board, a.item, a.net),
+                    &item_ctx(board, b.item, b.net),
                     LayerSet(a.layers.0 & b.layers.0),
                 )
             };
@@ -565,7 +570,7 @@ fn check_edges(board: &Board, items: &[CopperItem]) -> Vec<Violation> {
         if board.rules.custom.is_empty() {
             board.rules.edge_clearance
         } else {
-            let ctx = item_ctx(it.item, it.net);
+            let ctx = item_ctx(board, it.item, it.net);
             let mut ls = it.layers.iter();
             let first = ls.next().map_or(ctx, |l| ctx.on(l));
             std::iter::once(board.rules.edge_clearance_for(board, &first))
@@ -649,7 +654,11 @@ fn check_holes(board: &Board, items: &[CopperItem]) -> Vec<Violation> {
         let req = if r.custom.is_empty() {
             r.hole_to_hole
         } else {
-            r.hole_to_hole_for(board, &item_ctx(a.item, a.net), &item_ctx(b.item, b.net))
+            r.hole_to_hole_for(
+                board,
+                &item_ctx(board, a.item, a.net),
+                &item_ctx(board, b.item, b.net),
+            )
         };
         if a.hull.clearance_violated(&b.hull, req) {
             out.push(Violation {
@@ -681,8 +690,18 @@ fn check_holes(board: &Board, items: &[CopperItem]) -> Vec<Violation> {
             let req = if r.custom.is_empty() {
                 r.hole_clearance
             } else {
-                r.hole_clearance_for(board, &item_ctx(h.item, h.net), &item_ctx(it.item, it.net))
+                r.hole_clearance_for(
+                    board,
+                    &item_ctx(board, h.item, h.net),
+                    &item_ctx(board, it.item, it.net),
+                )
             };
+            // KiCad tests a pad's copper against another item's hole only for a positive
+            // hole clearance (`doTestHole` is guarded by `clearance > 0`); tracks are
+            // tested even at 0 because they cannot lie inside a hole.
+            if req <= 0 && matches!(it.item, ItemRef::Pad(_)) {
+                continue;
+            }
             if it.hull.clearance_violated(&h.hull, req) {
                 out.push(Violation {
                     kind: ViolationKind::HoleClearance,
@@ -966,7 +985,7 @@ fn pad_hole_violations(board: &Board) -> Vec<Violation> {
         let origin = if fp.placement != fp.original { Origin::Routed } else { Origin::Existing };
         let at = board.pad_position(id);
         let item = ItemRef::Pad(id);
-        let ctx = ItemCtx::new(pad.net, ItemType::Pad);
+        let ctx = ItemCtx::new(pad.net, ItemType::Pad).in_footprint(pad.footprint);
         let min = r.custom_min_for(board, ConstraintKind::HoleSize, &ctx, None);
         if dd < min {
             out.push(size_violation(ViolationKind::PadDrill, item, at, dd, min, origin));

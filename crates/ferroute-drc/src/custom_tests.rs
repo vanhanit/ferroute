@@ -284,3 +284,45 @@ fn maybe_matching_error_rule_keeps_violations_hard() {
     assert!(!r.is_clean());
     assert!(r.violations.iter().all(|v| v.severity == Severity::Error));
 }
+
+#[test]
+fn member_of_footprint_selects_pads_by_owner_reference() {
+    let (mut board, ..) = routed();
+    board.rules.custom.push(rule(
+        Cond::MemberOfFootprint { side: RuleSide::A, pattern: "R2".into() },
+        ConstraintKind::Clearance,
+        mm(5),
+    ));
+    let r = check(&board, &DrcConfig::default());
+    let owner = |i: ItemRef| match i {
+        ItemRef::Pad(p) => Some(board.footprint(board.pad(p).footprint).reference.clone()),
+        _ => None,
+    };
+    let hits: Vec<_> = r.violations.iter().filter(|v| v.kind == ViolationKind::Clearance).collect();
+    assert!(!hits.is_empty(), "{:#?}", r.violations);
+    for v in hits {
+        let owners = [owner(v.a), v.b.and_then(owner)];
+        assert!(owners.iter().flatten().all(|o| o == "R2"), "{v:?}");
+        assert!(owners.iter().any(Option::is_some), "{v:?}");
+    }
+    // No footprint matches: the rule never applies (tracks are never footprint members).
+    board.rules.custom[0].condition =
+        Cond::MemberOfFootprint { side: RuleSide::A, pattern: "U*".into() };
+    assert!(check(&board, &DrcConfig::default()).is_clean());
+}
+
+#[test]
+fn pad_over_a_hole_is_not_flagged_when_the_hole_clearance_rule_is_zero() {
+    // KiCad tests a pad's copper against another item's hole only for a positive hole
+    // clearance (`doTestHole` is guarded by `clearance > 0`).
+    let mut b = BoardBuilder::new(mm(30), mm(20), 2);
+    let (a, bn) = (b.net("A"), b.net("B"));
+    b.header("H1", pt10(100, 100), 0.0, &[a]);
+    b.smd2("R1", Point::new(10_800_000, 10_000_000), 0.0, bn, bn);
+    let mut board = b.build();
+    let holes =
+        |board: &Board| check(board, &DrcConfig::default()).count(ViolationKind::HoleClearance);
+    assert!(holes(&board) > 0);
+    board.rules.custom.push(rule(Cond::True, ConstraintKind::HoleClearance, 0));
+    assert_eq!(holes(&board), 0);
+}

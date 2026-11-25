@@ -58,26 +58,25 @@ pub fn obstacle_fills(board: &Board) -> Vec<FillPoly<'_>> {
 }
 
 /// Required gap between copper of net `zone_net` poured on `layer` and an item of net
-/// `other`: the larger of the zone's own clearance and the rules engine value (net classes
-/// plus `.kicad_dru` custom rules; the other item's kind is unknown, so kind-dependent rules
-/// apply conservatively). The DRC and the refill both use this — one definition.
+/// `other`: the rules engine value (net classes, pad/footprint overrides and `.kicad_dru`
+/// custom rules; the other item's kind is unknown, so kind-dependent rules apply
+/// conservatively). The zone's own `(connect_pads (clearance ..))` is deliberately *not*
+/// part of it: KiCad 10 consults it neither in DRC (`DRC_ENGINE::EvalRules` only reads
+/// `GetClearanceOverrides`, which a zone does not provide) nor in the filler
+/// (`ZONE_FILLER` knockouts use `EvalRules` only; the zone value matters just for
+/// unconnected same-net pads). The DRC and the refill both use this — one definition.
 #[must_use]
-pub fn zone_clearance(
-    board: &Board,
-    zone_net: NetId,
-    zone_clearance: Coord,
-    layer: LayerId,
-    other: NetId,
-) -> Coord {
-    let a = ItemCtx { net: Some(zone_net), kind: Some(ItemType::Zone), layer: Some(layer) };
-    let b = ItemCtx { net: Some(other), kind: None, layer: Some(layer) };
-    zone_clearance.max(board.rules.clearance_for(board, &a, &b))
+pub fn zone_clearance(board: &Board, zone_net: NetId, layer: LayerId, other: NetId) -> Coord {
+    let a =
+        ItemCtx { net: Some(zone_net), kind: Some(ItemType::Zone), ..ItemCtx::UNKNOWN }.on(layer);
+    let b = ItemCtx { net: Some(other), ..ItemCtx::UNKNOWN }.on(layer);
+    board.rules.clearance_for(board, &a, &b)
 }
 
 /// Required gap between fill `f` and an item of net `other` (see [`zone_clearance`]).
 #[must_use]
 pub fn required_clearance(board: &Board, f: &FillPoly<'_>, other: NetId) -> Coord {
-    zone_clearance(board, f.net, f.clearance, f.layer, other)
+    zone_clearance(board, f.net, f.layer, other)
 }
 
 /// Fill-vs-copper clearance and short violations (other-net copper only).

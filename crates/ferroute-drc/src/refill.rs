@@ -109,13 +109,7 @@ impl Ctx<'_> {
             .into_iter()
             .filter_map(|k| {
                 let it = &self.items[k];
-                let req = crate::zones::zone_clearance(
-                    self.board,
-                    self.zone.net,
-                    self.zone.clearance,
-                    layer,
-                    it.net,
-                );
+                let req = crate::zones::zone_clearance(self.board, self.zone.net, layer, it.net);
                 let c = circumscribed(&it.hull, req);
                 (c.bbox()?.intersects(bb) && poly.intersects(&c)).then_some(c)
             })
@@ -415,8 +409,8 @@ pub fn pour_splits(board: &Board, refill: &Refill) -> Vec<PourSplit> {
                     continue;
                 }
                 let zone = &board.zones[zi];
-                let reach = crate::zones::zone_clearance(board, net, zone.clearance, layer, it.net)
-                    + zone.min_thickness;
+                let reach =
+                    crate::zones::zone_clearance(board, net, layer, it.net) + zone.min_thickness;
                 if !it.bbox.intersects(bb.inflate(reach)) || !poly.hull_violates(&it.hull, reach) {
                     continue;
                 }
