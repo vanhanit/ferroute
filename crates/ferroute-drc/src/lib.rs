@@ -34,6 +34,7 @@ pub mod pairs;
 pub mod quality;
 pub mod refill;
 pub mod rules;
+pub mod thermal;
 pub mod zones;
 pub use connectivity::{Connectivity, Unconnected};
 
@@ -100,6 +101,9 @@ pub enum ViolationKind {
     /// A via whose copper span does not fit its kind (e.g. a micro via over more than two
     /// adjacent layers, a blind via with both ends on outer layers).
     ViaSpan,
+    /// A pad's thermal relief reaches the fill with fewer than `min_resolved_spokes` spokes
+    /// (KiCad `starved_thermal`, see [`thermal`]).
+    StarvedThermal,
 }
 
 /// Reference to a board item.
@@ -431,6 +435,7 @@ pub fn check(board: &Board, cfg: &DrcConfig) -> DrcReport {
     }
     if cfg.copper {
         violations.extend(zones::check_fills(board, &items));
+        violations.extend(thermal::check_starved_thermals(board, &items));
     }
     if cfg.keepouts {
         violations.extend(check_keepouts(board, &items));

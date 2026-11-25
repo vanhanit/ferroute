@@ -12,6 +12,14 @@
 //!    shrinks), then islands connected to no same-net pad/via/track are removed according to
 //!    the zone's island mode.
 //!
+//! 3. Thermal reliefs: a pad whose relief had at least `min_resolved_spokes` spokes before the
+//!    cut but would be *starved* (1 spoke, KiCad `starved_thermal`) after it is isolated from
+//!    the fill (the fill within [`crate::thermal::CUT_RADIUS`] of the pad is removed) and a
+//!    note is recorded. The pad then counts as disconnected from the pour, so INV-CONN-1 is
+//!    enforced by the same mechanism as every other refill disconnect
+//!    (`refill_disconnects` / [`pour_splits`] and the engine's repair/fallback) instead of a
+//!    silent starved relief that KiCad's DRC rejects.
+//!
 //! Polygons no obstacle touches keep their stored vertices byte for byte, and zones with no
 //! change are not reported. The function is pure and deterministic.
 
@@ -43,11 +51,12 @@ pub fn refill_zones(board: &Board) -> Refill {
     let items = copper_items(board);
     let boxes: Vec<Rect> = items.iter().map(|it| it.bbox).collect();
     let grid = BucketGrid::new(&boxes, 2_000_000);
+    let lk = crate::thermal::Lookup::new(board, &items);
     for (zi, zone) in board.zones.iter().enumerate() {
         if zone.is_unfilled() {
             continue;
         }
-        let ctx = Ctx { board, zone, items: &items, boxes: &boxes, grid: &grid };
+        let ctx = Ctx { board, zone, items: &items, boxes: &boxes, grid: &grid, lk: &lk };
         let mut changed = false;
         let mut fills = Vec::with_capacity(zone.fills.len());
         for f in &zone.fills {
@@ -68,6 +77,7 @@ struct Ctx<'a> {
     items: &'a [CopperItem],
     boxes: &'a [Rect],
     grid: &'a BucketGrid,
+    lk: &'a crate::thermal::Lookup<'a>,
 }
 
 impl Ctx<'_> {
@@ -124,8 +134,10 @@ impl Ctx<'_> {
                 continue;
             }
             changed = true;
-            let mut regions = difference(&regions_of(std::slice::from_ref(poly)), &obs);
+            let old = regions_of(std::slice::from_ref(poly));
+            let mut regions = difference(&old, &obs);
             regions = self.open(regions);
+            regions = self.relieve(&old, regions, &obs, fill.layer, notes);
             for r in regions {
                 if !self.keeps(&r, fill.layer) {
                     continue;
@@ -140,6 +152,62 @@ impl Ctx<'_> {
             }
         }
         (out, changed)
+    }
+
+    /// Isolates pads whose thermal relief the cut would leave starved (see the module doc).
+    fn relieve(
+        &self,
+        old: &[Region],
+        mut regions: Vec<Region>,
+        obs: &[Polygon],
+        layer: LayerId,
+        notes: &mut Vec<String>,
+    ) -> Vec<Region> {
+        use crate::thermal::{CUT_RADIUS, is_thermal};
+        if self.zone.net == NetId::NONE || obs.is_empty() {
+            return regions;
+        }
+        let Some(bb) = old.iter().filter_map(Region::bbox).reduce(|a, b| a.union(b)) else {
+            return regions;
+        };
+        let obs_boxes: Vec<Rect> = obs.iter().filter_map(Polygon::bbox).collect();
+        let mut pads: Vec<usize> = self
+            .grid
+            .query(bb, self.boxes)
+            .into_iter()
+            .map(|k| k as usize)
+            .filter(|&k| {
+                let it = &self.items[k];
+                matches!(it.item, ItemRef::Pad(_))
+                    && it.net == self.zone.net
+                    && it.layers.contains(layer)
+                    && is_thermal(self.board, self.zone, it)
+                    && obs_boxes.iter().any(|o| o.intersects(it.bbox.inflate(CUT_RADIUS * 2)))
+            })
+            .collect();
+        pads.sort_unstable();
+        for k in pads {
+            let pad = &self.items[k];
+            let was = self.lk.spokes(self.zone, layer, pad, old);
+            let now = self.lk.spokes(self.zone, layer, pad, &regions);
+            let (Some(was), Some(now)) = (was, now) else { continue };
+            if was.effective() < crate::thermal::MIN_RESOLVED_SPOKES || !now.starved() {
+                continue;
+            }
+            regions = difference(&regions, &[circumscribed(&pad.hull, CUT_RADIUS)]);
+            if let ItemRef::Pad(p) = pad.item {
+                let pd = self.board.pad(p);
+                notes.push(format!(
+                    "thermal relief of pad {}.{} on layer {} would be starved ({} of {} spokes); pad isolated from the fill",
+                    self.board.footprints[pd.footprint.idx()].reference,
+                    pd.number,
+                    layer.0,
+                    now.effective(),
+                    crate::thermal::MIN_RESOLVED_SPOKES
+                ));
+            }
+        }
+        regions
     }
 
     /// Morphological opening by the zone's `min_thickness` (never grows the copper).
