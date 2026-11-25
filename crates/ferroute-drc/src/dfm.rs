@@ -7,10 +7,17 @@
 //!   configured minimum and any KiCad `annular_width` custom rule),
 //! * drill aspect ratio (`board thickness / drill`, scaled to the layers a via spans),
 //! * minimum drill size of plated holes,
-//! * copper-to-hole clearance of non-plated (NPTH) holes.
+//! * copper-to-hole clearance of non-plated (NPTH) holes,
+//! * solder-mask slivers between adjacent pad openings (`mask`),
+//! * per-layer copper balance and warping risk (`balance`, reported separately).
 //!
 //! All decisions use integer arithmetic (INV-GEOM-1); the NPTH clearance uses the exact
 //! hull predicate of `ferroute-geom`.
+
+mod balance;
+mod mask;
+
+pub use balance::{BalanceNote, CopperBalance, LayerCopper, copper_balance};
 
 use crate::{BucketGrid, CopperItem, ItemRef, copper_items, idx};
 use ferroute_board::custom::{ItemCtx, ItemType};
@@ -35,6 +42,12 @@ pub struct DfmConfig {
     pub min_micro_drill: Coord,
     /// Minimum copper edge to NPTH hole edge distance (nm).
     pub npth_clearance: Coord,
+    /// Minimum solder-mask web between pad openings (nm). `None` = the board's
+    /// `solder_mask_min_width` when set, else 0.1 mm.
+    pub min_mask_web: Option<Coord>,
+    /// Copper-fraction difference (ppm of the board area) between stack-up-symmetric
+    /// layers above which a warping note is raised (300 000 = 30 percentage points).
+    pub balance_threshold_ppm: u32,
 }
 
 impl Default for DfmConfig {
@@ -46,6 +59,8 @@ impl Default for DfmConfig {
             max_aspect_micro_milli: 1_000,
             min_micro_drill: 100_000,
             npth_clearance: 250_000,
+            min_mask_web: None,
+            balance_threshold_ppm: 300_000,
         }
     }
 }
@@ -61,6 +76,9 @@ pub enum DfmKind {
     MinDrill { actual: Coord, required: Coord },
     /// Copper closer than allowed to a non-plated hole (nm, edge to edge).
     NpthCopper { actual: Coord, required: Coord, copper: ItemRef },
+    /// Solder-mask web (nm) between this pad's opening and `other`'s narrower than the
+    /// fab minimum.
+    MaskSliver { actual: Coord, required: Coord, other: ItemRef },
 }
 
 impl DfmKind {
@@ -72,6 +90,7 @@ impl DfmKind {
             Self::AspectRatio { .. } => "aspect-ratio",
             Self::MinDrill { .. } => "min-drill",
             Self::NpthCopper { .. } => "npth-copper",
+            Self::MaskSliver { .. } => "mask-sliver",
         }
     }
 }
@@ -107,6 +126,11 @@ impl DfmIssue {
             }
             DfmKind::NpthCopper { actual, required, .. } => format!(
                 "copper {} mm from an NPTH hole < required {} mm",
+                format_mm(*actual),
+                format_mm(*required)
+            ),
+            DfmKind::MaskSliver { actual, required, .. } => format!(
+                "mask sliver: web {} mm between pad openings < minimum {} mm",
                 format_mm(*actual),
                 format_mm(*required)
             ),
@@ -199,6 +223,7 @@ pub fn check(board: &Board, cfg: &DfmConfig) -> Vec<DfmIssue> {
         hole(ItemRef::Via(idx(i)), v.pos, v.drill, Some(ring), depth, v.kind == ViaKind::Micro);
     }
     out.extend(npth_copper(board, cfg));
+    out.extend(mask::mask_slivers(board, cfg));
     out
 }
 
@@ -422,5 +447,154 @@ mod tests {
         let issues = check(&via_board(500_000, 300_000), &DfmConfig::default());
         let s = issues[0].describe("via#0");
         assert!(s.contains("via#0") && s.contains("annular ring 0.1 mm < required 0.13 mm"), "{s}");
+    }
+    // ---- solder-mask slivers ----
+
+    /// Two 0.5 mm square SMD pads whose copper gap is `gap` nm.
+    fn two_pads(gap: Coord) -> Board {
+        use ferroute_board::builder::PadSpec;
+        let mut b = BoardBuilder::new(mm(20), mm(20), 2);
+        let n = b.net("N");
+        let spec = |num: &str, x: Coord| PadSpec {
+            number: num.into(),
+            local_pos: Point::new(x, 0),
+            shape: PadShape::Rect { w: 500_000, h: 500_000 },
+            drill: None,
+            net: n,
+        };
+        let pitch = 500_000 + gap;
+        b.footprint(
+            "U1",
+            pt10(100, 100),
+            0.0,
+            ferroute_board::Side::Front,
+            &[spec("1", 0), spec("2", pitch)],
+        );
+        b.build()
+    }
+
+    fn slivers(board: &Board) -> Vec<DfmKind> {
+        kinds(board, &DfmConfig::default())
+            .into_iter()
+            .filter(|k| matches!(k, DfmKind::MaskSliver { .. }))
+            .collect()
+    }
+
+    #[test]
+    fn mask_sliver_hit_and_miss() {
+        assert_eq!(
+            slivers(&two_pads(50_000)),
+            vec![DfmKind::MaskSliver {
+                actual: 50_000,
+                required: 100_000,
+                other: ItemRef::Pad(ferroute_board::PadId(1))
+            }]
+        );
+        assert!(slivers(&two_pads(200_000)).is_empty());
+    }
+
+    #[test]
+    fn mask_margin_shrinks_the_web() {
+        let mut b = two_pads(300_000);
+        assert!(slivers(&b).is_empty());
+        b.mask.margin = 120_000; // web = 0.3 - 2 * 0.12 = 0.06 mm
+        let got = slivers(&b);
+        assert!(matches!(got[..], [DfmKind::MaskSliver { actual: 60_000, .. }]), "{got:?}");
+        // A per-pad override on one pad only grows its side: 0.3 - 0.12 - 0.0 = 0.18 mm.
+        b.mask.pad_margins = vec![Some(0), None];
+        assert!(slivers(&b).is_empty());
+    }
+
+    #[test]
+    fn board_min_width_sets_the_default_and_config_wins() {
+        let mut b = two_pads(150_000);
+        assert!(slivers(&b).is_empty());
+        b.mask.min_width = 200_000;
+        assert_eq!(slivers(&b).len(), 1);
+        let cfg = DfmConfig { min_mask_web: Some(100_000), ..DfmConfig::default() };
+        assert!(kinds(&b, &cfg).is_empty());
+    }
+
+    #[test]
+    fn touching_openings_merge_and_have_no_web() {
+        assert!(slivers(&two_pads(0)).is_empty());
+        let mut b = two_pads(100_000);
+        b.mask.margin = 50_000; // openings touch
+        assert!(slivers(&b).is_empty());
+    }
+
+    #[test]
+    fn mask_sliver_describe_and_determinism() {
+        let b = two_pads(50_000);
+        let a = check(&b, &DfmConfig::default());
+        assert_eq!(a, check(&b, &DfmConfig::default()));
+        let s = a[0].describe("U1.1");
+        assert!(s.contains("mask sliver") && s.contains("0.05 mm"), "{s}");
+        assert_eq!(a[0].kind.label(), "mask-sliver");
+    }
+
+    // ---- copper balance ----
+
+    fn four_layer(f: bool, back: bool) -> Board {
+        let mut b = BoardBuilder::new(mm(20), mm(20), 4);
+        let n = b.net("N");
+        // 15 mm x 10 mm track = 150 mm2 of 400 mm2 + round end caps ≈ 57 %.
+        if f {
+            b.track(pt10(25, 100), pt10(175, 100), mm(10), 0, n, Origin::Existing);
+        }
+        if back {
+            b.track(pt10(25, 100), pt10(175, 100), mm(10), 3, n, Origin::Existing);
+        }
+        b.build()
+    }
+
+    #[test]
+    fn unbalanced_four_layer_board_is_noted() {
+        let board = four_layer(true, false);
+        let bal = copper_balance(&board, &DfmConfig::default());
+        assert_eq!(bal.layers.len(), 4);
+        assert!(bal.layers[0].fraction_ppm > 560_000 && bal.layers[0].fraction_ppm < 580_000);
+        assert_eq!(bal.layers[3].fraction_ppm, 0);
+        assert_eq!(bal.notes.len(), 1);
+        assert_eq!(
+            (bal.notes[0].a, bal.notes[0].b),
+            (ferroute_board::LayerId(0), ferroute_board::LayerId(3))
+        );
+        let s = bal.notes[0].describe(&board);
+        assert!(s.contains("F.Cu") && s.contains("B.Cu") && s.contains("warping"), "{s}");
+    }
+
+    #[test]
+    fn balanced_or_empty_boards_have_no_note() {
+        assert!(copper_balance(&four_layer(true, true), &DfmConfig::default()).notes.is_empty());
+        assert!(copper_balance(&four_layer(false, false), &DfmConfig::default()).notes.is_empty());
+        // A looser threshold silences the unbalanced board.
+        let loose = DfmConfig { balance_threshold_ppm: 600_000, ..DfmConfig::default() };
+        assert!(copper_balance(&four_layer(true, false), &loose).notes.is_empty());
+    }
+
+    #[test]
+    fn copper_balance_counts_fills_exactly_and_is_deterministic() {
+        use ferroute_board::{PadConnection, Zone, ZoneFill};
+        use ferroute_geom::Polygon;
+        let mut board = four_layer(false, false);
+        let fill = Polygon::from_rect(Rect::new(Point::ORIGIN, Point::new(mm(20), mm(10))));
+        board.zones.push(Zone {
+            net: ferroute_board::NetId(1),
+            layers: ferroute_board::LayerSet::single(ferroute_board::LayerId(1)),
+            outline: fill.clone(),
+            fills: vec![ZoneFill { layer: ferroute_board::LayerId(1), polys: vec![fill] }],
+            clearance: 0,
+            min_thickness: 0,
+            priority: 0,
+            pad_connection: PadConnection::default(),
+            islands: Default::default(),
+            yields: false,
+        });
+        let a = copper_balance(&board, &DfmConfig::default());
+        assert_eq!(a.layers[1].fraction_ppm, 500_000);
+        assert_eq!(a.layers[1].area, 200_000_000_000_000);
+        assert_eq!(a.notes.len(), 1); // In1 50 % vs In2 0 %
+        assert_eq!(a, copper_balance(&board, &DfmConfig::default()));
     }
 }

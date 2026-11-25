@@ -373,3 +373,20 @@ fn general_thickness_sets_board_thickness_without_stackup() {
     let kb = read_board(&src, &ReadOptions::default()).unwrap();
     assert_eq!(kb.board.stackup.board_thickness, 1_200_000);
 }
+
+#[test]
+fn solder_mask_margins_are_read() {
+    let fp = r#"(footprint "L:X" (layer "F.Cu") (at 10 10) (solder_mask_margin 0.05)
+      (fp_text reference "X1" (at 0 0) (layer "F.SilkS"))
+      (pad "1" smd rect (at 0 0) (size 1 1) (layers "F.Cu" "F.Mask") (solder_mask_margin 0.1) (net 1 "N1"))
+      (pad "2" smd rect (at 2 0) (size 1 1) (layers "F.Cu" "F.Mask") (net 1 "N1")))
+      (footprint "L:Y" (layer "F.Cu") (at 5 5) (fp_text reference "Y1" (at 0 0) (layer "F.SilkS"))
+      (pad "1" smd rect (at 0 0) (size 1 1) (layers "F.Cu" "F.Mask") (net 1 "N1")))"#;
+    let src = format!("{fp} (setup (pad_to_mask_clearance 0.02) (solder_mask_min_width 0.12))");
+    let b = read(&src).board;
+    assert_eq!((b.mask.margin, b.mask.min_width), (20_000, 120_000));
+    let m = |i: u32| b.mask.margin_for(ferroute_board::PadId(i));
+    assert_eq!((m(0), m(1), m(2)), (100_000, 50_000, 20_000));
+    let none = read("").board;
+    assert_eq!((none.mask.margin, none.mask.min_width), (0, 0));
+}

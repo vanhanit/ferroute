@@ -61,17 +61,24 @@ pub fn run(a: &DrcArgs) -> Result<ExitCode> {
             ferroute_geom::units::nm_to_mm(v.required)
         ));
     }
-    let dfm = ferroute_drc::dfm::check(&kb.board, &ferroute_drc::dfm::DfmConfig::default());
-    if !dfm.is_empty() {
-        out(&format!("{} DFM note(s) (not violations):", dfm.len()));
+    let dfm_cfg = ferroute_drc::dfm::DfmConfig::default();
+    let dfm = ferroute_drc::dfm::check(&kb.board, &dfm_cfg);
+    let balance = ferroute_drc::dfm::copper_balance(&kb.board, &dfm_cfg);
+    let notes = dfm.len() + balance.notes.len();
+    if notes > 0 {
+        out(&format!("{notes} DFM note(s) (not violations):"));
     }
     for i in dfm.iter().take(50) {
         out(&format!("  - dfm: {}", i.describe(&item_label(&kb.board, i.item))));
+    }
+    for n in &balance.notes {
+        out(&format!("  - dfm: {}", n.describe(&kb.board)));
     }
     if let Some(p) = &a.json {
         let mut v = serde_json::to_value(&rep)?;
         if let Some(o) = v.as_object_mut() {
             o.insert("dfm".into(), serde_json::to_value(&dfm)?);
+            o.insert("copper_balance".into(), serde_json::to_value(&balance)?);
         }
         std::fs::write(p, serde_json::to_string_pretty(&v)?)?;
     }

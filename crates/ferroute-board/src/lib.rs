@@ -636,6 +636,27 @@ impl Outline {
     }
 }
 
+/// Solder-mask settings used by the DFM checks (KiCad `pad_to_mask_clearance`,
+/// `solder_mask_min_width` and per-pad / per-footprint `solder_mask_margin`).
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MaskRules {
+    /// Board-wide expansion of every mask opening (nm; negative shrinks).
+    pub margin: Coord,
+    /// Fab minimum mask web (nm); 0 = not set.
+    pub min_width: Coord,
+    /// Resolved per-pad override (pad, else its footprint), indexed by pad id; entries
+    /// beyond the vector mean "no override".
+    pub pad_margins: Vec<Option<Coord>>,
+}
+
+impl MaskRules {
+    /// Mask expansion of pad `id` (nm): its own override, else the board margin.
+    #[must_use]
+    pub fn margin_for(&self, id: PadId) -> Coord {
+        self.pad_margins.get(id.idx()).copied().flatten().unwrap_or(self.margin)
+    }
+}
+
 /// The complete board.
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct Board {
@@ -662,6 +683,9 @@ pub struct Board {
     /// Differential pairs routed as coupled units.
     #[serde(default)]
     pub diff_pairs: Vec<pairs::DiffPair>,
+    /// Solder-mask settings (DFM only).
+    #[serde(default)]
+    pub mask: MaskRules,
 }
 
 /// Errors from [`Board::validate`].

@@ -312,6 +312,10 @@ impl Reader {
             let pad = self.read_pad(id, rot_deg, &reference, p)?;
             pad_ids.push(PadId(u32::try_from(self.board.pads.len()).unwrap_or(u32::MAX)));
             self.board.pads.push(pad);
+            let margin = |n: &SExpr| {
+                n.child("solder_mask_margin").and_then(|m| m.atom(1)).and_then(|v| mm(v).ok())
+            };
+            self.board.mask.pad_margins.push(margin(p).or_else(|| margin(node)));
         }
 
         // Courtyard (any side) and Edge.Cuts shapes inside the footprint.
@@ -678,6 +682,11 @@ pub(crate) fn parse_board(root: &SExpr) -> Result<Parsed, KicadError> {
     board.nets = r.nets;
     board.outline = outline;
     legacy_net_classes(root, &mut board);
+    if let Some(setup) = root.child("setup") {
+        let get = |k: &str| setup.child(k).and_then(|n| n.atom(1)).and_then(|v| mm(v).ok());
+        board.mask.margin = get("pad_to_mask_clearance").unwrap_or(0);
+        board.mask.min_width = get("solder_mask_min_width").unwrap_or(0).max(0);
+    }
     let general_t = root
         .child("general")
         .and_then(|g| g.child("thickness"))
