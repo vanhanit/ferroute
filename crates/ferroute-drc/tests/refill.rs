@@ -143,3 +143,88 @@ fn nothing_to_refill_returns_no_edit_and_refill_is_deterministic() {
     assert_eq!(x.fills.len(), 1);
     assert_eq!(x.fills, y.fills);
 }
+
+#[test]
+fn pour_splits_name_the_wall_that_separates_two_pad_groups() {
+    let (mut board, gnd, a) = board();
+    board.tracks.push(track(pt10(140, 110), pt10(140, 190), a));
+    let r = refill_zones(&board);
+    let splits = ferroute_drc::refill::pour_splits(&board, &r);
+    assert_eq!(splits.len(), 1);
+    let s = &splits[0];
+    assert_eq!((s.net, s.groups), (gnd, 2));
+    assert_eq!(s.cutters.len(), 1);
+    assert_eq!((s.cutters[0].item, s.cutters[0].net), (ItemRef::Track(0), a));
+    assert!(s.cutters[0].introduced);
+    assert_eq!(s.movable().count(), 1);
+}
+
+#[test]
+fn a_track_that_leaves_a_channel_does_not_split_the_pour() {
+    let (mut board, _, a) = board();
+    // Stops short of the pour edge: the pour wraps around its end.
+    board.tracks.push(track(pt10(140, 110), pt10(140, 160), a));
+    let r = refill_zones(&board);
+    assert!(ferroute_drc::refill::pour_splits(&board, &r).is_empty());
+}
+
+#[test]
+fn pour_splits_ignore_pours_the_refill_did_not_change() {
+    let (board, _, _) = board();
+    let r = refill_zones(&board);
+    assert!(ferroute_drc::refill::pour_splits(&board, &r).is_empty());
+}
+
+#[test]
+fn pre_existing_copper_that_walls_the_pour_is_reported_as_fixed() {
+    let (mut board, _, a) = board();
+    let mut t = track(pt10(140, 110), pt10(140, 190), a);
+    t.origin = Origin::Existing;
+    board.tracks.push(t);
+    let r = refill_zones(&board);
+    let splits = ferroute_drc::refill::pour_splits(&board, &r);
+    assert_eq!(splits.len(), 1);
+    assert_eq!(splits[0].cutters.len(), 1);
+    assert_eq!(splits[0].movable().count(), 0, "existing copper cannot be re-routed");
+}
+
+#[test]
+fn a_neck_narrower_than_min_thickness_is_removed_from_the_fill() {
+    use ferroute_geom::Point;
+    let (mut board, _, a) = board();
+    let b2 =
+        board.nets.iter().position(|n| n.name == "B").map(|i| NetId(u32::try_from(i).unwrap()));
+    let other = b2.unwrap_or(a);
+    // Two parallel 3 mm tracks (0.25 wide, 0.2 clearance): the strip between them is
+    // 0.8 - 0.25 - 0.4 = 0.15 mm wide, below the 0.25 mm min_thickness of the zone.
+    board.tracks.push(track(pt10(120, 150), pt10(150, 150), a));
+    board.tracks.push(track(pt10(120, 158), pt10(150, 158), other));
+    let after = refilled(&board);
+    let mid = pt10(135, 154);
+    let covered = after.zones[0].fills[0].polys.iter().any(|p| p.contains(mid));
+    assert!(!covered, "the 0.15 mm neck must be opened away");
+    let _ = Point::ORIGIN;
+}
+
+#[test]
+fn a_neck_between_two_vias_is_removed_from_the_fill() {
+    use ferroute_board::{Via, ViaKind};
+    let (mut board, _, a) = board();
+    for x in [10, 11, 12] {
+        board.vias.push(Via {
+            pos: Point::new(x * 1_000_000, 15_000_000),
+            diameter: 450_000,
+            drill: 200_000,
+            layers: LayerSet::single(LayerId(0)),
+            kind: ViaKind::Through,
+            net: a,
+            locked: false,
+            origin: Origin::Routed,
+        });
+    }
+    let after = refilled(&board);
+    let at =
+        |x: i64, y: i64| after.zones[0].fills[0].polys.iter().any(|p| p.contains(Point::new(x, y)));
+    assert!(at(10_500_000, 14_000_000), "open copper above the row stays");
+    assert!(!at(10_500_000, 15_000_000), "the 0.15 mm neck must be opened away");
+}

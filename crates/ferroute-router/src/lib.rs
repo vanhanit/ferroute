@@ -29,6 +29,7 @@ pub mod negotiate;
 pub mod pairgeom;
 pub mod plan;
 pub mod plane;
+pub mod pour;
 pub mod search;
 pub mod smooth;
 pub mod straighten;
@@ -117,6 +118,17 @@ pub struct RouterConfig {
     /// Outermost array ring that gets a planned escape (`0` = outer ring only).
     #[serde(default = "default_escape_rings")]
     pub escape_rings: usize,
+    /// Extra cost factor for other nets' copper on a layer with a refillable pour of
+    /// another net ([`pour`]); `0` disables the term.
+    #[serde(default = "default_pour_cost")]
+    pub pour_track_cost: f32,
+    /// Regions of pour layers to avoid (from a diagnosed pour split, see [`pour`]).
+    #[serde(default)]
+    pub pour_avoid: Vec<pour::PourAvoid>,
+}
+
+const fn default_pour_cost() -> f32 {
+    0.0
 }
 
 const fn default_escape_rings() -> usize {
@@ -166,6 +178,8 @@ impl Default for RouterConfig {
             lns: lns::LnsConfig::default(),
             escape: default_escape(),
             escape_rings: default_escape_rings(),
+            pour_track_cost: default_pour_cost(),
+            pour_avoid: Vec::new(),
         }
     }
 }
@@ -749,6 +763,7 @@ pub fn route_prepared(prep: &Prepared, cfg: &RouterConfig) -> Result<RouteOutcom
         costs: base_costs,
         margin: cfg.margin,
         vm: vm.clone(),
+        pour: pour::build(grid, board, cfg.pour_track_cost, &cfg.pour_avoid),
     };
     let t1 = Instant::now();
     let (routes, nstats) =

@@ -146,6 +146,19 @@ pub fn offset(regions: &[Region], d: Coord) -> Vec<Region> {
     shapes.outline(&style).map(regions_from).unwrap_or_default()
 }
 
+/// [`offset`] with bevelled convex corners: growing never reaches beyond the true (round)
+/// offset, so `offset_bevel(offset(r, -d), d)` is a conservative morphological opening
+/// (a mitred grow restores acute tips, e.g. the neck between two nearby holes).
+#[must_use]
+pub fn offset_bevel(regions: &[Region], d: Coord) -> Vec<Region> {
+    if regions.is_empty() || d == 0 {
+        return regions.to_vec();
+    }
+    let shapes: Vec<Shape> = regions.iter().map(shape_of).collect();
+    let style = IntOutlineStyle::<i64>::new(d).line_join(IntLineJoin::Bevel);
+    shapes.outline(&style).map(regions_from).unwrap_or_default()
+}
+
 const SEC_PI_32: f64 = 1.004_838_572_376_311_4;
 
 #[rustfmt::skip]

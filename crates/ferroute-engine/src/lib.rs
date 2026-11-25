@@ -87,6 +87,8 @@ pub struct Metrics {
 pub struct PipelineResult {
     /// Internal: the refill split a pour net (the pipeline then re-runs without refill).
     pub refill_disconnects: bool,
+    /// Diagnosis of the pours the refill split (empty when none).
+    pub pour_splits: Vec<ferroute_drc::refill::PourSplit>,
     /// The input board with the movability policy applied (edit invariants are checked
     /// against this board).
     pub policy_board: Board,
@@ -156,7 +158,7 @@ fn moves_between(policy_board: &Board, placed: &Board) -> Vec<FootprintMove> {
 /// Router errors (invalid board, impossible lattice).
 pub fn run(board: &Board, cfg: &PipelineConfig) -> Result<PipelineResult, RouteError> {
     if cfg.router.escape {
-        let with = run_once(board, cfg)?;
+        let with = run_repaired(board, cfg)?;
         if with.route.escape_balls == 0 {
             // No array (or nothing planned): this pass is the plain pass.
             return finish_refill(board, cfg, with);
@@ -177,8 +179,108 @@ pub fn run(board: &Board, cfg: &PipelineConfig) -> Result<PipelineResult, RouteE
 }
 
 fn run_plain(board: &Board, cfg: &PipelineConfig) -> Result<PipelineResult, RouteError> {
-    let first = run_once(board, cfg)?;
+    let first = run_repaired(board, cfg)?;
     finish_refill(board, cfg, first)
+}
+
+/// Extra cost factor for foreign copper on a pour layer in repair attempts (the router's
+/// `pour_track_cost`): large values starve the plane layers of routes, small ones barely
+/// steer; measured on the dense suite.
+const POUR_TRACK_COST: f32 = 0.1;
+/// Cost factor of the first avoid regions; doubled for the next attempt.
+const POUR_AVOID_COST: f32 = 4.0;
+/// Extra passes tried when a refill would split a pour.
+const POUR_REPAIR_ATTEMPTS: u32 = 3;
+
+/// Avoid regions for the router from diagnosed pour splits: per split and pour layer, the
+/// nets whose movable copper walls the pour stay off that layer's pour area (soft cost).
+fn avoid_regions(
+    board: &Board,
+    splits: &[ferroute_drc::refill::PourSplit],
+    cost: f32,
+) -> Vec<ferroute_router::pour::PourAvoid> {
+    let mut out: Vec<ferroute_router::pour::PourAvoid> = Vec::new();
+    for s in splits {
+        let mut layers: Vec<ferroute_board::LayerId> = s.movable().map(|c| c.layer).collect();
+        layers.sort_unstable();
+        layers.dedup();
+        for layer in layers {
+            let area = board
+                .zones
+                .iter()
+                .filter(|z| z.net == s.net)
+                .flat_map(|z| z.fills.iter().filter(|f| f.layer == layer))
+                .flat_map(|f| f.polys.iter().filter_map(|p| p.bbox()))
+                .reduce(|a, b| a.union(b));
+            let Some(area) = area else { continue };
+            let mut nets: Vec<NetId> =
+                s.movable().filter(|c| c.layer == layer).map(|c| c.net).collect();
+            nets.sort_unstable();
+            nets.dedup();
+            out.push(ferroute_router::pour::PourAvoid { layer, area, cost, nets });
+        }
+    }
+    out
+}
+
+/// [`run_once`] plus bounded repair of pour splits (INV-CONN-1 without giving up the
+/// refill). The first pass is the plain pass, so boards without a split are untouched. When
+/// the refill would split a pour, up to three more passes steer the router away from the
+/// split, and the best one wins (no split first, then completion):
+///
+/// 1. every net pays a little for copper on pour layers (`pour_track_cost`);
+/// 2. the nets whose copper walls the pour ([`ferroute_drc::refill::pour_splits`]) are
+///    kept off that pour layer by an expensive avoid region;
+/// 3. both, with doubled avoid cost and the cutters of every attempt so far.
+///
+/// An attempt that keeps the pours intact and is about as complete as the split pass
+/// (within one percent) ends the search early.
+fn run_repaired(board: &Board, cfg: &PipelineConfig) -> Result<PipelineResult, RouteError> {
+    let mut best = run_once(board, cfg)?;
+    tracing::info!(
+        disconnects = best.refill_disconnects,
+        completion = best.metrics.completion,
+        "pour pass 0"
+    );
+    if !best.refill_disconnects {
+        return Ok(best);
+    }
+    let target = best.metrics.completion - 0.01;
+    let mut splits = best.pour_splits.clone();
+    let mut avoid: Vec<ferroute_router::pour::PourAvoid> = Vec::new();
+    for attempt in 0..POUR_REPAIR_ATTEMPTS {
+        let mut c = cfg.clone();
+        match attempt {
+            0 => c.router.pour_track_cost = POUR_TRACK_COST,
+            1 => avoid.extend(avoid_regions(board, &splits, POUR_AVOID_COST)),
+            _ => {
+                c.router.pour_track_cost = POUR_TRACK_COST;
+                avoid.extend(avoid_regions(board, &splits, 2.0 * POUR_AVOID_COST));
+            }
+        }
+        if attempt > 0 {
+            if avoid.is_empty() {
+                break;
+            }
+            c.router.pour_avoid.clone_from(&avoid);
+        }
+        let next = run_once(board, &c)?;
+        tracing::info!(
+            attempt,
+            disconnects = next.refill_disconnects,
+            completion = next.metrics.completion,
+            "pour repair"
+        );
+        splits.extend(next.pour_splits.iter().cloned());
+        let key = |r: &PipelineResult| (!r.refill_disconnects, r.metrics.completion);
+        if key(&next).partial_cmp(&key(&best)) == Some(std::cmp::Ordering::Greater) {
+            best = next;
+        }
+        if !best.refill_disconnects && best.metrics.completion >= target {
+            break;
+        }
+    }
+    Ok(best)
 }
 
 /// INV-CONN-1: when refilling around the new copper would split a pour and disconnect
@@ -289,6 +391,7 @@ fn run_once(board: &Board, cfg: &PipelineConfig) -> Result<PipelineResult, Route
     let mut board_after = policy_board.clone();
     board_after.apply(&edit);
     let mut refill_disconnects = false;
+    let mut pour_splits: Vec<ferroute_drc::refill::PourSplit> = Vec::new();
     if cfg.refill_zones {
         let only_conn = DrcConfig {
             copper: false,
@@ -301,8 +404,9 @@ fn run_once(board: &Board, cfg: &PipelineConfig) -> Result<PipelineResult, Route
         };
         let before = missing_per_net(&ferroute_drc::check(&board_after, &only_conn).connectivity);
         let refill = ferroute_drc::refill::refill_zones(&board_after);
-        rule_notes.extend(refill.notes);
-        edit.zone_fills = refill.fills;
+        rule_notes.extend(refill.notes.iter().cloned());
+        let unfilled = board_after.clone();
+        edit.zone_fills.clone_from(&refill.fills);
         board_after
             .apply(&BoardEdit { zone_fills: edit.zone_fills.clone(), ..BoardEdit::default() });
         for z in &mut board_after.zones {
@@ -310,6 +414,27 @@ fn run_once(board: &Board, cfg: &PipelineConfig) -> Result<PipelineResult, Route
         }
         let after = missing_per_net(&ferroute_drc::check(&board_after, &only_conn).connectivity);
         refill_disconnects = after.iter().any(|(n, &c)| c > before.get(n).copied().unwrap_or(0));
+        if refill_disconnects {
+            pour_splits = ferroute_drc::refill::pour_splits(&unfilled, &refill)
+                .into_iter()
+                .filter(|s| {
+                    after.get(&s.net).copied().unwrap_or(0)
+                        > before.get(&s.net).copied().unwrap_or(0)
+                })
+                .collect();
+            for s in &pour_splits {
+                tracing::info!(
+                    net = s.net.0,
+                    groups = s.groups,
+                    cutters = s.cutters.len(),
+                    movable = s.movable().count(),
+                    "pour split"
+                );
+                for c in &s.cutters {
+                    tracing::debug!(?c, "pour cutter");
+                }
+            }
+        }
     }
     debug_assert!(edit.check_invariants(&policy_board).is_ok());
     let drc = ferroute_drc::check(&board_after, &DrcConfig::default());
@@ -337,6 +462,7 @@ fn run_once(board: &Board, cfg: &PipelineConfig) -> Result<PipelineResult, Route
     };
     Ok(PipelineResult {
         refill_disconnects,
+        pour_splits,
         policy_board,
         edit,
         board_after,
@@ -689,5 +815,67 @@ mod refill_tests {
         assert!(r.drc.is_clean(), "{:#?}", r.drc.violations);
         let again = run(&board, &cfg(true)).expect("run");
         assert_eq!(r.edit, again.edit, "deterministic");
+    }
+
+    #[test]
+    fn avoid_regions_keep_the_wall_nets_off_the_pour_layer() {
+        use ferroute_drc::refill::{Cutter, PourSplit};
+        use ferroute_drc::{ItemRef, ItemRef::Track};
+        let board = blocked_board();
+        let gnd = board.net_by_name("GND").expect("gnd");
+        let s = board.net_by_name("S").expect("s");
+        let q = board.net_by_name("Q").expect("q");
+        let cut = |item: ItemRef, net: NetId, introduced: bool| Cutter {
+            item,
+            net,
+            layer: LayerId(0),
+            bbox: ferroute_geom::Rect::new(
+                ferroute_geom::Point::new(0, 0),
+                ferroute_geom::Point::new(1, 1),
+            ),
+            introduced,
+        };
+        let split = PourSplit {
+            net: gnd,
+            groups: 2,
+            cutters: vec![cut(Track(0), s, true), cut(Track(1), s, true), cut(Track(2), q, false)],
+        };
+        let a = avoid_regions(&board, &[split], 4.0);
+        assert_eq!(a.len(), 1, "one pour layer");
+        assert_eq!(a[0].layer, LayerId(0));
+        assert_eq!(a[0].nets, vec![s], "only movable cutters pay, once");
+        assert!((a[0].cost - 4.0).abs() < 1e-6);
+        let fill = board.zones[0].fills[0].polys[0].bbox().expect("bbox");
+        assert_eq!(a[0].area, fill, "the whole pour layer");
+        assert!(avoid_regions(&board, &[], 4.0).is_empty());
+    }
+
+    #[test]
+    fn the_pour_repair_path_is_deterministic_across_thread_counts() {
+        // The split case runs the plain pass, the repair attempts and the obstacle fallback.
+        let mut board = blocked_board();
+        let gnd = board.net_by_name("GND").expect("gnd");
+        let mut bb = BoardBuilder::new(mm(30), mm(20), 2);
+        for n in ["S", "Q", "Q2", "GND"] {
+            bb.net(n);
+        }
+        bb.smd2("G2", pt10(150, 170), 0.0, NetId(4), NetId::NONE);
+        let extra = bb.build();
+        let mut pad = extra.pads[0].clone();
+        pad.footprint =
+            ferroute_board::FootprintId(u32::try_from(board.footprints.len()).expect("fp"));
+        pad.net = gnd;
+        let mut foot = extra.footprints[0].clone();
+        foot.pads = vec![ferroute_board::PadId(u32::try_from(board.pads.len()).expect("pad"))];
+        board.pads.push(pad);
+        board.footprints.push(foot);
+        let runs: Vec<_> = [1usize, 4]
+            .iter()
+            .map(|&n| {
+                let pool = rayon::ThreadPoolBuilder::new().num_threads(n).build().expect("pool");
+                pool.install(|| run(&board, &cfg(true)).expect("run").edit)
+            })
+            .collect();
+        assert_eq!(runs[0], runs[1]);
     }
 }

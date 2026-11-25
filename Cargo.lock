@@ -550,6 +550,7 @@ dependencies = [
  "ferroute-geom",
  "ferroute-place",
  "ferroute-router",
+ "rayon",
  "serde",
  "thiserror",
  "tracing",

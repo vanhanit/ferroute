@@ -71,6 +71,8 @@ pub struct NegotiationConfig {
     pub margin: u32,
     /// Which via kinds the lattice may use.
     pub vm: ViaModel,
+    /// Pour-continuity costs ([`crate::pour`]); `None` = no refillable pour.
+    pub pour: Option<crate::pour::PourCosts>,
 }
 
 /// Negotiation statistics.
@@ -384,6 +386,7 @@ fn route_one(
     margin: u32,
     pres_fac: f32,
     vm: &ViaModel,
+    pour: Option<&crate::pour::PourCosts>,
 ) -> (NetRoute, u64) {
     let cp = &plan.classes[job.class];
     let k_offs = ball(cp.k);
@@ -409,6 +412,7 @@ fn route_one(
         rv_offs: &rv_offs,
         rh_offs: &rh_offs,
         vm,
+        pour: pour.map(|c| crate::pour::PourView::new(c, job.net)),
         via_gap: u8::try_from((2 * plan.rh + 1).min(7)).unwrap_or(7),
     };
     // node → (island, stub, heading into the stub) for every terminal.
@@ -644,7 +648,16 @@ pub fn negotiate(
                 .par_iter()
                 .map(|&j| {
                     route_one(
-                        grid, legal, plan, stubs, &st, &jobs[j], margins[j], pres_fac, &cfg.vm,
+                        grid,
+                        legal,
+                        plan,
+                        stubs,
+                        &st,
+                        &jobs[j],
+                        margins[j],
+                        pres_fac,
+                        &cfg.vm,
+                        cfg.pour.as_ref(),
                     )
                 })
                 .collect();

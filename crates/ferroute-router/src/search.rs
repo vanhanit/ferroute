@@ -50,6 +50,8 @@ pub struct Ctx<'a> {
     pub rh_offs: &'a [(i32, i32)],
     /// Which via kinds exist and what they cost.
     pub vm: &'a crate::vspan::ViaModel,
+    /// Pour-continuity costs (`None` = free).
+    pub pour: Option<crate::pour::PourView<'a>>,
     /// Planar steps between two vias of one path when spans are enabled.
     pub via_gap: u8,
 }
@@ -592,7 +594,9 @@ fn astar_in(
             } else {
                 1.0
             };
-            let step = len * (1.0 + ctx.hist[m as usize]) * (1.0 + ctx.pres_fac * cong) + bend;
+            let pen = ctx.pour.map_or(0.0, |p| p.track_pen(m, l, mi, mj));
+            let step =
+                len * (1.0 + ctx.hist[m as usize] + pen) * (1.0 + ctx.pres_fac * cong) + bend;
             relax(recs, heap, lm, m, (mi, mj), step, Arrival::new(Some(d), false));
         }
         if !arr.via() && hold == 0 && nl > 1 && ctx.vm.spans_enabled() {
@@ -622,9 +626,12 @@ fn astar_in(
                 if recs[lm].closed {
                     continue;
                 }
+                let pen = ctx
+                    .pour
+                    .map_or(0.0, |p| (lo..=hi).map(|x| p.via_pen(g.idx(i, j, x), x, i, j)).sum());
                 let step = costs.via
                     * ctx.vm.factor(kind)
-                    * (1.0 + ctx.hist[m as usize])
+                    * (1.0 + ctx.hist[m as usize] + pen)
                     * (1.0 + ctx.pres_fac * cong);
                 // Vias of one net keep their holes apart: the next one is a hole-channel
                 // diameter away (a successive pair of cheap layer hops would otherwise
@@ -657,7 +664,11 @@ fn astar_in(
                 if recs[lm].closed {
                     continue;
                 }
-                let step = costs.via * (1.0 + ctx.hist[m as usize]) * (1.0 + ctx.pres_fac * cong);
+                let pen = ctx.pour.map_or(0.0, |p| {
+                    (0..nl).map(|x| p.via_pen(g.idx(i, j, x), x, i, j)).sum::<f32>()
+                });
+                let step =
+                    costs.via * (1.0 + ctx.hist[m as usize] + pen) * (1.0 + ctx.pres_fac * cong);
                 // The heading survives the via: turning right after it costs a bend.
                 relax(recs, heap, lm, m, (i, j), step, Arrival::new(arr.heading(), true));
             }
@@ -770,6 +781,7 @@ mod tests {
             rv_offs: &rv,
             rh_offs: &rh,
             vm: &vm,
+            pour: None,
             via_gap: 3,
         };
         let (a, b) = (grid.idx(2, 3, 0), grid.idx(20, 11, 1));
