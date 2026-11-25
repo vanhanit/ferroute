@@ -483,7 +483,7 @@ checksum = "da7c62ceae207dd37ea5b845da6a0696c799f85e97da1ab5b7910be3c1c80223"
 
 [[package]]
 name = "ferroute-board"
-version = "0.7.0"
+version = "0.8.0"
 dependencies = [
  "ferroute-geom",
  "serde",
@@ -492,7 +492,7 @@ dependencies = [
 
 [[package]]
 name = "ferroute-cli"
-version = "0.7.0"
+version = "0.8.0"
 dependencies = [
  "anyhow",
  "clap",
@@ -519,7 +519,7 @@ dependencies = [
 
 [[package]]
 name = "ferroute-drc"
-version = "0.7.0"
+version = "0.8.0"
 dependencies = [
  "ferroute-board",
  "ferroute-geom",
@@ -531,7 +531,7 @@ dependencies = [
 
 [[package]]
 name = "ferroute-dsn"
-version = "0.7.0"
+version = "0.8.0"
 dependencies = [
  "ferroute-board",
  "ferroute-drc",
@@ -542,7 +542,7 @@ dependencies = [
 
 [[package]]
 name = "ferroute-engine"
-version = "0.7.0"
+version = "0.8.0"
 dependencies = [
  "criterion",
  "ferroute-board",
@@ -558,7 +558,7 @@ dependencies = [
 
 [[package]]
 name = "ferroute-geom"
-version = "0.7.0"
+version = "0.8.0"
 dependencies = [
  "i_overlay",
  "proptest",
@@ -568,7 +568,7 @@ dependencies = [
 
 [[package]]
 name = "ferroute-gpu"
-version = "0.7.0"
+version = "0.8.0"
 dependencies = [
  "naga",
  "pollster",
@@ -580,7 +580,7 @@ dependencies = [
 
 [[package]]
 name = "ferroute-ipc"
-version = "0.7.0"
+version = "0.8.0"
 dependencies = [
  "prost",
  "serde",
@@ -592,7 +592,7 @@ dependencies = [
 
 [[package]]
 name = "ferroute-kicad"
-version = "0.7.0"
+version = "0.8.0"
 dependencies = [
  "ferroute-board",
  "ferroute-geom",
@@ -603,7 +603,7 @@ dependencies = [
 
 [[package]]
 name = "ferroute-place"
-version = "0.7.0"
+version = "0.8.0"
 dependencies = [
  "ferroute-board",
  "ferroute-drc",
@@ -615,7 +615,7 @@ dependencies = [
 
 [[package]]
 name = "ferroute-render"
-version = "0.7.0"
+version = "0.8.0"
 dependencies = [
  "ferroute-board",
  "ferroute-geom",
@@ -624,7 +624,7 @@ dependencies = [
 
 [[package]]
 name = "ferroute-router"
-version = "0.7.0"
+version = "0.8.0"
 dependencies = [
  "ferroute-board",
  "ferroute-drc",
