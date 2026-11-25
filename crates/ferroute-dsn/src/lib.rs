@@ -7,6 +7,9 @@
 //! * [`read_ses`]: Specctra SES session (routes) to an additive
 //!   [`ferroute_board::BoardEdit`] (INV-EDIT-1) that the KiCad writer can apply.
 //!
+//! * [`freerouting_settings`]: the Freerouting command-line settings a DSN cannot carry
+//!   (no neckdown/fanout, hole clearance, pours as obstacles).
+//!
 //! ## Conventions
 //!
 //! * The DSN uses `(resolution um 1)`: one design unit is 1 um (finer overflows Freerouting
@@ -25,10 +28,12 @@
 
 mod error;
 mod ses;
+mod settings;
 mod sexp;
 mod units;
 mod write;
 
 pub use error::DsnError;
 pub use ses::read_ses;
+pub use settings::{FreeroutingSettings, freerouting_settings};
 pub use write::write_dsn;

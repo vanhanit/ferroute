@@ -7,7 +7,8 @@
 # Usage: scripts/freerouting_compare.sh [--dense] [--passes N] [--timeout S] [board.kicad_pcb ...]
 # Env:   FERROUTE_BIN (default target/release/ferroute), FERROUTE_JAVA (a JDK >= 25 `java`),
 #        FERROUTE_CACHE (default ~/.cache/ferroute), THREADS (default: all cores),
-#        FERROUTE_WORK (work dir, default: a fresh mktemp dir), FR_EXTRA_ARGS.
+#        FERROUTE_WORK (work dir, default: a fresh mktemp dir), FR_EXTRA_ARGS,
+#        FR_SETTINGS (set per board from ferroute-dsn: --router.* settings, see docs/FREEROUTING.md).
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
@@ -40,12 +41,12 @@ JAR=$(scripts/fetch_freerouting.sh)
 fr() { # fr <dsn> <ses> : paths below $WORK
   local dsn="$1" ses="$2"
   if [ -n "$JAVA" ]; then
-    "$JAVA" -jar "$JAR" -de "$dsn" -do "$ses" -mp "$PASSES" -mt "$THREADS" --gui.enabled=false ${FR_EXTRA_ARGS:-}
+    "$JAVA" -jar "$JAR" -de "$dsn" -do "$ses" -mp "$PASSES" -mt "$THREADS" --gui.enabled=false ${FR_SETTINGS:-} ${FR_EXTRA_ARGS:-}
   else
     docker run --rm --name "ferroute-fr-$$" -v "$(dirname "$JAR"):/fr:ro" -v "$WORK:/work" -u "$(id -u):$(id -g)" \
       -e HOME=/tmp eclipse-temurin:25 java -jar "/fr/$(basename "$JAR")" \
       -de "/work/${dsn#"$WORK"/}" -do "/work/${ses#"$WORK"/}" -mp "$PASSES" -mt "$THREADS" \
-      --gui.enabled=false ${FR_EXTRA_ARGS:-}
+      --gui.enabled=false ${FR_SETTINGS:-} ${FR_EXTRA_ARGS:-}
   fi
 }
 
@@ -54,7 +55,7 @@ if [ "$DENSE" = 1 ]; then
   BOARDS+=("$WORK/dense/qfn_dense_2l.kicad_pcb" "$WORK/dense/bga_256_4l.kicad_pcb")
 fi
 
-export JAVA JAR WORK PASSES THREADS FR_EXTRA_ARGS
+export JAVA JAR WORK PASSES THREADS FR_EXTRA_ARGS FR_SETTINGS
 export -f fr
 
 now() { date +%s.%N; }
@@ -103,6 +104,9 @@ for b in "${BOARDS[@]}"; do
 
   # --- Freerouting (export, route, import) ---
   "$BIN" dsn export "$d/in.kicad_pcb" -o "$d/in.dsn" >/dev/null
+  # Settings a DSN cannot carry (no neckdown/fanout, hole clearance, pours as obstacles).
+  FR_SETTINGS=$(cargo run -q --release -p ferroute-dsn --example freerouting_args -- "$d/in.kicad_pcb" | tr "\n" " ")
+  export FR_SETTINGS
   t0=$(now)
   timeout "$TIMEOUT" bash -c 'fr "$0" "$1"' "$d/in.dsn" "$d/out.ses" >"$d/freerouting.log" 2>&1 || true
   docker kill "ferroute-fr-$$" >/dev/null 2>&1 || true

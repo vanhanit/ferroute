@@ -205,24 +205,24 @@ all six; the only unconnected items are the 2 connections `bga_256_4l` reports a
 CI re-runs the `ci` suite on every PR and fails on any DRC regression, completion drop or
 quality regression beyond tolerance (`crates/ferroute-engine/src/score.rs`).
 
-**Versus Freerouting 2.5.0** (same machine, fixed placement, Freerouting 20 passes; method
-and caveats in [`docs/FREEROUTING.md`](docs/FREEROUTING.md); DRC by our oracle under each
-board's own rules):
+**Versus Freerouting 2.5.0** (same machine, fixed placement, Freerouting 20 passes with
+neck-down/fan-out off, hole clearance and pours-as-obstacles set so it honours each board's
+rules; method in [`docs/FREEROUTING.md`](docs/FREEROUTING.md); DRC by our oracle; wall times
+include Freerouting's JVM/container start and were measured on a shared, loaded machine):
 
-| board | router | completion | DRC errors | vias | wirelength (mm) | time (s) |
-|---|---|---:|---:|---:|---:|---:|
-| demo_2layer | ferroute | 100 % | 0 | 8 | 339.7 | 0.6 |
-| demo_2layer | Freerouting | 100 % | 0 | 4 | 393.3 | 7.8 |
-| bus_match | ferroute | 100 % | 0 | 2 | 195.1 | 0.2 |
-| bus_match | Freerouting | 100 % | 0 | 0 | 212.9 | 4.9 |
-| qfn_dense_2l | ferroute | 99.3 % | 0 | 56 | 583.4 | 3.5 |
-| qfn_dense_2l | Freerouting | 100 % | 95 | 15 | 661.8 | 29.6 |
-| bga_256_4l | ferroute | 90.6 % | 0 | 373 | 1281.6 | 7.3 |
-| bga_256_4l | Freerouting | 93.8 % | 979 | 256 | 1784.8 | 665.2 |
+| board | router | completion | DRC errors | vias | wirelength (mm) |
+|---|---|---:|---:|---:|---:|
+| demo_2layer | ferroute | 100 % | 0 | 8 | 339.7 |
+| demo_2layer | Freerouting | 100 % | 0 | 4 | 370.2 |
+| bus_match | ferroute | 100 % | 0 | 2 | 195.1 |
+| bus_match | Freerouting | 100 % | 0 | 0 | 221.2 |
+| qfn_dense_2l | ferroute | 99.3 % | 0 | 56 | 583.4 |
+| qfn_dense_2l | Freerouting | 95.7 % | 0 | 31 | 559.9 |
+| bga_256_4l | ferroute | 90.6 % | 0 | 373 | 1281.6 |
+| bga_256_4l | Freerouting | 62.3 % | 0 | 0 | 1131.0 |
 
-Freerouting's extra completion on the dense boards is not DRC-clean: it narrows traces below
-the net-class width and routes other nets through copper pours (partly because our DSN
-export cannot yet express pour keep-outs and hole clearance — see the doc).
+With its default settings Freerouting completes more of the dense boards (100 % / 93.8 %)
+but with 95 / 979 DRC errors (narrowed traces, hole clearance, shorts through pours).
 
 ## Guarantees and their tests
 

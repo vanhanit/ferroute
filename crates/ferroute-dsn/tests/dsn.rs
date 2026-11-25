@@ -264,3 +264,36 @@ fn pours_are_exported_as_planes() {
     let d = dsn(&kb.board);
     assert!(d.contains("(plane GND (polygon "), "{d}");
 }
+
+#[test]
+fn class_width_is_the_nets_required_width() {
+    // Regression: the class width must be the widest of class/current/impedance rules, never
+    // the board default (Freerouting treats it as the default width of the net).
+    let mut b = sample();
+    b.rules.classes[0].track_width = 300_000;
+    let d = dsn(&b);
+    assert!(d.contains("(rule (width 300) (clearance "), "{d}");
+    assert!(!d.contains("(rule (width 250)"), "{d}");
+}
+
+#[test]
+fn freerouting_settings_cover_what_the_dsn_cannot_express() {
+    // Regression (Freerouting 2.5.0): neckdown/fanout narrow traces below the net width,
+    // drill clearance and pour obstacles have no DSN keyword.
+    let p = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../testdata/boards/pour_gnd.kicad_pcb");
+    let kb = ferroute_kicad::read_board_file(&p).expect("read pour board");
+    let s = ferroute_dsn::freerouting_settings(&kb.board);
+    assert!(s.plane_as_obstacle);
+    assert_eq!(s.hole_clearance_um, (kb.board.rules.hole_clearance + 999) / 1000);
+    let args = s.args();
+    for want in [
+        "--router.fanout.enabled=false",
+        "--router.automatic_neckdown=false",
+        "--router.plane_as_obstacle=true",
+    ] {
+        assert!(args.iter().any(|a| a == want), "{args:?}");
+    }
+    assert!(args.iter().any(|a| a.starts_with("--router.hole_clearance_um=")), "{args:?}");
+    // No pour: pours are not obstacles.
+    assert!(!ferroute_dsn::freerouting_settings(&sample()).plane_as_obstacle);
+}
